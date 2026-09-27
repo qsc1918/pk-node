@@ -75,6 +75,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
+          TAG="$GITHUB_REF_NAME"
+
+          # 幂等：同一个 tag 重复发布（比如重打 tag）时，先把旧 Release 删掉。
+          # 不删的话 `gh release create` 会因「同名已存在」失败，并可能留下一份
+          # draft 孤儿 —— 那个孤儿还会被 /releases/latest 解析到，导致用户下到旧包。
+          # `--cleanup-tag=false`：只删 Release，不动 git tag（tag 由 push 负责）。
+          gh release delete "$TAG" --yes --cleanup-tag=false 2>/dev/null || true
+          # 顺手清掉可能存在的同名 draft
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id" \
+            | while read -r id; do [ -n "$id" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" || true; done
+
           NOTES=$(cat <<'EOF'
           ## 免安装包
 
@@ -103,6 +115,7 @@ jobs:
           > 仅供学习与研究，请自行评估使用风险。
           EOF
           )
-          gh release create "$GITHUB_REF_NAME" dist/*.zip \
-            --title "pk-node $GITHUB_REF_NAME" \
+          gh release create "$TAG" dist/*.zip \
+            --title "pk-node $TAG" \
+            --latest \
             --notes "$NOTES"
