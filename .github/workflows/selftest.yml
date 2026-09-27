@@ -1,0 +1,94 @@
+name: selftest
+
+# 每次 push / PR 都跑一遍纯 JS 自检。
+#
+# 为什么跳过原生检查：bin/native/ 是 **arm64 的 Android 库**，
+# 而 GitHub 的默认 runner 是 x86_64 —— 在那里跑 linker64 必然失败，
+# 失败原因是「架构不对」而不是「代码坏了」。
+# 所以这里用 PK_SKIP_NATIVE=1 只验证与架构无关的部分：
+#   sign 公式 / RSA 编码 / 笔画算法 / 提交体结构 / 模块导出完整性。
+# 原生链路的完整自检请在 arm64 设备上跑 `node bin/selftest.js`。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 项目要求 Node >= 22（node:sqlite 自 22.5 起）
+        node: [22, 24]
+
+    name: Node ${{ matrix.node }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: 版本信息
+        run: |
+          node -v
+          npm -v
+          echo "arch: $(node -p 'process.arch')"
+
+      - name: 语法检查（全部 .js）
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            node --check "$f" || { echo "::error file=$f::语法错误"; fail=1; }
+          done < <(find . -name '*.js' -not -path './node_modules/*' -not -path './.git/*')
+          exit $fail
+
+      - name: 自检（跳过 arm64 原生检查）
+        env:
+          PK_SKIP_NATIVE: '1'
+        run: node bin/selftest.js
+
+      - name: 启动冒烟测试（起服务 → 探活 → 关掉）
+        env:
+          PK_SKIP_NATIVE: '1'
+          PK_PORT: '8791'
+          PK_DB: /tmp/pk-ci.sqlite
+        run: |
+          node server.js > /tmp/server.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 30); do
+            if curl -fsS -m 2 http://127.0.0.1:8791/api/auth/me >/dev/null 2>&1; then
+              echo "服务已就绪（第 ${i} 次探测）"; break
+            fi
+            sleep 0.5
+          done
+
+          echo "--- 探活 ---"
+          curl -fsS http://127.0.0.1:8791/api/auth/me
+          echo
+
+          echo "--- 登录 admin/admin ---"
+          curl -fsS -c /tmp/ck.txt -X POST http://127.0.0.1:8791/api/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"admin"}'
+          echo
+
+          echo "--- 静态页 ---"
+          curl -fsS -o /dev/null -w 'index %{http_code}\n' http://127.0.0.1:8791/
+          curl -fsS -o /dev/null -w 'app.js %{http_code}\n' http://127.0.0.1:8791/app.js
+
+          echo "--- 未登录应 401 ---"
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8791/api/jobs)
+          echo "HTTP $code"
+          test "$code" = "401"
+
+          echo "--- 服务日志 ---"
+          cat /tmp/server.log
+
+          kill $SRV || true
+          wait $SRV 2>/dev/null || true

@@ -8,10 +8,18 @@
 
 MIT License —— `bin/native/` 下的第三方二进制不在授权范围内，见 [NOTICE](bin/native/NOTICE.md)
 
+[![selftest](https://github.com/sxd91/pk-node/actions/workflows/selftest.yml/badge.svg)](https://github.com/sxd91/pk-node/actions/workflows/selftest.yml)
+[![pages](https://github.com/sxd91/pk-node/actions/workflows/pages.yml/badge.svg)](https://sxd91.github.io/pk-node/)
+
+📄 **项目介绍页：https://sxd91.github.io/pk-node/**
+
 ```bash
 ./start.sh                 # 默认 http://127.0.0.1:8787
 PK_PORT=8790 ./start.sh    # 换端口
 ```
+
+Windows：双击 `start.bat`（**注意**：Windows 上只有网页 / 登录 / 数据库可用，
+刷局需要 arm64 原生库，跑不了 —— 详见该脚本顶部说明）。
 
 浏览器打开 → 用 `admin / admin` 登录（**第一次登录后请立刻改密**）。
 

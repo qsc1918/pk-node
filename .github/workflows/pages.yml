@@ -1,0 +1,46 @@
+name: pages
+
+# 把 docs/ 发布到 GitHub Pages（项目介绍页）。
+#
+# 注意：只托管**静态**页面。pk-node 本体需要 Node 运行时 + SQLite +
+# arm64 原生库，Pages 跑不了 —— 这里发布的是介绍 / 文档页。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 只保留最新一次部署，不排队
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 配置 Pages
+        uses: actions/configure-pages@v5
+
+      - name: 打包 docs/
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: 部署
+        id: deployment
+        uses: actions/deploy-pages@v4

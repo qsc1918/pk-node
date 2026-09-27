@@ -14,19 +14,41 @@ const { config } = require(path.join(root, 'src', 'config'));
 
 let failed = 0;
 
+/**
+ * 能不能跑「原生」检查（sign / 内容编码）。
+ *
+ * `bin/native/` 里是 **arm64 的 Android 库**，只有在 arm64 环境（手机 / Apple Silicon
+ * / arm64 容器）才跑得起来。GitHub 的默认 runner 是 x86_64 Linux，所以那里必须跳过
+ * —— 否则 CI 会红，而红的原因是「架构不对」而不是「代码坏了」。
+ *
+ * 可用 `PK_SKIP_NATIVE=1` 强制跳过；`PK_FORCE_NATIVE=1` 强制尝试。
+ */
+const CAN_RUN_NATIVE = process.env.PK_FORCE_NATIVE === '1'
+  ? true
+  : (process.env.PK_SKIP_NATIVE !== '1' && process.arch === 'arm64');
+
 function check(name, ok, detail) {
   console.log((ok ? '  [OK]   ' : '  [FAIL] ') + name + (detail ? ' → ' + detail : ''));
   if (!ok) failed++;
 }
 
+function skip(name, why) {
+  console.log('  [SKIP] ' + name + ' —— ' + why);
+}
+
 console.log('== pk-node 自检 ==');
 console.log('项目目录: ' + root);
 console.log('native  : ' + config.nativeDir);
+console.log('平台    : ' + process.platform + '/' + process.arch + (CAN_RUN_NATIVE ? '' : '（原生检查将跳过）'));
 console.log('');
 
 console.log('1) native 资产与 sign');
-const nt = nativeLib.selfTest();
-check('native 链路', nt.ok, nt.ok ? '样例 sign ' + nt.sample : nt.detail);
+if (!CAN_RUN_NATIVE) {
+  skip('native 链路', `当前是 ${process.platform}/${process.arch}，bin/native 是 arm64 Android 库`);
+} else {
+  const nt = nativeLib.selfTest();
+  check('native 链路', nt.ok, nt.ok ? '样例 sign ' + nt.sample : nt.detail);
+}
 
 console.log('');
 console.log('2) sign 公式（纯 JS，对照历史真机样本）');
@@ -64,15 +86,17 @@ if (body) {
 console.log('');
 console.log('4) 内容编码器（密文逐字节对齐真机，若样本在）');
 const sampleGz = path.join(config.nativeDir, 'pk_body.gz');
-const samplePlain = '/root/alinker/pk_body.json';
-if (fs.existsSync(sampleGz) && fs.existsSync(samplePlain)) {
+const samplePlain = process.env.PK_SAMPLE_PLAIN || '/root/alinker/pk_body.json';
+if (!CAN_RUN_NATIVE) {
+  skip('内容编码器', '非 arm64 环境，跳过');
+} else if (fs.existsSync(sampleGz) && fs.existsSync(samplePlain)) {
   const raw = fs.readFileSync(samplePlain);
   const gz = nativeLib.gzipLikeDevice(raw);
   check('gzip(level6,mtime0,OS=0xff) 与样本一致', gz.equals(fs.readFileSync(sampleGz)));
   const enc = nativeLib.encodeSubmitBody(raw);
   check('c(gzip) 长度与 gzip 相同（等长变换）', enc.length === gz.length, enc.length + 'B');
 } else {
-  console.log('  [SKIP] 无样本（bin/native/pk_body.gz 或 /root/alinker/pk_body.json 缺失）');
+  skip('内容编码器比对', '缺样本（bin/native/pk_body.gz 或 ' + samplePlain + '）');
 }
 
 console.log('');
