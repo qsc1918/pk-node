@@ -25,6 +25,15 @@ const MAX_CONCURRENT = 3;
 const running = new Map();
 
 /**
+ * 「该账号上次**成功出题**的时刻」，按 `leoAccountId` 索引（模块级，跨任务共享）。
+ *
+ * 用途：出题接口的冷却是账号级的（实测 ≈61.6s，见 config.js）。
+ * 记住这个时刻后，下一轮可以直接等到「上次成功 + 冷却」再发车，
+ * 既不用猜窗口大小、也不会每次都白撞一次 —— 这就是「最快」的实现方式。
+ */
+const lastMatchOkAt = new Map();
+
+/**
  * 任务事件监听器：jobId → Set<fn>。
  * 用于 SSE（`/api/jobs/:id/stream`）向网页实时推日志。
  */
@@ -138,7 +147,18 @@ function startJob(o) {
 
   // 「立即结束」靠这个 controller：既中断在途 HTTP，也中断等待中的 sleep
   const controller = new AbortController();
-  const ctx = { stopped: false, jar: jar, config: cfg, controller: controller, signal: controller.signal };
+  // 出题冷却**按账号**共享：把「该账号上次成功出题的时刻」放进一个按
+  // leoAccountId 索引的**模块级**表，这样换任务/换知识点也能接着贴窗口下沿，
+  // 而不是每个新任务都从零重新白撞一次。
+  const ctx = {
+    stopped: false,
+    jar: jar,
+    config: cfg,
+    controller: controller,
+    signal: controller.signal,
+    get lastMatchOkAt() { return lastMatchOkAt.get(job.leo_account_id) || 0; },
+    set lastMatchOkAt(v) { lastMatchOkAt.set(job.leo_account_id, v); },
+  };
   running.set(job.id, ctx);
   db.setJobStatus(job.id, 'running', { startedAt: Date.now() });
   publish(job.id, { type: 'status', message: '任务开始', at: Date.now() });

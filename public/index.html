@@ -91,16 +91,16 @@
           </div>
 
           <div class="row">
-            <label class="grow">每轮最小间隔 ms<input id="grind-gapmin" type="number" value="60000"></label>
-            <label class="grow">最大间隔 ms<input id="grind-gapmax" type="number" value="66000"></label>
+            <label class="grow">每轮最小间隔 ms<input id="grind-gapmin" type="number" value="4000"></label>
+            <label class="grow">最大间隔 ms<input id="grind-gapmax" type="number" value="8000"></label>
           </div>
 
           <div class="row">
-            <label class="grow">出题频控重试间隔 ms<input id="grind-mretry" type="number" value="10000"></label>
+            <label class="grow">出题频控重试间隔 ms<input id="grind-mretry" type="number" value="8000"></label>
             <label class="grow">出题最长等待 ms<input id="grind-mmax" type="number" value="240000"></label>
           </div>
           <p class="muted small">出题撞频控（HTTP 400「请求过于频繁」）时会按上面的间隔自动重试。
-            所以轮间隔只需设个「下限」，不必去猜频控窗口大小；超过最长等待才判定该轮失败。</p>
+            所以轮间隔只需设个「下限」——引擎会自动等到「上次成功出题 + 冷却(≈61.6s/账号)」再发车，不必去猜窗口大小。</p>
 
           <div class="row">
             <label class="grow">答题间隔最小 ms<em class="hint">出题后等多久再提交</em>

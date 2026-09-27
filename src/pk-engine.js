@@ -148,18 +148,34 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
   // 1) 轮间隔（**下限**，不是「睡够就一定能出题」）
   //
   // ⚠️ 这段等待期间日志必须**有东西可看**，否则前端会以为卡死：
-  // 长间隔（默认 12~20s）里没有事件的话，用户看到的就是一片空白。
-  // 所以这里每 5 秒发一个 tick，让 UI 能显示「还剩 Xs」。
+  // 长间隔里没有事件的话，用户看到的就是一片空白。所以每 5 秒发一个 tick。
   //
-  // 注意语义：睡完这个间隔**并不保证**能出题成功 —— 服务端出题接口有独立频控，
-  // 到点了仍可能 400。真正的兜底是下面第 2 步的「频控自动重试」。
-  const gapMin = num(cfg.gapMinMs, 12000);
-  const gapMax = num(cfg.gapMaxMs, 20000);
+  // ## 速度策略：贴着出题冷却的下沿跑
+  //
+  // 出题接口的冷却实测 ≈ [PK.matchCooldownMs]（账号级，与请求形态无关，
+  // 见 config.js 的实测表）。「最快」不是把 gap 调大或调小，而是：
+  //
+  //   等 = max(配置的轮间隔, 上次成功出题 + 冷却 - 现在)
+  //
+  // ctx 里带着**同账号**上一次成功出题的时刻（跨轮/跨任务共享），
+  // 所以连续刷局时不会每次都白撞窗口、也不会多等 —— 恰好贴着下沿发车。
+  const gapMin = num(cfg.gapMinMs, 4000);
+  const gapMax = num(cfg.gapMaxMs, 8000);
   const gap = gapMin + Math.floor(Math.random() * Math.max(1, gapMax - gapMin));
-  if (gap > 0) {
-    emit({ type: 'gap', message: `等待 ${(gap / 1000).toFixed(1)}s 后尝试下一局`, gapMs: gap });
+
+  let cooldownWait = 0;
+  if (ctx && ctx.lastMatchOkAt && PK.matchCooldownMs > 0) {
+    const target = ctx.lastMatchOkAt + PK.matchCooldownMs - num(cfg.matchCooldownSafetyMs, PK.matchCooldownSafetyMs);
+    cooldownWait = Math.max(0, target - Date.now());
+  }
+  const wait = Math.max(gap, cooldownWait);
+  if (wait > 0) {
+    const why = cooldownWait > gap
+      ? `按出题冷却（${(PK.matchCooldownMs / 1000).toFixed(1)}s/账号）等 ${(wait / 1000).toFixed(1)}s 后出题`
+      : `等待 ${(wait / 1000).toFixed(1)}s 后尝试下一局`;
+    emit({ type: 'gap', message: why, gapMs: Math.round(wait) });
     // 可中断：点「立即结束」时不用等这段等待走完
-    await sleepWithTicks(gap, (leftMs) => {
+    await sleepWithTicks(wait, (leftMs) => {
       emit({ type: 'tick', message: `距下轮还有 ${Math.ceil(leftMs / 1000)}s`, leftMs: leftMs });
     }, signal);
   }
@@ -177,7 +193,7 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
   // 而不需要用户去猜一个刚好大于频控窗口的数 —— 猜小了会白跑一局，
   // 猜大了又白白拖慢。
   const matchMaxWaitMs = num(cfg.matchRetryMaxMs, 4 * 60 * 1000);
-  const matchIntervalMs = num(cfg.matchRetryIntervalMs, 15_000);
+  const matchIntervalMs = num(cfg.matchRetryIntervalMs, 8_000);
   emit({ type: 'match', message: `出题 pointId=${cfg.pointId}` });
   let m = null;
   {
@@ -208,6 +224,8 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
       ensureLive();
     }
     emit({ type: 'match-ok', message: `出题成功：pkIdStr=${m.json.pkIdStr}，共 ${((m.json.examVO && m.json.examVO.questions) || []).length} 题（第 ${tries} 次尝试）` });
+    // 记下这次成功时刻（**按账号**共享）→ 下一轮据此贴冷却下沿发车
+    if (ctx) ctx.lastMatchOkAt = Date.now();
   }
   const pkIdStr = m.json.pkIdStr;
   const qCount = (m.json.examVO && m.json.examVO.questions) ? m.json.examVO.questions.length : 0;

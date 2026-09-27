@@ -147,20 +147,40 @@ const PK = {
   rateLimitBaseMs: 60_000,
   rateLimitMaxWait: 2,
   /**
-   * 出题接口的冷却（**2026-09-27 实测 ≈ 61.6 秒**，同账号同 pointId）。
-   *
-   * 实测方法：先成功出题一次，然后每 10s 试一次，直到再次 200 →
-   * 10/21/31/41/51s 全 400，62s 放行。
-   *
-   * 所以：
-   *  - 轮间隔（gapMin/gapMax）默认设成 **略大于 60s**，避免每轮都白撞一次；
-   *  - 但轮间隔只是「下限」，真正保证不失败的是 `matchRetry*`：
-   *    撞到 400 就按 `matchRetryIntervalMs` 自动重试，总等待超过
-   *    `matchRetryMaxMs` 才判该轮失败。这样用户不必去猜窗口大小。
-   */
-  matchCooldownMs: 61_600,
-  matchRetryIntervalMs: 10_000,
-  matchRetryMaxMs: 240_000,
+ * 出题接口的冷却（**2026-09-27 实测 ≈ 61.6 秒**，同账号）。
+ *
+ * 实测方法：先成功出题一次，然后每 10s 试一次，直到再次 200 →
+ * 10/21/31/41/51s 全 400，62s 放行。
+ *
+ * ## 这个数字有多「硬」？（都试过，全部 400）
+ *
+ * | 变体 | 结果 |
+ * |---|---|
+ * | 换知识点 `pointId` | 400 |
+ * | 换 UA（`Leo/…` ↔ 真实 WebView UA） | 400 |
+ * | 换 `platform`（`android36` ↔ `browser`） | 400 |
+ * | 加 / 不加减 `sign` | 400 |
+ * | 删风控头 / 加 `sw8` / 加主域头 | 400 |
+ * | 补 App 注入的参数（`YFD_U` / `from` / `phaseId` / `vendor`） | 400 |
+ * | 换其它出题接口（`multi/match` / `english/pk/match`） | 400 |
+ *
+ * ⇒ 冷却是**账号级**的，与请求形态无关。原版走 `match/v2`（需要 App 的
+ * LeoSecure 原生桥，纯 HTTP 9 种组合一律 417），所以本方案下
+ * **「每账号 ≈ 60s 一局」就是硬上限**。
+ *
+ * ## 所以速度优化的正确方向
+ *
+ * 不是「猜/绕过窗口」，而是**精确贴着窗口下沿跑**：
+ *  1. `matchCooldownMs`：记住上次成功出题的时刻，下一轮直接等到
+ *     `上次成功 + 冷却` 再试（而不是先睡一个拍脑袋的 gap 再干等重试）；
+ *  2. 撞到 400 时按 `matchRetryIntervalMs` 兜底重试（估计偏了也能自愈）；
+ *  3. 想再快只能**加账号**（冷却按账号隔离，多号并行 = 线性提速）。
+ */
+matchCooldownMs: 61_600,
+matchRetryIntervalMs: 8_000,
+matchRetryMaxMs: 240_000,
+/** 冷却的估计最多往回缩这么多（避免每次都在窗口边缘白撞一次）。 */
+matchCooldownSafetyMs: 1_200,
 };
 
 /**
