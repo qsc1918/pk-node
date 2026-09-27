@@ -300,13 +300,16 @@ async function handleApi(req, res, u, user) {
     const cfg = {
       pointId: Number(b.pointId || 1951),
       costTimeMs: b.costTimeMs == null || b.costTimeMs === '' ? null : Number(b.costTimeMs),
-      gapMinMs: b.gapMinMs == null ? 12000 : Number(b.gapMinMs),
-      gapMaxMs: b.gapMaxMs == null ? 20000 : Number(b.gapMaxMs),
+      gapMinMs: b.gapMinMs == null ? 60000 : Number(b.gapMinMs),
+      gapMaxMs: b.gapMaxMs == null ? 66000 : Number(b.gapMaxMs),
       // 出题成功 → 提交答案 之间的间隔（让节奏更像真人，也错开频控窗口）
       submitDelayMinMs: b.submitDelayMinMs == null ? 0 : Number(b.submitDelayMinMs),
       submitDelayMaxMs: b.submitDelayMaxMs == null ? 0 : Number(b.submitDelayMaxMs),
       rateLimitBaseMs: b.rateLimitBaseMs == null ? PK.rateLimitBaseMs : Number(b.rateLimitBaseMs),
       rateLimitMaxWait: b.rateLimitMaxWait == null ? PK.rateLimitMaxWait : Number(b.rateLimitMaxWait),
+      // 出题被频控时的自动重试：间隔 / 总等待上限（见 pk-engine 第 2 步）
+      matchRetryIntervalMs: b.matchRetryIntervalMs == null ? 10000 : Number(b.matchRetryIntervalMs),
+      matchRetryMaxMs: b.matchRetryMaxMs == null ? 240000 : Number(b.matchRetryMaxMs),
       strokeMode: strokes.normalizeStrokeMode(b.strokeMode),
       subUserId: b.subUserId == null ? null : Number(b.subUserId),
     };

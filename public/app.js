@@ -395,12 +395,14 @@ $('btn-start').addEventListener('click', async () => {
     subUserId: $('grind-sub').value ? Number($('grind-sub').value) : null,
     pointId: Number($('grind-point').value || 1951),
     rounds: Number($('grind-rounds').value || 10),
-    gapMinMs: Number($('grind-gapmin').value || 12000),
-    gapMaxMs: Number($('grind-gapmax').value || 20000),
+    gapMinMs: Number($('grind-gapmin').value || 60000),
+    gapMaxMs: Number($('grind-gapmax').value || 66000),
     submitDelayMinMs: Number($('grind-delaymin').value || 0),
     submitDelayMaxMs: Number($('grind-delaymax').value || 0),
     rateLimitBaseMs: Number($('grind-rlbase').value || 60000),
     rateLimitMaxWait: Number($('grind-rlmax').value || 2),
+    matchRetryIntervalMs: Number(($('grind-mretry') || {}).value || 10000),
+    matchRetryMaxMs: Number(($('grind-mmax') || {}).value || 240000),
     strokeMode: strokeEl ? strokeEl.value : 'ARC',
   };
   // costTime 留空 = 自动（服务端按题数 × 5ms 给下限）

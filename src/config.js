@@ -146,6 +146,21 @@ const PK = {
    */
   rateLimitBaseMs: 60_000,
   rateLimitMaxWait: 2,
+  /**
+   * 出题接口的冷却（**2026-09-27 实测 ≈ 61.6 秒**，同账号同 pointId）。
+   *
+   * 实测方法：先成功出题一次，然后每 10s 试一次，直到再次 200 →
+   * 10/21/31/41/51s 全 400，62s 放行。
+   *
+   * 所以：
+   *  - 轮间隔（gapMin/gapMax）默认设成 **略大于 60s**，避免每轮都白撞一次；
+   *  - 但轮间隔只是「下限」，真正保证不失败的是 `matchRetry*`：
+   *    撞到 400 就按 `matchRetryIntervalMs` 自动重试，总等待超过
+   *    `matchRetryMaxMs` 才判该轮失败。这样用户不必去猜窗口大小。
+   */
+  matchCooldownMs: 61_600,
+  matchRetryIntervalMs: 10_000,
+  matchRetryMaxMs: 240_000,
 };
 
 /**

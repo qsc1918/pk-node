@@ -145,16 +145,19 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
     if (signal && signal.aborted) throw abortedError();
   };
 
-  // 1) 轮间隔（规避频控）
+  // 1) 轮间隔（**下限**，不是「睡够就一定能出题」）
   //
   // ⚠️ 这段等待期间日志必须**有东西可看**，否则前端会以为卡死：
   // 长间隔（默认 12~20s）里没有事件的话，用户看到的就是一片空白。
   // 所以这里每 5 秒发一个 tick，让 UI 能显示「还剩 Xs」。
+  //
+  // 注意语义：睡完这个间隔**并不保证**能出题成功 —— 服务端出题接口有独立频控，
+  // 到点了仍可能 400。真正的兜底是下面第 2 步的「频控自动重试」。
   const gapMin = num(cfg.gapMinMs, 12000);
   const gapMax = num(cfg.gapMaxMs, 20000);
   const gap = gapMin + Math.floor(Math.random() * Math.max(1, gapMax - gapMin));
   if (gap > 0) {
-    emit({ type: 'gap', message: `等待 ${(gap / 1000).toFixed(1)}s 以规避频控`, gapMs: gap });
+    emit({ type: 'gap', message: `等待 ${(gap / 1000).toFixed(1)}s 后尝试下一局`, gapMs: gap });
     // 可中断：点「立即结束」时不用等这段等待走完
     await sleepWithTicks(gap, (leftMs) => {
       emit({ type: 'tick', message: `距下轮还有 ${Math.ceil(leftMs / 1000)}s`, leftMs: leftMs });
@@ -162,15 +165,52 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
   }
   ensureLive();
 
-  // 2) 出题
+  // 2) 出题 —— **遇频控自动等待重试**（对齐真机：点「继续PK」立刻下一局）
+  //
+  // 真机点「继续PK」是立刻请求的；如果撞上频控，真人会等一会儿再点。
+  // 本引擎把这件「等一会儿再点」自动化：
+  //   · 拿到 200 → 继续
+  //   · 撞频控（400 请求过于频繁 / 403）→ 报一次日志，等 intervalMs 再试，直到超时
+  //   · 撞非频控错误 → 立刻失败，不浪费时间
+  //
+  // 这样配置里那个「轮间隔」就只是**下限**（保护服务器、也让节奏像真人），
+  // 而不需要用户去猜一个刚好大于频控窗口的数 —— 猜小了会白跑一局，
+  // 猜大了又白白拖慢。
+  const matchMaxWaitMs = num(cfg.matchRetryMaxMs, 4 * 60 * 1000);
+  const matchIntervalMs = num(cfg.matchRetryIntervalMs, 15_000);
   emit({ type: 'match', message: `出题 pointId=${cfg.pointId}` });
-  const m = await leo.pkMatch(jar, cfg.pointId, anySignal({}));
-  if (m.status !== 200 || !m.json) {
-    return fail(m.status, `出题失败 HTTP ${m.status}`, m.text, t0);
+  let m = null;
+  {
+    const tMatch = Date.now();
+    let tries = 0;
+    for (;;) {
+      m = await leo.pkMatch(jar, cfg.pointId, anySignal({}));
+      tries++;
+      if (m.status === 200 && m.json) break;
+
+      // 非频控错误：没必要重试
+      if (!isRateLimited(m.status, m.text)) {
+        return fail(m.status, `出题失败 HTTP ${m.status}`, m.text, t0);
+      }
+      const waited = Date.now() - tMatch;
+      if (waited >= matchMaxWaitMs) {
+        return fail(m.status,
+          `出题持续频控（已重试 ${tries} 次 / ${Math.round(waited / 1000)}s 仍未放行）`,
+          m.text, t0);
+      }
+      emit({
+        type: 'rate-limit',
+        message: `出题被频控（HTTP ${m.status}），${Math.round(matchIntervalMs / 1000)}s 后自动重试（已等 ${Math.round(waited / 1000)}s）`,
+      });
+      await sleepWithTicks(matchIntervalMs, (leftMs) => {
+        emit({ type: 'tick', message: `出题重试倒计时 ${Math.ceil(leftMs / 1000)}s`, leftMs: leftMs });
+      }, signal);
+      ensureLive();
+    }
+    emit({ type: 'match-ok', message: `出题成功：pkIdStr=${m.json.pkIdStr}，共 ${((m.json.examVO && m.json.examVO.questions) || []).length} 题（第 ${tries} 次尝试）` });
   }
   const pkIdStr = m.json.pkIdStr;
   const qCount = (m.json.examVO && m.json.examVO.questions) ? m.json.examVO.questions.length : 0;
-  emit({ type: 'match-ok', message: `出题成功：pkIdStr=${pkIdStr}，共 ${qCount} 题` });
 
   // 2.5) 拿到题目 → 提交答案 之间的间隔（可配）
   //
