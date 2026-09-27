@@ -17,3 +17,9 @@
 版权归各自权利人所有。若你要分发本项目，请自行评估并遵守相应许可；
 
 **建议**：把这一类文件从版本库中排除，改为提供"如何从你自己的设备提取"的脚本。
+
+## 补充：`bin/keystream.bin`（本项目目录外）
+
+`bin/keystream.bin` 是从 `libContentEncoder.so` **提取出来的密钥流数据**
+（编码全零输入即可得到）。它不是第三方二进制本身，而是逆向产物；
+用作纯 JS 内容编码（见 `src/keystream.js`）。重新提取：`node tools/keystream-extract.js`。

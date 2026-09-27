@@ -19,6 +19,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 const { config } = require('./config');
+const keystream = require('./keystream');
 
 // 单次 harness 超时（毫秒）。真机实测 100~250ms，给足余量。
 const NATIVE_TIMEOUT_MS = 20000;
@@ -55,27 +56,44 @@ function runNative(bin, args) {
   };
 }
 
-// 按设备口径 gzip：zlib level 6、无 mtime、OS 字段 0xff。
+// 按设备口径 gzip：优先系统 gzip（zlib level 6、无 mtime、OS 字段 0xff）。
 // 实测真机 gzip 流与本机 `gzip -6 -n` 逐字节相同，仅第 10 字节不同。
+//
+// 没有系统 gzip（Windows）→ 回落 Node zlib。压缩实现不同、字节会不一样，但格式合法，
+// 服务端 gunzip 得回同一份 JSON —— 内容编码只是对字节流做 XOR，不要求 gzip 与真机一致。
 function gzipLikeDevice(buf) {
   const r = spawnSync('gzip', ['-6', '-n', '-c'], {
     input: buf,
     maxBuffer: 1 << 26,
     timeout: NATIVE_TIMEOUT_MS,
   });
-  if (r.status !== 0 || !r.stdout || r.stdout.length === 0) {
-    throw new Error('gzip 失败：' + (r.stderr ? r.stderr.toString() : r.status));
+  if (r.status === 0 && r.stdout && r.stdout.length) {
+    const out = Buffer.from(r.stdout);
+    if (out.length > GZIP_OS_BYTE_INDEX) out[GZIP_OS_BYTE_INDEX] = GZIP_OS_BYTE_VALUE;
+    return out;
   }
-  const out = Buffer.from(r.stdout);
-  if (out.length > GZIP_OS_BYTE_INDEX) out[GZIP_OS_BYTE_INDEX] = GZIP_OS_BYTE_VALUE;
-  return out;
+  const zlib = require('node:zlib');
+  const gz = zlib.gzipSync(buf, { level: 6 });
+  if (gz.length > GZIP_OS_BYTE_INDEX) gz[GZIP_OS_BYTE_INDEX] = GZIP_OS_BYTE_VALUE;
+  return gz;
 }
 
 // 契约（逐字节验证过）：cipher = c( gzip(json, level=6, mtime=0) )，无外层 AES，等长。
+//
+// ★ 2026-09-27 起默认走**纯 JS**：c() 已被证明是「与固定密钥流逐位置 XOR」
+//   （推导与验证见 src/keystream.js）。好处：不需要 arm64 原生库（x86/Windows 也能编码），
+//   且省掉每轮 80~250ms 的子进程开销。
+//   只有密钥流文件缺失时才回落到原生 libContentEncoder（等价备份路径）。
 function encodeSubmitBody(jsonBytes) {
   const raw = Buffer.isBuffer(jsonBytes) ? jsonBytes : Buffer.from(String(jsonBytes), 'utf8');
   const gz = gzipLikeDevice(raw);
 
+  // 首选：纯 JS（与原生逐字节等价，已多长度验证）
+  if (keystream.available()) {
+    return keystream.xorEncode(gz);
+  }
+
+  // 回落：原生编码器
   const inFile = tmpPath('.gz');
   const outFile = tmpPath('.enc');
   fs.writeFileSync(inFile, gz);
@@ -123,22 +141,34 @@ function safeUnlink(p) {
   try { fs.unlinkSync(p); } catch (e) { /* 临时文件已被清或不存在 */ }
 }
 
-// 启动自检：native 资产齐备 + sign 可算。失败则启动即报错。
+// 启动自检：**编码**（纯 JS 密钥流）+ **sign**（仍需 arm64 原生库）。
+// 失败则启动即报错，比跑起来才发现强。
 function selfTest() {
-  const need = [
-    'linker64', 'libc.so', 'libm.so', 'libdl.so', 'liblog.so',
-    'libc++.so', 'libc++_shared.so', 'libContentEncoder_patched.so', 'lre.so', 'dump7', 'enc_device',
-  ];
-  for (const f of need) {
-    const p = path.join(config.nativeDir, f);
-    if (!fs.existsSync(p)) return { ok: false, detail: '缺少 native 资产：' + p };
+  const enc = keystream.selfTest();
+  if (!enc.ok) return { ok: false, detail: '内容编码器不可用：' + enc.detail };
+
+  const need = ['linker64', 'lre.so', 'dump7'];
+  const missing = need.filter((f) => !fs.existsSync(path.join(config.nativeDir, f)));
+  if (missing.length) {
+    return {
+      ok: false,
+      encoding: enc,
+      detail: '内容编码可用（纯 JS），但缺 sign 所需原生资产：' + missing.join(', ') +
+        '（sign 需要 arm64；x86 可用 qemu-user 跑 bin/native/linker64）',
+    };
   }
+
   try {
     const sample = calcSign('/leo-game-pk/android/math/pk/submit');
     if (!/^[0-9a-f]{32}$/.test(sample)) return { ok: false, detail: 'sign 输出异常：' + sample };
-    return { ok: true, detail: 'native 链路可用', sample: sample };
+    return {
+      ok: true,
+      encoding: enc,
+      detail: enc.warn ? ('sign 可用；注意：' + enc.detail) : '编码（纯 JS）+ sign（原生）均可用',
+      sample: sample,
+    };
   } catch (e) {
-    return { ok: false, detail: e.message };
+    return { ok: false, encoding: enc, detail: 'sign 计算失败（编码仍可用）：' + e.message };
   }
 }
 

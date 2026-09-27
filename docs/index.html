@@ -150,7 +150,7 @@ cd pk-node
     </tr>
     <tr>
       <td>内容编码器</td>
-      <td><code>cipher = c( gzip(json, level6, mtime=0) )</code>，外层没有 AES，等长变换。<b>已实测与真机密文逐字节一致</b>。</td>
+      <td><b>已用纯 JS 复现，不再需要原生库</b>。差分分析证明 <code>c()</code> 就是「与固定密钥流逐位置 XOR」（翻转 1 bit 只变同位置 1 字节、<code>in XOR out</code> 的流恒定、与总长无关、确定性），因此编码全零即得密钥流。<br>纯 JS XOR 在 1B~128KiB 各长度<b>逐字节等于原生结果</b>，且与真机密文一致；耗时从 80–250ms 降到 ~14ms。</td>
     </tr>
   </table>
 
@@ -175,7 +175,7 @@ cd pk-node
     </tr>
     <tr>
       <td>平台限制</td>
-      <td><code>bin/native/</code> 是 arm64 Android 库，<b>x86 / Windows 跑不了刷局</b>（网页与登录仍可用）。</td>
+      <td>内容编码已是纯 JS；只有 <code>sign</code> 需执行 arm64 原生库，所以 <b>x86 / Windows 上完整刷局仍不行</b>（网页、登录、数据库可用）。x86_64 Linux / WSL2 可试 <code>qemu-user-static</code> 用户态模拟（作者未在 x86 实测）。</td>
     </tr>
     <tr>
       <td>频控</td>

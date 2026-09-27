@@ -18,8 +18,9 @@ MIT License —— `bin/native/` 下的第三方二进制不在授权范围内�
 PK_PORT=8790 ./start.sh    # 换端口
 ```
 
-Windows：双击 `start.bat`（**注意**：Windows 上只有网页 / 登录 / 数据库可用，
-刷局需要 arm64 原生库，跑不了 —— 详见该脚本顶部说明）。
+Windows：双击 `start.bat`。
+**内容编码已是纯 JS**，但 `sign` 仍需 arm64 原生库，
+所以 Windows（x86）上能跑网页/登录，**完整刷局仍需 arm64 或 qemu-user**（见下）。
 
 浏览器打开 → 用 `admin / admin` 登录（**第一次登录后请立刻改密**）。
 
@@ -41,13 +42,48 @@ Windows：双击 `start.bat`（**注意**：Windows 上只有网页 / 登录 / �
 
 ## 二、为什么需要 native 资产（`bin/native/`）
 
-小猿的两个关键环节是 **arm64 原生实现**，纯 JS 重写既不划算也不可靠：
+小猿的两个关键环节原本是 **arm64 原生实现**。其中**内容编码器已经被完全拆解**，
+现在只有 `sign` 还需要原生库：
 
-1. **`sign`** —— 4 轮 MD5 链（salt = `wdi4n2t8edr`），但它的 `T` 段来自 so 里
-   一个 4.6KB 的函数（含 `time()`，随分钟变化）。本项目**纯 JS 保存了公式并做了离线自校验**
-   （`src/sign.js` 的 `verifyWithFixture()`），实际计算走原生 harness 拿当下的 `T`。
-2. **内容编码器** —— `libContentEncoder.so`：`cipher = c( gzip(json, level6, mtime=0) )`，
-   外层没有 AES，等长变换。**已实测与真机密文逐字节一致**。
+1. **内容编码器** —— ✅ **已用纯 JS 复现，不再需要原生库**。
+   差分分析证明 `libContentEncoder.so` 的内层函数 `c()` 就是
+   **「与一条固定密钥流逐位置 XOR」**：
+
+   | 实验 | 结果 |
+   |---|---|
+   | 翻转输入 1 bit | 输出**只变同位置 1 个字节**（无扩散） |
+   | 两段不同的同长输入 | `in XOR out` 得到的流**完全相同** |
+   | 短输入 vs 长输入前缀 | 密钥流**逐字节一致**（与总长无关） |
+   | 同输入重复编码 | 完全一致（确定性） |
+
+   ⇒ `out[i] = in[i] ^ K[i]`，于是**编码全零输入，输出就是密钥流**。
+   密钥流已提取为 `bin/keystream.bin`（128 KiB），纯 JS XOR 在
+   1B / 2B / 17B / 256B / 4524B / 20000B / 131071B / 131072B **全部逐字节等于原生结果**，
+   并且**与真机抓包密文一致**。收益：x86/Windows 也能编码，且省掉每轮 80–250ms 的子进程开销
+   （实测降到 ~14ms）。
+
+2. **`sign`** —— ⚠️ **仍需原生库**。它是 4 轮 MD5 链（salt = `wdi4n2t8edr`），
+   公式已用纯 JS 复现并做了离线自校验（`src/sign.js` 的 `verifyWithFixture()`）；
+   但其中的 `T` 段来自 so 里一个 4.6KB 的函数，**实测随分钟变化**
+   （伪造 4 个不同时间 → 4 个不同 sign），且涉及设备侧数据，**没有复现出来**。
+   所以实际计算仍走原生 harness 取当下的 `T`。
+
+### 在 x86_64 Linux / WSL2 上跑（qemu-user「转译」）
+
+内容编码已是纯 JS，**只剩 `sign`** 需要执行 arm64 的 `linker64` + `lre.so`。
+x86 上可以用 qemu 的**用户态模拟**（不改一行代码）：
+
+```sh
+sudo apt install qemu-user-static binfmt-support
+sudo update-binfmts --enable qemu-aarch64      # 或 systemctl restart systemd-binfmt
+
+# 验证：能打印出 SIGN=... 就成功了
+LD_LIBRARY_PATH=bin/native bin/native/linker64 bin/native/dump7   bin/native/lre.so /leo-game-pk/android/math/pk/submit 0
+```
+
+> ⚠️ **本机未在 x86 上实测过**（开发环境本身就是 arm64）——
+> 这属于「机制上成立、但作者未验证」的方案，遇到问题请提 issue。
+> 另：Windows 原生（非 WSL）不适用，需要先有 WSL2 或 Linux 环境。
 
 ### 跑 Android so 的做法
 
@@ -59,6 +95,9 @@ LD_LIBRARY_PATH=bin/native bin/native/linker64 bin/native/enc_device <so> <in> <
 
 `bin/native/` 里必须有：`linker64`、`libc.so`、`libm.so`、`libdl.so`、`liblog.so`、
 `libc++.so`、`libc++_shared.so`、`libContentEncoder_patched.so`、`lre.so`、`dump7`、`enc_device`。
+
+> **内容编码不再需要这些** —— 它走 `bin/keystream.bin`（纯 JS XOR）。
+> 上面这些只为 `sign` 保留。密钥流换版本时用 `node tools/keystream-extract.js` 重新提取。
 
 > ⚠️ `libContentEncoder_patched.so` 是把 `DT_NEEDED: libandroid.so` **等长覆盖**成 `libc.so`
 > 的版本 —— 因为 libandroid 会拖出一长串 proot 里拉不起来的系统依赖。

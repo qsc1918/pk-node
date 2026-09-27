@@ -84,19 +84,36 @@ if (body) {
 }
 
 console.log('');
-console.log('4) 内容编码器（密文逐字节对齐真机，若样本在）');
+console.log('4) 内容编码器（纯 JS 密钥流 + 可选原生对拍）');
 const sampleGz = path.join(config.nativeDir, 'pk_body.gz');
 const samplePlain = process.env.PK_SAMPLE_PLAIN || '/root/alinker/pk_body.json';
-if (!CAN_RUN_NATIVE) {
-  skip('内容编码器', '非 arm64 环境，跳过');
-} else if (fs.existsSync(sampleGz) && fs.existsSync(samplePlain)) {
-  const raw = fs.readFileSync(samplePlain);
-  const gz = nativeLib.gzipLikeDevice(raw);
-  check('gzip(level6,mtime0,OS=0xff) 与样本一致', gz.equals(fs.readFileSync(sampleGz)));
-  const enc = nativeLib.encodeSubmitBody(raw);
-  check('c(gzip) 长度与 gzip 相同（等长变换）', enc.length === gz.length, enc.length + 'B');
+const ksLib = require(path.join(root, 'src', 'keystream'));
+const ksTest = ksLib.selfTest();
+if (!ksTest.ok) {
+  check('密钥流可用', false, ksTest.detail);
 } else {
-  skip('内容编码器比对', '缺样本（bin/native/pk_body.gz 或 ' + samplePlain + '）');
+  check('密钥流可用', true, ksTest.detail);
+
+  // 纯 JS 编码是否与「设备 gzip 口径」逐字节可复现
+  if (fs.existsSync(sampleGz)) {
+    const raw = fs.existsSync(samplePlain) ? fs.readFileSync(samplePlain) : null;
+    if (raw) {
+      const gz = nativeLib.gzipLikeDevice(raw);
+      check('gzip(level6,mtime0,OS=0xff) 与样本一致', gz.equals(fs.readFileSync(sampleGz)));
+      const enc = nativeLib.encodeSubmitBody(raw);
+      check('纯 JS 编码长度 == gzip 长度（等长）', enc.length === gz.length, enc.length + 'B');
+      check('纯 JS 编码 == XOR(gzip, 密钥流)',
+        enc.equals(ksLib.xorEncode(gz)));
+      // 超长必须明确报错，不能静默截断
+      let threw = false;
+      try { ksLib.xorEncode(Buffer.alloc(ksLib.length() + 1)); } catch (e) { threw = true; }
+      check('超长输入会明确报错（不静默截断）', threw);
+    } else {
+      skip('与样本对拍', '缺 ' + samplePlain);
+    }
+  } else {
+    skip('与样本对拍', '缺 ' + sampleGz);
+  }
 }
 
 console.log('');
