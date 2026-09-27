@@ -6,7 +6,7 @@
 一个**零外部依赖**的本地 Node 服务：起个网页，导入小猿登录态 → 选子账号 → 刷 PK 对局，
 带 SQLite 本地库、实时日志（SSE）、管理后台，并可选 Cloudflare 临时内网穿透。
 
-[MIT License](LICENSE)（`bin/native/` 下第三方二进制不在授权范围内）
+MIT License —— `bin/native/` 下的第三方二进制不在授权范围内，见 [NOTICE](bin/native/NOTICE.md)
 
 ```bash
 ./start.sh                 # 默认 http://127.0.0.1:8787
