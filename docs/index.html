@@ -173,9 +173,10 @@ cd pk-node
   <pre><code>LD_LIBRARY_PATH=bin/native bin/native/linker64 bin/native/enc_device &lt;so&gt; &lt;in&gt; &lt;out&gt;</code></pre>
 
   <div class="note">
-    <b>关于 GitHub Pages：</b>本项目需要 Node 运行时、SQLite 与 arm64 原生库，
+    <b>关于 GitHub Pages：</b>本项目需要 Node 运行时与 SQLite，
     <b>无法在 GitHub Pages 上运行</b>（Pages 只能托管静态文件）。
-    这个页面就是 Pages 能承载的部分 —— 项目介绍。
+    这个页面就是 Pages 能承载的部分 —— 项目介绍；<b>真实运行请下载
+    <a href="https://github.com/sxd91/pk-node/releases/latest">免安装包</a></b>。
     想验证代码是否健康，请看
     <a href="https://github.com/sxd91/pk-node/actions/workflows/selftest.yml">CI</a>。
   </div>
@@ -219,8 +220,9 @@ cd pk-node
 │   ├── db.js              # SQLite 层（node:sqlite）
 │   ├── http.js            # HTTP 客户端 + CookieJar（可中断）
 │   ├── crypto-rsa.js      # RSA 编码（手机号 / 验证码 / 密码）
-│   ├── sign.js            # sign 公式（纯 JS + 离线自校验）
-│   ├── native.js          # 调用 arm64 原生库
+│   ├── sign.js            # sign 公式（纯 JS 复现的 4 轮 MD5 链）
+│   ├── keystream.js       # 内容编码器（纯 JS：固定密钥流 XOR）
+│   ├── native.js          # 编码链路封装 + sign 按 PK_SIGN_MODE 开关
 │   ├── strokes.js         # 画笔算法：弧线 / 七段码
 │   ├── leo.js             # 小猿协议层
 │   ├── pk-engine.js       # 出题 → 组 body → 加密 → 提交
@@ -229,10 +231,13 @@ cd pk-node
 │   └── services/          # auth / login / leo-accounts
 ├── public/                # 网页（原生 HTML+JS+CSS，无构建）
 ├── bin/
-│   ├── native/            # arm64 原生资产（见 NOTICE）
+│   ├── keystream.bin      # 密钥流（128 KiB，内容编码器必需）
 │   ├── selftest.js        # 命令行自检
 │   └── pick-port.js       # 端口避让
-└── .github/workflows/     # CI：语法检查 + 自检 + 启动冒烟
+├── tools/
+│   ├── make-release.js    # 打免安装包
+│   └── keystream-extract.js # so 换版本时重提密钥流
+└── .github/workflows/     # CI：自检 + 启动冒烟 + 打 tag 出 Release
 </code></pre>
 
   <footer>
