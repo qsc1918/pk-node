@@ -11,7 +11,8 @@ bin/cloudflared.*
 
 # ---- 依赖 / 构建产物 ----
 node_modules/
-dist/                 # tools/make-release.js 的产物（发布包），不入库
+# tools/make-release.js 的产物
+dist/
 *.log
 
 # ---- 编辑器 / 系统 ----
