@@ -85,21 +85,20 @@ function sw8Header(traceId) {
  */
 function mainDomainHeaders(extra) {
   const traceId = randomTraceId();
-  return Object.assign(
-    {
-      'User-Agent': leoUserAgent(),
-      Accept: 'application/json',
-      'X-App-Version': PK.commonQuery.version,
-      'X-Channel': 'official',
-      'X-XYKS-REQ-TIMESTAMP': String(Date.now()),
-      'X-XYKS-REQ-NETWORK-ENV': 'mobile',
-      'x-shepherd-did': config.shepherdDid,
-      'x-shepherd-sessionid': '0',
-      'leo-client-trace-id': traceId,
-      'default-namespace-sw8': sw8Header(traceId),
-    },
-    extra || {},
-  );
+  const h = {
+    'User-Agent': leoUserAgent(),
+    Accept: 'application/json',
+    'X-App-Version': PK.commonQuery.version,
+    'X-Channel': 'official',
+    'X-XYKS-REQ-TIMESTAMP': String(Date.now()),
+    'X-XYKS-REQ-NETWORK-ENV': 'mobile',
+    'x-shepherd-sessionid': '0',
+    'leo-client-trace-id': traceId,
+    'default-namespace-sw8': sw8Header(traceId),
+  };
+  // 没配 PK_SHEPHERD_DID 就不发这个头（空值反而可能被判异常）
+  if (config.shepherdDid) h['x-shepherd-did'] = config.shepherdDid;
+  return Object.assign(h, extra || {});
 }
 
 /**

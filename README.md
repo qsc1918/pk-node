@@ -1,7 +1,12 @@
 # pk-node · 小猿口算 PK 刷局（网页版本地服务）
 
+> ⚠️ **仅供学习与研究**：本项目用于研究 Android 客户端的协议与加固实现。
+> 请勿用于任何违反服务条款或法律法规的用途，使用风险自负。
+
 一个**零外部依赖**的本地 Node 服务：起个网页，导入小猿登录态 → 选子账号 → 刷 PK 对局，
 带 SQLite 本地库、实时日志（SSE）、管理后台，并可选 Cloudflare 临时内网穿透。
+
+[MIT License](LICENSE)（`bin/native/` 下第三方二进制不在授权范围内）
 
 ```bash
 ./start.sh                 # 默认 http://127.0.0.1:8787
@@ -209,7 +214,7 @@ sign = md5(s3 + d3 + salt)          salt = "wdi4n2t8edr"
 ### 命令行等价操作
 
 ```bash
-# 自检（native / sign / RSA / body 结构 / 编码器）
+# 自检（native / sign / RSA / 笔画 / body 结构 / 编码器）
 node bin/selftest.js
 
 # 重置管理员密码
@@ -218,6 +223,33 @@ node bin/reset-admin.js 新密码
 # 下载穿透客户端（可选）
 sh bin/get-cloudflared.sh
 ```
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `PK_HOST` | `127.0.0.1` | 监听地址。`0.0.0.0` 则局域网可访问 |
+| `PK_PORT` | `8787` | 端口（`start.sh` 会自动避让被占用的端口） |
+| `PK_DB` | `data/pk-node.sqlite` | SQLite 路径 |
+| `PK_ADMIN_USER` / `PK_ADMIN_PASS` | `admin` / `admin` | 首次启动写入的管理员 |
+| `PK_MAX_CONCURRENT` | `3` | 最大并行任务数 |
+| `PK_SHEPHERD_DID` | 空 | 风控设备标识 `x-shepherd-did`，见下 |
+| `PK_DEVICE_BRAND` / `PK_DEVICE_MODEL` / `PK_DEVICE_SDK` / `PK_DEVICE_SCALE` | `Redmi` / `25053RT47C` / `37` / `3.25` | 拼 App 原生 UA 用，建议按自己设备改 |
+
+> `PK_DEVICE_*` 必须与**你自己设备**一致：主域风控会核对 UA。
+> 用 `getprop ro.product.brand` / `ro.product.model` / `ro.build.version.sdk`
+> 与 `ro.sf.lcd_density`（除以 160 得到 Scale）取值。
+
+**`PK_SHEPHERD_DID` 怎么拿**（需 root）：
+
+```bash
+strings /data/data/com.fenbi.android.leo/files/mmkv/leo_shepherd_id \
+  | grep didKey | head -1 | sed 's/.*String%\$//'
+```
+
+它是宿主 App 从服务端同步、持久化在本机的**设备级凭据**。本服务不复刻那套同步链路，
+直接沿用同机宿主的值（与「导入登录态 cookie」同一思路）。
+留空则不发送该头 —— PK 系接口不受影响，主域部分端点可能因此 417。
 
 ---
 

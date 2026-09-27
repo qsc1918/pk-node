@@ -80,9 +80,9 @@ console.log('5) 登录 RSA 编码器（原版硬编码公钥）');
 const rsa = require(path.join(root, 'src', 'crypto-rsa'));
 const rt = rsa.selfTest();
 check('RSA 1024 / PKCS#1 可用', rt.ok, rt.detail);
-check('手机号格式校验', rsa.isValidPhone('18723143414') && !rsa.isValidPhone('123'));
+check('手机号格式校验', rsa.isValidPhone('13800138000') && !rsa.isValidPhone('123'));
 check('两次加密密文不同（PKCS#1 随机填充，预期行为）',
-  rsa.encrypt('18723143414') !== rsa.encrypt('18723143414'));
+  rsa.encrypt('13800138000') !== rsa.encrypt('13800138000'));
 
 console.log('');
 console.log('6) 画笔算法（ARC 弧线 / SEVEN_SEGMENT 七段码）');

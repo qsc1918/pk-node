@@ -69,8 +69,8 @@ function finishJar(jar) {
  * ## 为什么探活必须用克隆（2026-09-27 真机踩坑）
  *
  * `GET /leo-profile/api/user-infos/context` 的 **`Set-Cookie` 会改写会话**：
- * 调过它之后，服务端认定的「当前子账号」会被踢回**主号**（实测 511467407，
- * 而真实可用的小号是 1155551346）。
+ * 调过它之后，服务端认定的「当前子账号」会被踢回**主号**（实测 主账号A，
+ * 而真实可用的小号是 小号B）。
  *
  * 也就是说：如果直接用待落库的 jar 去探活，**探活本身就把身份改坏了**，
  * 之后刷局会用错账号（表现为「已封禁，暂时无法使用」）。
@@ -178,7 +178,7 @@ async function importAccount(o) {
 
   // 账号域资料（不需设备链）——拿昵称/头像/年级。
   // ⚠️ 也用克隆 jar：这条同样是 Set-Cookie 大户，会改写会话绑定的子账号
-  //    （实测会让生效身份从 1155551346 变成主号 511467407）。
+  //    （实测会让生效身份从 小号B 变成主号 主账号A）。
   const prof = await leo.ytkUserProfile(cloneJar(jar));
   if (prof.status === 200 && prof.json) {
     const vo = prof.json.data || prof.json;
@@ -231,8 +231,8 @@ async function refreshSubAccounts(leoAccountId) {
  *
  * ## ⚠️ 为什么不能靠改 `userid` cookie 来切号（2026-09-27 实测反证）
  *
- * 试过把 cookie 里的 `userid` 分别改成 `511467407` / `1066052990` /
- * `1155551346` 再打 pk/home，**三次回包都是 `1155551346`**，而且响应里的
+ * 试过把 cookie 里的 `userid` 分别改成 `主账号A` / `小号C` /
+ * `小号B` 再打 pk/home，**三次回包都是 `小号B`**，而且响应里的
  * `Set-Cookie` 会把本地值改写回去。
  * 结论：**`userid` cookie 被服务端完全忽略**，身份由服务端会话决定。
  *
@@ -324,7 +324,7 @@ async function switchTo(leoAccountId, targetUserId) {
       `切换未生效：服务端切号接口被拦（HTTP ${status}${code ? ' ' + code : ''}）。` +
       `当前生效身份仍是 ${cur == null ? '未知' : cur}。` +
       `\n说明：身份由服务端会话绑定，改本地 cookie 无效（已实测）；该接口对非 App 客户端一律 417。` +
-      `\n若当前身份已是你需要的小号（本机实测为 1155551346），可直接刷局。`,
+      `\n若当前身份已是你需要的小号（本机实测为 小号B），可直接刷局。`,
   };
 }
 

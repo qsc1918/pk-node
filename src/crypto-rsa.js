@@ -86,7 +86,7 @@ function isValidCode(code) {
 /** 自检：公钥可解析 + 加密长度符合 1024 位 PKCS#1 预期（128 字节）。 */
 function selfTest() {
   try {
-    const sample = encrypt('18723143414');
+    const sample = encrypt('13800138000');
     const len = Buffer.from(sample, 'base64').length;
     if (len !== 128) return { ok: false, detail: '密文长度异常：' + len };
     return { ok: true, detail: 'RSA 1024 / PKCS#1 可用（密文 128B）' };

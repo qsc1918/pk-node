@@ -62,18 +62,24 @@ const config = {
   },
 
   /**
-   * 风控设备标识 `x-shepherd-did`。
+   * 风控设备标识 `x-shepherd-did`（**需要你自己从本机取一次**）。
    *
    * 真机上由宿主 App 从服务端同步，持久化在
    * `/data/data/com.fenbi.android.leo/files/mmkv/leo_shepherd_id`
-   * （key `didKey@v3.68.0@String`）。本服务不复刻那套同步链路，
-   * **直接沿用同机宿主的值** —— 与「导入登录态 cookie」同一思路：
-   * 同一台设备复用同一份设备级凭据。
+   * （key `didKey@v3.68.0@String`）。
    *
-   * 实测值（可直接 `strings` 那个 mmkv 文件核对）：
-   *   DUtA-DmaWBaa-xgaLMMFCl5fjJG__ajuzNf3
+   * 取法（需 root）：
+   * ```sh
+   * strings /data/data/com.fenbi.android.leo/files/mmkv/leo_shepherd_id \
+   *   | grep didKey | head -1 | sed 's/.*String%\\$//'
+   * ```
+   * 然后 `export PK_SHEPHERD_DID=<取到的值>`，或直接改这里的默认值。
+   *
+   * 本服务不复刻那套 shepherd 同步链路，**直接沿用同机宿主的值**
+   * —— 与「导入登录态 cookie」同一思路：同一台设备复用同一份设备级凭据。
+   * 留空则不发送该头（PK 系接口不受影响；主域部分端点可能因此 417）。
    */
-  shepherdDid: process.env.PK_SHEPHERD_DID || 'DUtA-DmaWBaa-xgaLMMFCl5fjJG__ajuzNf3',
+  shepherdDid: process.env.PK_SHEPHERD_DID || '',
 
 
   /** 是否默认启用 cloudflared 穿透（也可在网页里勾选开关）。 */
