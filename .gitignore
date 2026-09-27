@@ -1,0 +1,21 @@
+# ---- 运行时数据（含明文 cookie，绝对不要提交）----
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# ---- 大体积 / 可重新获取的二进制 ----
+# cloudflared 由 bin/get-cloudflared.sh 按需下载，不入库
+bin/cloudflared
+bin/cloudflared.*
+
+# ---- 依赖 / 构建产物 ----
+node_modules/
+*.log
+
+# ---- 编辑器 / 系统 ----
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
