@@ -88,7 +88,8 @@
       自带 SQLite 本地库、SSE 实时日志、管理后台，可选 Cloudflare 临时内网穿透。
     </p>
     <div class="btns">
-      <a class="btn primary" href="https://github.com/sxd91/pk-node">GitHub 仓库</a>
+      <a class="btn primary" href="https://github.com/sxd91/pk-node/releases/latest">下载免安装包</a>
+      <a class="btn" href="https://github.com/sxd91/pk-node">GitHub 仓库</a>
       <a class="btn" href="#start">快速开始</a>
       <a class="btn" href="#how">工作原理</a>
       <a class="btn" href="#limits">已知限制</a>
@@ -124,8 +125,18 @@
 
   <h2 id="start">快速开始</h2>
 
-  <p>要求 <b>Node.js &gt;= 22.5</b>，运行在 <b>arm64 Linux / Android(proot|Termux)</b>。</p>
+  <p>要求 <b>Node.js &gt;= 22</b>（用到内置 <code>node:sqlite</code>）。除此之外<b>零依赖</b>，
+     <b>不需要</b> WSL / Docker / qemu，也<b>不需要</b>任何 arm64 原生库。</p>
 
+  <p><b>方式一：下载免安装包（推荐）</b></p>
+  <pre><code># 从 Releases 下载 zip，解压后：
+#   Windows：双击 start.bat
+#   Linux / macOS：./start.sh</code></pre>
+  <p>
+    <a class="btn primary" href="https://github.com/sxd91/pk-node/releases/latest">下载最新版</a>
+  </p>
+
+  <p><b>方式二：从源码运行</b></p>
   <pre><code>git clone https://github.com/sxd91/pk-node.git
 cd pk-node
 ./start.sh            # 默认 http://127.0.0.1:8787（被占用会自动往后找）
@@ -136,14 +147,18 @@ cd pk-node
 
   <h3>跑一遍自检</h3>
   <pre><code>node bin/selftest.js
-# 检查：sign 公式 / RSA 编码 / 笔画算法 / 提交体结构 / 模块导出 / 原生链路</code></pre>
+# 检查：编码链路 / sign 公式 / RSA 编码 / 笔画算法 / 提交体结构 / 模块导出</code></pre>
 
   <h2 id="how">工作原理</h2>
 
-  <p>两个关键环节是 <b>arm64 原生实现</b>，纯 JS 重写既不划算也不可靠，所以直接调用原生库：</p>
+  <p>原本两个关键环节是 <b>arm64 原生实现</b>，现在<b>都已解除依赖</b>，纯 JS 即可：</p>
 
   <table>
     <tr><th>环节</th><th>说明</th></tr>
+    <tr>
+      <td><code>内容编码器</code></td>
+      <td><b>已拆解为「固定密钥流 XOR」，纯 JS 实现</b>。差分分析证明 <code>c()</code> 就是逐位置异或一条固定密钥流（128 KiB，<code>bin/keystream.bin</code>），在 1B~128KiB 各长度上<b>逐字节等于原生结果</b>，且与真机抓包密文一致。耗时 80–250ms → ~14ms。</td>
+    </tr>
     <tr>
       <td><code>sign</code></td>
       <td><b>PK 端点实测不需要，已默认关闭</b>。不带 sign 时 <code>match</code> 与 <code>submit</code> 都返回 200；带 sign 反而遇到过 403。需要时设 <code>PK_SIGN_MODE=on</code>。</td>
