@@ -62,6 +62,28 @@ const config = {
   },
 
   /**
+   * 是否给主域请求加 `sign`。
+   *
+   * - `off`  —— 不加（**默认**）
+   * - `auto` —— 能算就算（需要 arm64 原生库），算不了就不加
+   * - `on`   —— 必须加，算不出来就抛错
+   *
+   * ## 为什么默认 `off`（2026-09-27 实测）
+   *
+   * PK 的 `home` / `match` / `submit` 三个端点**都不需要 sign**：
+   * 不带 sign 时 `match` 与 `submit` 均实测返回 **HTTP 200**（提交成功）；
+   * 反而带上 sign 时遇到过 403。而那批「必须带 sign」的主域端点
+   * （`accounts/switch` / `batchGet`）**带了也照样 417** —— 它们的拦截
+   * 与 sign 无关（见 README 的 417 说明）。
+   *
+   * 结论：sign 对当前的可用端点没有任何增益，却在 arm64 上才跑得动。
+   * 关掉它 → **x86 / Windows 也能完整刷局**（内容编码已是纯 JS）。
+   *
+   * 若将来确认某端点确实需要 sign，把它设为 `on` 并保留 `bin/native/` 即可。
+   */
+  signMode: process.env.PK_SIGN_MODE || 'off',
+
+  /**
    * 风控设备标识 `x-shepherd-did`（**需要你自己从本机取一次**）。
    *
    * 真机上由宿主 App 从服务端同步，持久化在

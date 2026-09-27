@@ -141,21 +141,30 @@ function safeUnlink(p) {
   try { fs.unlinkSync(p); } catch (e) { /* 临时文件已被清或不存在 */ }
 }
 
-// 启动自检：**编码**（纯 JS 密钥流）+ **sign**（仍需 arm64 原生库）。
+// 启动自检：**编码**（纯 JS，必需）+ **sign**（仅当 signMode != off 时需要）。
 // 失败则启动即报错，比跑起来才发现强。
 function selfTest() {
   const enc = keystream.selfTest();
   if (!enc.ok) return { ok: false, detail: '内容编码器不可用：' + enc.detail };
 
+  const mode = String(config.signMode || 'off').toLowerCase();
+  if (mode === 'off') {
+    // 默认路径：完全不需要原生库 → x86 / Windows 也能完整刷局
+    return {
+      ok: true,
+      encoding: enc,
+      signMode: 'off',
+      detail: '编码（纯 JS）可用；sign 已关闭（PK 端点实测不需要）→ 无需 arm64 原生库',
+    };
+  }
+
   const need = ['linker64', 'lre.so', 'dump7'];
   const missing = need.filter((f) => !fs.existsSync(path.join(config.nativeDir, f)));
   if (missing.length) {
-    return {
-      ok: false,
-      encoding: enc,
-      detail: '内容编码可用（纯 JS），但缺 sign 所需原生资产：' + missing.join(', ') +
-        '（sign 需要 arm64；x86 可用 qemu-user 跑 bin/native/linker64）',
-    };
+    const msg = '缺 sign 所需原生资产：' + missing.join(', ') +
+      '（sign 需要 arm64；如不需要可设 PK_SIGN_MODE=off）';
+    if (mode === 'auto') return { ok: true, encoding: enc, signMode: mode, detail: 'sign 已跳过（' + msg + '）' };
+    return { ok: false, detail: msg };
   }
 
   try {
@@ -164,11 +173,14 @@ function selfTest() {
     return {
       ok: true,
       encoding: enc,
-      detail: enc.warn ? ('sign 可用；注意：' + enc.detail) : '编码（纯 JS）+ sign（原生）均可用',
+      signMode: mode,
+      detail: '编码（纯 JS）+ sign（原生）均可用',
       sample: sample,
     };
   } catch (e) {
-    return { ok: false, encoding: enc, detail: 'sign 计算失败（编码仍可用）：' + e.message };
+    const msg = 'sign 计算失败：' + e.message;
+    if (mode === 'auto') return { ok: true, encoding: enc, signMode: mode, detail: 'sign 已跳过（' + msg + '）' };
+    return { ok: false, encoding: enc, detail: msg };
   }
 }
 

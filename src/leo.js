@@ -127,10 +127,35 @@ function buildUrl(urlPath, params = {}, opts = {}) {
     q.set(k, String(v));
   }
 
-  // 4) sign 必须最后算（输入是 path，与 query 无关；放最后是为了语义清晰）
-  q.set('sign', nativeLib.calcSign(urlPath));
+  // 4) sign —— 按 signMode 决定加不加（默认 off：PK 用不上，且它需要 arm64）
+  const sign = maybeSign(urlPath);
+  if (sign) q.set('sign', sign);
 
   return config.leoBase + urlPath + '?' + q.toString();
+}
+
+/**
+ * 按 [config.signMode] 决定是否计算 sign。
+ *
+ * 计算需要 arm64 原生库（`libRequestEncoder` 的 T 段随分钟变化，已确认无法纯 JS 复现）。
+ * 因此：
+ *  - `off`（默认）：直接返回 null，**完全不碰原生库** → x86/Windows 可用；
+ *  - `auto`：能算就算，算不了返回 null（不抛）；
+ *  - `on`：算不出来就抛错（明确失败，而不是静默降级）。
+ *
+ * @param {string} urlPath 只含路径
+ * @returns {string|null} 32 位 hex 或 null
+ */
+function maybeSign(urlPath) {
+  const mode = String(config.signMode || 'off').toLowerCase();
+  if (mode === 'off') return null;
+
+  try {
+    return nativeLib.calcSign(urlPath);
+  } catch (e) {
+    if (mode === 'on') throw e;
+    return null;                       // auto：静默降级
+  }
 }
 
 /* ------------------------------ PK 接口 ------------------------------ */

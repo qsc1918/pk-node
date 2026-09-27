@@ -39,15 +39,18 @@ function skip(name, why) {
 console.log('== pk-node 自检 ==');
 console.log('项目目录: ' + root);
 console.log('native  : ' + config.nativeDir);
-console.log('平台    : ' + process.platform + '/' + process.arch + (CAN_RUN_NATIVE ? '' : '（原生检查将跳过）'));
+console.log('平台    : ' + process.platform + '/' + process.arch +
+  (CAN_RUN_NATIVE ? '' : '（未强制跑原生 sign）'));
 console.log('');
 
-console.log('1) native 资产与 sign');
-if (!CAN_RUN_NATIVE) {
-  skip('native 链路', `当前是 ${process.platform}/${process.arch}，bin/native 是 arm64 Android 库`);
-} else {
-  const nt = nativeLib.selfTest();
-  check('native 链路', nt.ok, nt.ok ? '样例 sign ' + nt.sample : nt.detail);
+console.log('1) 编码链路（纯 JS，必需） + sign（按 PK_SIGN_MODE）');
+const nt = (() => {
+  try { return nativeLib.selfTest(); } catch (e) { return { ok: false, detail: e.message }; }
+})();
+check('编码链路自检', nt.ok, nt.detail);
+if (nt.ok) {
+  console.log('        signMode = ' + (nt.signMode || config.signMode || 'off'));
+  if (nt.sample) check('sign 可算（示例）', /^[0-9a-f]{32}$/.test(nt.sample), nt.sample);
 }
 
 console.log('');

@@ -18,9 +18,7 @@ MIT License —— `bin/native/` 下的第三方二进制不在授权范围内�
 PK_PORT=8790 ./start.sh    # 换端口
 ```
 
-Windows：双击 `start.bat`。
-**内容编码已是纯 JS**，但 `sign` 仍需 arm64 原生库，
-所以 Windows（x86）上能跑网页/登录，**完整刷局仍需 arm64 或 qemu-user**（见下）。
+Windows：双击 `start.bat` —— **可完整刷局**（内容编码已是纯 JS，sign 实测 PK 端点不需要）
 
 浏览器打开 → 用 `admin / admin` 登录（**第一次登录后请立刻改密**）。
 
@@ -40,10 +38,10 @@ Windows：双击 `start.bat`。
 
 ---
 
-## 二、为什么需要 native 资产（`bin/native/`）
+## 二、原生依赖：**已全部解除**
 
-小猿的两个关键环节原本是 **arm64 原生实现**。其中**内容编码器已经被完全拆解**，
-现在只有 `sign` 还需要原生库：
+小猿的两个关键环节原本都是 **arm64 原生实现**。两者都已解决，
+**现在不需要 `bin/native/` 里的任何 arm64 库，Windows 也能完整刷局**：
 
 1. **内容编码器** —— ✅ **已用纯 JS 复现，不再需要原生库**。
    差分分析证明 `libContentEncoder.so` 的内层函数 `c()` 就是
@@ -62,11 +60,15 @@ Windows：双击 `start.bat`。
    并且**与真机抓包密文一致**。收益：x86/Windows 也能编码，且省掉每轮 80–250ms 的子进程开销
    （实测降到 ~14ms）。
 
-2. **`sign`** —— ⚠️ **仍需原生库**。它是 4 轮 MD5 链（salt = `wdi4n2t8edr`），
-   公式已用纯 JS 复现并做了离线自校验（`src/sign.js` 的 `verifyWithFixture()`）；
-   但其中的 `T` 段来自 so 里一个 4.6KB 的函数，**实测随分钟变化**
-   （伪造 4 个不同时间 → 4 个不同 sign），且涉及设备侧数据，**没有复现出来**。
-   所以实际计算仍走原生 harness 取当下的 `T`。
+2. **`sign`** —— ✅ **PK 端点实测不需要，已默认关闭**（`PK_SIGN_MODE=off`）。
+   实测：不带 sign 时 `match` 与 `submit` **都返回 HTTP 200**（提交成功）；
+   而带 sign 反而遇到过 403。至于那批「必须带 sign」的主域端点
+   （`accounts/switch` / `batchGet`），**带了也照样 417** —— 它们的拦截与 sign 无关。
+
+   > 补充：sign 的 `T` 段确实无法纯 JS 复现（它是 base-100 大数的十进制展开，
+   > 随分钟变化且无周期，实测 m→10m 时位数只 +40~48，不符合任何简单闭式）。
+   > 但既然 PK 用不到它，这个难点就不再挡路。
+   > 需要时设 `PK_SIGN_MODE=on` 并在 arm64 上跑即可。
 
 ### 在 x86_64 Linux / WSL2 上跑（qemu-user「转译」）
 

@@ -570,10 +570,11 @@ function main() {
   const nt = nativeLib.selfTest();
   const sg = signLib.verifyWithFixture();
   console.log('[pk-node] 启动中…');
-  console.log('[pk-node] native 自检：' + (nt.ok ? 'OK（sign 样例 ' + nt.sample + '）' : '失败 → ' + nt.detail));
+  console.log('[pk-node] 编码/sign 自检：' + (nt.ok ? 'OK' : '失败 → ' + nt.detail) +
+    (nt.ok && nt.sample ? '（sign 样例 ' + nt.sample + '）' : ''));
   console.log('[pk-node] sign 公式自校验：' + (sg.ok ? 'OK' : '失败（expect ' + sg.expect + ' got ' + sg.got + '）'));
   if (!nt.ok) {
-    console.error('[pk-node] ⚠️ native 不可用，PK 提交会失败。请检查 ' + config.nativeDir);
+    console.error('[pk-node] ⚠️ 编码链路不可用，PK 提交会失败。请检查 ' + config.nativeDir + ' / bin/keystream.bin');
   }
 
   server.listen(config.port, config.host, () => {

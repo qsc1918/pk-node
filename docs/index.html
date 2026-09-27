@@ -146,7 +146,7 @@ cd pk-node
     <tr><th>环节</th><th>说明</th></tr>
     <tr>
       <td><code>sign</code></td>
-      <td>4 轮 MD5 链（salt 为常量）。公式已用纯 JS 复现并做了离线自校验；实际计算走原生 harness 取当下的 <code>T</code>。</td>
+      <td><b>PK 端点实测不需要，已默认关闭</b>。不带 sign 时 <code>match</code> 与 <code>submit</code> 都返回 200；带 sign 反而遇到过 403。需要时设 <code>PK_SIGN_MODE=on</code>。</td>
     </tr>
     <tr>
       <td>内容编码器</td>
@@ -175,7 +175,7 @@ cd pk-node
     </tr>
     <tr>
       <td>平台限制</td>
-      <td>内容编码已是纯 JS；只有 <code>sign</code> 需执行 arm64 原生库，所以 <b>x86 / Windows 上完整刷局仍不行</b>（网页、登录、数据库可用）。x86_64 Linux / WSL2 可试 <code>qemu-user-static</code> 用户态模拟（作者未在 x86 实测）。</td>
+      <td><b>已无 arm64 依赖</b>：内容编码是纯 JS，sign 默认关闭。Windows / x86_64 <b>可以完整刷局</b>，不需要 WSL 或 qemu。<code>bin/native/</code> 可整个删掉。</td>
     </tr>
     <tr>
       <td>频控</td>

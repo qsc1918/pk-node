@@ -7,16 +7,17 @@ rem       set PK_PORT=9000 & start.bat     换端口
 rem       set PK_HOST=0.0.0.0 & start.bat  局域网可访问
 rem
 rem  ------------------------------------------------------------
-rem  ⚠️ 重要：Windows 上只有「网页 + 数据库 + 登录」能用
+rem  ✅ Windows 上可以**完整刷局**（含 PK 出题 + 提交）
 rem
-rem  PK 刷局需要 bin\native\ 里的 arm64 Android 原生库（linker64 / *.so），
-rem  它们只能在 Linux arm64 / Android(proot|Termux) 里跑，Windows 跑不了；
-rem  另外内容编码依赖系统 gzip（Windows 10 1803+ 自带，老版本没有）。
+rem  原因：两个原本依赖 arm64 原生库的环节都已解决
+rem    1) 内容编码器 —— 已拆解为「固定密钥流 XOR」，纯 JS 实现
+rem       （bin/keystream.bin + src/keystream.js）
+rem    2) sign —— 实测 PK 的 home / match / submit 三个端点**都不需要**
+rem       它（不带 sign 时 match 与 submit 均返回 200），故默认关闭
+rem       （PK_SIGN_MODE=off）
 rem
-rem  想完整体验 PK 刷局，请用：
-rem    - Android + Termux/proot（推荐，就是本项目的开发环境）
-rem    - 或 WSL2 (Ubuntu arm64) / 树莓派等 arm64 Linux
-rem  在 Windows 上本脚本主要用于：跑 web 界面、看代码、跑纯 JS 自检。
+rem  所以不需要 bin\native\ 里的 arm64 库，也不需要 WSL/qemu。
+rem  bin\native\ 可以整个删掉，只保留 bin\keystream.bin。
 rem ============================================================
 
 setlocal
@@ -59,10 +60,9 @@ if not "%PORT%"=="%PK_PORT%" echo 提示：%PK_PORT% 被占用，自动改用 %P
 echo 监听      : http://%PK_HOST%:%PORT%
 echo native    : %cd%\bin\native
 
-if not exist "bin\native\linker64" (
-  echo.
-  echo [!] 缺少 bin\native 原生资产：网页/登录/数据库可用，
-  echo     PK 刷局会失败（需要 arm64 Linux / Android）。
+if not exist "bin\keystream.bin" (
+  echo [!] 缺少 bin\keystream.bin —— 内容编码器需要它（纯 JS 密钥流）。
+  echo     在 arm64 设备上运行: node tools\keystream-extract.js
 )
 
 echo.
