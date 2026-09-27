@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pk-node · 小猿口算 PK 刷局本地服务</title>
+<meta name="description" content="零依赖 Node 网页服务：导入登录态 → 选子账号 → 刷 PK 对局。SQLite 本地库、SSE 实时日志、管理后台、可选 Cloudflare 穿透。">
+<style>
+  :root{
+    --bg:#0e1116; --bg2:#151a21; --bg3:#1c222b; --line:#2a323c;
+    --fg:#e7eaf0; --dim:#98a2b3; --acc:#4c8dff; --acc2:#2f6fe4;
+    --ok:#46b57a; --warn:#d9a441; --danger:#e35d5d;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--bg);color:var(--fg);
+    font:15px/1.75 -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:var(--acc);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .wrap{max-width:900px;margin:0 auto;padding:0 22px}
+
+  header{
+    padding:64px 0 40px;
+    background:radial-gradient(900px 380px at 50% -120px,rgba(76,141,255,.22),transparent 70%);
+    border-bottom:1px solid var(--line);
+  }
+  h1{margin:0 0 10px;font-size:34px;letter-spacing:-.5px}
+  h1 .tag{font-size:14px;color:var(--dim);font-weight:400;margin-left:10px}
+  .lead{color:var(--dim);margin:0 0 22px;max-width:62ch}
+  .btns{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+  .btn{
+    display:inline-block;padding:10px 18px;border-radius:10px;font-size:14px;
+    border:1px solid var(--line);background:var(--bg3);color:var(--fg);
+  }
+  .btn:hover{text-decoration:none;border-color:var(--acc)}
+  .btn.primary{background:var(--acc2);border-color:var(--acc)}
+  .badges{display:flex;gap:8px;flex-wrap:wrap}
+  .badges img{height:20px}
+
+  h2{margin:46px 0 14px;font-size:20px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  h3{margin:26px 0 8px;font-size:15px;color:var(--fg)}
+  p{margin:10px 0}
+  ul{padding-left:22px;margin:10px 0}
+  li{margin:5px 0}
+
+  pre{
+    background:#0a0d11;border:1px solid var(--line);border-radius:10px;
+    padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.7;
+  }
+  code{background:var(--bg3);padding:1px 6px;border-radius:5px;font-size:13px}
+  pre code{background:none;padding:0}
+
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:9px 12px;text-align:left;vertical-align:top}
+  th{background:var(--bg3);color:var(--dim);font-weight:600;white-space:nowrap}
+  td code{white-space:nowrap}
+
+  .note{
+    border-left:3px solid var(--acc);background:var(--bg2);
+    border-radius:0 10px 10px 0;padding:12px 16px;margin:16px 0;color:var(--dim);
+  }
+  .note.warn{border-left-color:var(--warn)}
+  .note.danger{border-left-color:var(--danger)}
+  .note b{color:var(--fg)}
+
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:16px 0}
+  .card{background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:16px}
+  .card h3{margin:0 0 6px;font-size:14px}
+  .card p{margin:0;color:var(--dim);font-size:13px}
+
+  footer{
+    margin-top:60px;padding:26px 0 44px;border-top:1px solid var(--line);
+    color:var(--dim);font-size:13px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <h1>pk-node<span class="tag">小猿口算 PK 刷局 · 本地网页服务</span></h1>
+    <p class="lead">
+      一个<b>零外部依赖</b>的本地 Node 服务：起个网页，导入小猿登录态 → 选子账号 → 刷 PK 对局。
+      自带 SQLite 本地库、SSE 实时日志、管理后台，可选 Cloudflare 临时内网穿透。
+    </p>
+    <div class="btns">
+      <a class="btn primary" href="https://github.com/sxd91/pk-node">GitHub 仓库</a>
+      <a class="btn" href="#start">快速开始</a>
+      <a class="btn" href="#how">工作原理</a>
+      <a class="btn" href="#limits">已知限制</a>
+    </div>
+    <div class="badges">
+      <a href="https://github.com/sxd91/pk-node/actions/workflows/selftest.yml">
+        <img src="https://github.com/sxd91/pk-node/actions/workflows/selftest.yml/badge.svg" alt="selftest">
+      </a>
+      <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT">
+      <img src="https://img.shields.io/badge/node-%3E%3D22.5-brightgreen.svg" alt="Node >= 22.5">
+      <img src="https://img.shields.io/badge/deps-0-success.svg" alt="零依赖">
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="note warn">
+    <b>仅供学习与研究。</b>本项目用于研究 Android 客户端的协议与加固实现。
+    请勿用于任何违反服务条款或法律法规的用途，使用风险自负。
+  </div>
+
+  <h2 id="what">它是什么</h2>
+
+  <div class="cards">
+    <div class="card"><h3>零依赖</h3><p>只用 Node 内置模块（<code>node:sqlite</code> / <code>node:http</code> / <code>node:crypto</code>），<b>不需要 npm install</b>。</p></div>
+    <div class="card"><h3>三种添加账号方式</h3><p>短信验证码登录 / 密码登录 / 粘贴 cookie —— 效果完全一致。</p></div>
+    <div class="card"><h3>可配置刷局</h3><p>costTime、画笔算法（弧线 / 七段码）、轮间隔、答题间隔、频控退避。</p></div>
+    <div class="card"><h3>立即结束</h3><p>基于 <code>AbortController</code> 的真中断：在途请求与等待都能秒断，不用等本轮跑完。</p></div>
+    <div class="card"><h3>任务并行</h3><p>任务之间可并行（默认上限 3），每个任务内部仍逐轮串行。</p></div>
+    <div class="card"><h3>实时日志</h3><p>SSE 推送每轮进度，带事件回放与轮询兜底，刷新页面不丢历史。</p></div>
+  </div>
+
+  <h2 id="start">快速开始</h2>
+
+  <p>要求 <b>Node.js &gt;= 22.5</b>，运行在 <b>arm64 Linux / Android(proot|Termux)</b>。</p>
+
+  <pre><code>git clone https://github.com/sxd91/pk-node.git
+cd pk-node
+./start.sh            # 默认 http://127.0.0.1:8787（被占用会自动往后找）
+# Windows：start.bat
+</code></pre>
+
+  <p>浏览器打开 → 用 <code>admin / admin</code> 登录 → <b>第一次登录后请立刻改密</b>。</p>
+
+  <h3>跑一遍自检</h3>
+  <pre><code>node bin/selftest.js
+# 检查：sign 公式 / RSA 编码 / 笔画算法 / 提交体结构 / 模块导出 / 原生链路</code></pre>
+
+  <h2 id="how">工作原理</h2>
+
+  <p>两个关键环节是 <b>arm64 原生实现</b>，纯 JS 重写既不划算也不可靠，所以直接调用原生库：</p>
+
+  <table>
+    <tr><th>环节</th><th>说明</th></tr>
+    <tr>
+      <td><code>sign</code></td>
+      <td><b>PK 端点实测不需要，已默认关闭</b>。不带 sign 时 <code>match</code> 与 <code>submit</code> 都返回 200；带 sign 反而遇到过 403。需要时设 <code>PK_SIGN_MODE=on</code>。</td>
+    </tr>
+    <tr>
+      <td>内容编码器</td>
+      <td><b>已用纯 JS 复现，不再需要原生库</b>。差分分析证明 <code>c()</code> 就是「与固定密钥流逐位置 XOR」（翻转 1 bit 只变同位置 1 字节、<code>in XOR out</code> 的流恒定、与总长无关、确定性），因此编码全零即得密钥流。<br>纯 JS XOR 在 1B~128KiB 各长度<b>逐字节等于原生结果</b>，且与真机密文一致；耗时从 80–250ms 降到 ~14ms。</td>
+    </tr>
+  </table>
+
+  <p>在 proot 里跑 Android so 的方式：</p>
+  <pre><code>LD_LIBRARY_PATH=bin/native bin/native/linker64 bin/native/enc_device &lt;so&gt; &lt;in&gt; &lt;out&gt;</code></pre>
+
+  <div class="note">
+    <b>关于 GitHub Pages：</b>本项目需要 Node 运行时、SQLite 与 arm64 原生库，
+    <b>无法在 GitHub Pages 上运行</b>（Pages 只能托管静态文件）。
+    这个页面就是 Pages 能承载的部分 —— 项目介绍。
+    想验证代码是否健康，请看
+    <a href="https://github.com/sxd91/pk-node/actions/workflows/selftest.yml">CI</a>。
+  </div>
+
+  <h2 id="limits">已知限制（如实说明）</h2>
+
+  <table>
+    <tr><th>项</th><th>说明</th></tr>
+    <tr>
+      <td>子账号切换</td>
+      <td><b>做不到</b>。服务端切号接口对非 App 客户端一律 417；而 <code>userid</code> cookie 被服务端忽略（改本地 cookie 无效，已实测）。身份由服务端会话绑定 —— 如需换号，请在原版 App 里切好再重新导入 cookie。</td>
+    </tr>
+    <tr>
+      <td>平台限制</td>
+      <td><b>已无 arm64 依赖</b>：内容编码是纯 JS，sign 默认关闭。Windows / x86_64 <b>可以完整刷局</b>，不需要 WSL 或 qemu。<code>bin/native/</code> 可整个删掉。</td>
+    </tr>
+    <tr>
+      <td>频控</td>
+      <td>出题与提交接口都有服务端频控。刷太快会 403 / 400「请求过于频繁」，这是正常保护，不是 bug。</td>
+    </tr>
+    <tr>
+      <td>风控头</td>
+      <td><code>x-shepherd-did</code> 需自己从本机取（见 README）。留空则不发送。</td>
+    </tr>
+    <tr>
+      <td>cookie 存储</td>
+      <td>小猿 cookie 以<b>明文</b>存在本地 SQLite。谁能读到那个文件谁就能拿到登录态 —— 默认只监听回环，且已被 <code>.gitignore</code> 排除。</td>
+    </tr>
+    <tr>
+      <td>第三方二进制</td>
+      <td><code>bin/native/</code> 下的系统库与 App 库不属于本项目，不在 MIT 授权范围内，见 <a href="https://github.com/sxd91/pk-node/blob/main/bin/native/NOTICE.md">NOTICE</a>。</td>
+    </tr>
+  </table>
+
+  <h2>目录结构</h2>
+  <pre><code>pk-node/
+├── server.js              # HTTP 服务 + 路由（零依赖）
+├── start.sh / start.bat   # Linux / Windows 启动脚本
+├── src/
+│   ├── config.js          # 配置与协议常量
+│   ├── db.js              # SQLite 层（node:sqlite）
+│   ├── http.js            # HTTP 客户端 + CookieJar（可中断）
+│   ├── crypto-rsa.js      # RSA 编码（手机号 / 验证码 / 密码）
+│   ├── sign.js            # sign 公式（纯 JS + 离线自校验）
+│   ├── native.js          # 调用 arm64 原生库
+│   ├── strokes.js         # 画笔算法：弧线 / 七段码
+│   ├── leo.js             # 小猿协议层
+│   ├── pk-engine.js       # 出题 → 组 body → 加密 → 提交
+│   ├── jobs.js            # 任务调度（并行 / 立即结束 / SSE 缓冲）
+│   ├── tunnel.js          # Cloudflare 快速隧道
+│   └── services/          # auth / login / leo-accounts
+├── public/                # 网页（原生 HTML+JS+CSS，无构建）
+├── bin/
+│   ├── native/            # arm64 原生资产（见 NOTICE）
+│   ├── selftest.js        # 命令行自检
+│   └── pick-port.js       # 端口避让
+└── .github/workflows/     # CI：语法检查 + 自检 + 启动冒烟
+</code></pre>
+
+  <footer>
+    <a href="https://github.com/sxd91/pk-node">sxd91/pk-node</a> ·
+    MIT License ·
+    仅供学习与研究
+  </footer>
+
+</div>
+</body>
+</html>

@@ -13,15 +13,6 @@ MIT License —— `bin/native/` 下的第三方二进制不在授权范围内�
 
 📄 **项目介绍页：https://sxd91.github.io/pk-node/**
 
-## 下载 / 运行
-
-| 方式 | 说明 |
-|---|---|
-| **[免安装包（Releases）](https://github.com/sxd91/pk-node/releases/latest)** | 解压即用，**推荐**。含密钥流 + 全部源码，不用 `npm install` |
-| `git clone` 源码 | 在项目根运行下面的命令 |
-
-只要求 **Node.js ≥ 22**（用到内置 `node:sqlite`），除此之外零依赖。
-
 ```bash
 ./start.sh                 # 默认 http://127.0.0.1:8787
 PK_PORT=8790 ./start.sh    # 换端口

@@ -1,0 +1,108 @@
+name: release
+
+# 打 tag（v*）时自动：
+#   1) 跑自检
+#   2) 打免安装 zip（tools/make-release.js，内部会真起一次服务验证）
+#   3) 建 GitHub Release 并把 zip 挂上去
+#
+# 也可在 Actions 页手动触发（workflow_dispatch）：只出 artifact，不建 Release。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 环境信息
+        run: |
+          node -v
+          python3 -V
+          uname -a
+
+      - name: 自检
+        run: node bin/selftest.js
+
+      - name: 打免安装包（内含一次「起服务 + curl」验证）
+        run: node tools/make-release.js
+
+      - name: 读版本号
+        id: ver
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pk-node-${{ steps.ver.outputs.version }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: 校验 zip 内容（不许有 data/ 或原生库）
+        run: |
+          set -eu
+          Z=$(ls dist/*.zip)
+          echo "zip = $Z"
+          python3 - "$Z" <<'PY'
+          import sys, zipfile
+          z = zipfile.ZipFile(sys.argv[1])
+          names = z.namelist()
+          print(f'{len(names)} entries')
+          bad = [n for n in names if '/data/' in n or n.endswith('.sqlite')
+                 or '/native/' in n or n.endswith('/cloudflared')]
+          if bad:
+              print('✘ 包含不该有的文件：', bad); sys.exit(1)
+          must = ['server.js', 'start.bat', 'start.sh', 'bin/keystream.bin']
+          for m in must:
+              if not any(n.endswith('/' + m) for n in names):
+                  print('✘ 缺', m); sys.exit(1)
+          print('✔ 内容检查通过')
+          PY
+
+      - name: 建 Release（仅打 tag 时）
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          NOTES=$(cat <<'EOF'
+          ## 免安装包
+
+          解压后：
+
+          - **Windows**：双击 `start.bat`
+          - **Linux / macOS**：`./start.sh`
+
+          然后浏览器打开 `http://127.0.0.1:8787`，默认账号 `admin / admin`。
+
+          ### 需要什么
+
+          - **Node.js ≥ 22**（用到内置 `node:sqlite`）。除此之外**零依赖**，不需要 `npm install`。
+          - **不需要** WSL、Docker、qemu。
+          - **不需要** 任何 arm64 原生库：内容编码器已是纯 JS（固定密钥流 XOR），
+            而 `sign` 经实测对 PK 端点不必要，默认关闭（`PK_SIGN_MODE=off`）。
+
+          ### 首次使用
+
+          1. 添加小猿账号：短信验证码 / 密码 / 粘贴 cookie，三选一
+          2. 勾选子账号 → 设题数 → 开始刷局
+          3. 实时日志在「日志」页；出题与提交都有独立频控（403/400 是频控，不是 bug）
+
+          详见 `README.md`。
+
+          > 仅供学习与研究，请自行评估使用风险。
+          EOF
+          )
+          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+            --title "pk-node $GITHUB_REF_NAME" \
+            --notes "$NOTES"
