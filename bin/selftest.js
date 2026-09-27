@@ -145,7 +145,7 @@ console.log('7) 模块导出完整性（防「漏导出」这类只在运行时�
 // 这种错静态检查抓不到、只有真跑才暴露 —— 所以在这里钉死。
 const leoLib = require(path.join(root, 'src', 'leo'));
 const REQUIRED_LEO = [
-  'buildUrl', 'pkMatch', 'pkSubmit', 'pkSubmitRaw', 'pkHome',
+  'buildUrl', 'pkMatch', 'pkSubmit', 'pkSubmitRaw', 'pkHistoryDetail', 'pkHome',
   'userInfosContext', 'subAccountsBatchGet', 'ytkUserProfile', 'switchSubAccount',
   'ytkSmsVerify', 'ytkSmsLogin', 'ytkPasswordLogin', 'CookieJar',
 ];

@@ -198,6 +198,37 @@ sign = md5(s3 + d3 + salt)          salt = "wdi4n2t8edr"
 因此本项目**串行**跑任务，且默认 `60s / 120s` 大退避、最多 2 次（可在网页高级参数里改）。
 并发提交只会把请求一起打进频控窗口。
 
+### 4.5 出题 → 提交 → **结算核对**（对齐真机结算页）
+
+真机点了「继续PK」会打开
+`result.html?pkIdStr=<pkIdStr>#/结算页面`，这个页面的数据源是：
+
+```
+GET /leo-game-pk/{client}/math/pk/history/detail?pkIdStr=<pkIdStr>
+```
+
+**关键：`submit` 返回 200 只代表服务端「收下了」，不代表这局已结算。** 实测两种历史记录：
+
+| 情况 | `history/detail` 返回 |
+|---|---|
+| 提交成功 | `{correctCnt:20, questions:[…20 条明细…]}` |
+| 提交被 403（没算上） | `{correctCnt:0, questions:null}` ← 服务端仍留占位记录 |
+
+所以引擎在每次 `submit` 之后**都会再拉一次本接口核对**，日志里表现为：
+
+```
+[submit]     提交（第 1 次）→ 200
+[settle-ok]  已结算：答对 20 题 / 明细 20 题      ← 这局真算上了
+[settle-fail] 服务端未结算（correctCnt=0）—— 这局没算上   ← 会记为该轮失败
+```
+
+只读接口、**不计入出题频控**，每轮都调不影响刷局节奏。
+（完整 API 面另见 `exercise-legacy` bundle：`math/pk/match[/v2]`、`math/pk/multi/match[/v2]`、
+`final/pk/match/{math,english}/v2`、`english/pk/match[/v2]`、`word/eliminate/match[/v2]`、
+`math/pk/submit`、`math/pk/multi/submit`、`final/pk/submit/{math,english}`、
+`english/pk/submit`、`word/eliminate/submit`、`math/pk/reward/claim`、`pk/pros/use`、
+`pk/login/sync`。`/v2` 系列返回 **arraybuffer 加密体**，本项目走旧版明文接口。）
+
 ### 5. 登录（短信 / 密码）的加密口径 —— **两条路的字段不一样**
 
 | 接口 | 字段 | 加密？ |

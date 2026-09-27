@@ -221,12 +221,27 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
     emit({ type: 'submit', message: `提交（第 ${attempt + 1} 次）costTime=${bodyObj.costTime}ms 全对 ${bodyObj.correctCnt}/${bodyObj.questionCnt}` });
     const s = await leo.pkSubmitRaw(jar, cipher, anySignal({}));
     if (s.status === 200) {
+      // ⚠️ 提交 200 ≠ 这局已结算。MUST 再拉一次结算接口核对
+      // （真机上这是结算页 result.html 的数据源，见 leo.pkHistoryDetail 注释）。
+      // 没结算成功的局在服务端是 {correctCnt:0, questions:null} 的占位记录。
+      const settle = await confirmSettle(jar, pkIdStr, bodyObj, emit, signal);
+      if (!settle.ok) {
+        return {
+          ok: false,
+          httpCode: 200,
+          message: settle.message,
+          detail: settle.raw,
+          pkIdStr: pkIdStr,
+          costTimeMs: Date.now() - t0,
+        };
+      }
       return {
         ok: true,
         httpCode: 200,
-        message: '提交成功',
-        detail: String(s.text || '').slice(0, 2000),
+        message: settle.message,
+        detail: JSON.stringify(settle.detail).slice(0, 2000),
         pkIdStr: pkIdStr,
+        settled: settle.detail,
         costTimeMs: Date.now() - t0,
       };
     }
@@ -243,6 +258,51 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
     }
     return fail(s.status, `提交失败 HTTP ${s.status}`, s.text, t0, pkIdStr);
   }
+}
+
+/**
+ * 提交后核对结算（对齐结算页 `result.html?pkIdStr=X` 的数据源）。
+ *
+ * 返回 `{ok, message, detail}`：
+ *  - `ok:true`  服务端已有逐题明细（`correctCnt > 0` 且 `questions` 非空）
+ *  - `ok:false` 仍是 `{correctCnt:0, questions:null}` 的占位记录 → 这局没算上
+ *
+ * 只读接口，**不计入出题频控**，所以可以放心在每轮都调。
+ */
+async function confirmSettle(jar, pkIdStr, sentBody, emit, signal) {
+  const r = await leo.pkHistoryDetail(jar, pkIdStr, { signal: signal });
+  const j = r.json;
+  if (r.status !== 200 || !j) {
+    emit({ type: 'settle', message: `结算核对失败 HTTP ${r.status}（提交本身已是 200）` });
+    // 结算接口查不到不代表这局一定失败：可能只是历史还没落库。
+    // 此时按「提交成功」记账，但把情况写进 detail，不误报失败。
+    return {
+      ok: true,
+      message: `提交成功（结算明细未取到，HTTP ${r.status}）`,
+      detail: { settled: false, reason: 'history/detail ' + r.status, sent: sentBody.correctCnt },
+      raw: String(r.text || '').slice(0, 500),
+    };
+  }
+  const cnt = Number(j.correctCnt) || 0;
+  const qs = Array.isArray(j.questions) ? j.questions.length : 0;
+  if (cnt > 0 && qs > 0) {
+    emit({ type: 'settle-ok', message: `已结算：答对 ${cnt} 题 / 明细 ${qs} 题` });
+    return {
+      ok: true,
+      message: `提交成功并已结算（对 ${cnt} 题）`,
+      detail: {
+        settled: true, correctCnt: cnt, questionCnt: Number(j.questionCnt) || qs,
+        pointId: j.pointId, pointName: j.pointName, costTime: j.costTime,
+      },
+    };
+  }
+  emit({ type: 'settle-fail', message: `服务端未结算（correctCnt=${cnt}, questions=${j.questions === null ? 'null' : qs}）—— 这局没算上` });
+  return {
+    ok: false,
+    message: `提交返回 200 但未被结算（correctCnt=${cnt}）`,
+    detail: JSON.stringify(j).slice(0, 600),
+    raw: String(r.text || '').slice(0, 600),
+  };
 }
 
 /** 中断错误：`aborted === true`，上层据此把任务标成 stopped 而不是 failed。 */

@@ -224,6 +224,43 @@ async function pkSubmitRaw(jar, cipher, opts) {
 }
 
 /**
+ * 结算查询：`GET /leo-game-pk/android/math/pk/history/detail?pkIdStr=X`
+ *
+ * ## 为什么要有这一步（对齐结算页）
+ *
+ * 结算页 `result.html?pkIdStr=X` 的**主数据源就是它**（从 H5 bundle
+ * `Result-legacy` 里逐行读出：`getPkExerciseResult(pkIdStr)` →
+ * `GET /leo-game-pk/{client}/math/pk/history/detail?pkIdStr=`）。
+ *
+ * 提交返回 200 只代表「服务端收下了」，**不代表这局已结算**。
+ * 用历史 pkIdStr 实测过两种情况：
+ *   - 提交成功的局 → `{correctCnt:20, questions:[...]}`（有逐题明细）
+ *   - 提交被 403 的局 → `{correctCnt:0, questions:null}`（服务端仍留占位记录）
+ *
+ * 所以引擎在提交成功后额外拉一次本接口，**以结算结果为准**判断这局是否真的算上。
+ * 这样「日志说成功、实际没结算」这种最难查的情况不会再出现。
+ *
+ * @returns {Promise<{status:number, json:object|null, text:string}>}
+ */
+async function pkHistoryDetail(jar, pkIdStr, opts) {
+  const path = '/leo-game-pk/android/math/pk/history/detail';
+  const url = buildUrl(path, { pkIdStr: String(pkIdStr) }, pkOpts());
+  const r = await request({
+    url,
+    method: 'GET',
+    jar,
+    signal: opts && opts.signal,
+    headers: Object.assign(
+      {
+        Referer: config.leoBase + '/bh5/leo-web-oral-pk/result.html?pkIdStr=' + encodeURIComponent(pkIdStr),
+      },
+      riskHeaders(),
+    ),
+  });
+  return { status: r.status, json: safeJson(r.text), text: r.text };
+}
+
+/**
  * 提交一局（便捷版）：明文 body → 加密 → 提交。
  *
  * body 流程：明文 JSON → gzip(level6,mtime0) → libContentEncoder → octet-stream。
@@ -411,6 +448,7 @@ module.exports = {
   pkMatch,
   pkSubmitRaw,
   pkSubmit,
+  pkHistoryDetail,
   pkHome,
   userInfosContext,
   subAccountsBatchGet,
