@@ -88,6 +88,23 @@ function collect() {
   });
 }
 
+/**
+ * 把权限**归一化**：只保留「可执行位」这一个信息。
+ *
+ * ## 为什么（踩过的坑）
+ *
+ * 直接用源文件的 `st_mode` 会导致**同样的源码在不同机器上打出不同的 zip**：
+ * 我在 proot 里 umask 让文件是 `0600`，而 GitHub runner 上是 `0644` ——
+ * 32 个条目的内容（size/CRC）完全一样，只有权限位不同，zip 的 sha256 就不一样。
+ *
+ * 归一化后：
+ *  - 同一份源码在**任何环境**打出的 zip **逐字节相同**（sha256 可对账）；
+ *  - 发布包解压出来也不会是「只有 owner 能读」的怪文件。
+ */
+function normMode(mode) {
+  return (mode & 0o111) ? 0o755 : 0o644;
+}
+
 function human(bytes) {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
@@ -143,8 +160,9 @@ fs.mkdirSync(OUTDIR, { recursive: true });
 for (const f of files) {
   const dst = path.join(OUTDIR, f);
   fs.mkdirSync(path.dirname(dst), { recursive: true });
+  const srcMode = fs.statSync(path.join(ROOT, f)).mode;
   fs.copyFileSync(path.join(ROOT, f), dst);
-  fs.chmodSync(dst, fs.statSync(path.join(ROOT, f)).mode);
+  fs.chmodSync(dst, normMode(srcMode));      // 归一化 → 跨环境可复现
 }
 
 // ---------------------------------------------------------------- 验证
