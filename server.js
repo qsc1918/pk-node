@@ -19,6 +19,7 @@ const tunnel = require('./src/tunnel');
 const nativeLib = require('./src/native');
 const signLib = require('./src/sign');
 const strokes = require('./src/strokes');
+const exercise = require('./src/exercise');
 
 const PUBLIC_DIR = path.join(config.root, 'public');
 
@@ -398,6 +399,53 @@ async function handleApi(req, res, u, user) {
     const r = await tunnel.start(config.port);
     db.audit(user.id, 'tunnel_start', r.ok ? r.url : r.message, clientIp(req));
     return sendJson(res, r.ok ? 200 : 400, r);
+  }
+
+  /* ------------------------- 练习 / 刷分 ------------------------- */
+  if (p === '/api/exercise/overview' && method === 'GET') {
+    const leoId = Number(u.searchParams.get('leoAccountId') || 0);
+    const acc = db.getLeoAccount(leoId);
+    if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '小猿账号不存在' });
+    const jar = jobs.jarOf(acc);
+    const r = await exercise.overview(jar);
+    return sendJson(res, r.ok ? 200 : 502, Object.assign({ limits: exercise.explainLimits() }, r));
+  }
+
+  if (p === '/api/exercise/keypoints' && method === 'GET') {
+    const leoId = Number(u.searchParams.get('leoAccountId') || 0);
+    const acc = db.getLeoAccount(leoId);
+    if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '小猿账号不存在' });
+    const jar = jobs.jarOf(acc);
+    const r = await exercise.keypoints(jar, {
+      book: u.searchParams.get('book'), grade: u.searchParams.get('grade'),
+      semester: u.searchParams.get('semester'), type: u.searchParams.get('type'),
+      count: u.searchParams.get('count'),
+    });
+    return sendJson(res, r.status === 200 ? 200 : 502, { ok: r.status === 200, status: r.status, data: r.json, text: r.text.slice(0, 1500) });
+  }
+
+  if (p === '/api/exercise/exam' && method === 'POST') {
+    const b = await readJson(req);
+    const acc = db.getLeoAccount(Number(b.leoAccountId));
+    if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '小猿账号不存在' });
+    const jar = jobs.jarOf(acc);
+    const r = await exercise.getExam(jar, b.keypointId || 235001, b.limit || 10);
+    return sendJson(res, r.status === 200 ? 200 : 502, {
+      ok: r.status === 200, status: r.status, exam: r.json, text: r.text.slice(0, 1500),
+    });
+  }
+
+  if (p === '/api/exercise/pump' && method === 'POST') {
+    const b = await readJson(req);
+    const acc = db.getLeoAccount(Number(b.leoAccountId));
+    if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '小猿账号不存在' });
+    const jar = jobs.jarOf(acc);
+    const r = await exercise.pumpScore(jar, {
+      delta: b.delta, ruleTypes: b.ruleTypes,
+      onEvent: (ev) => publish(0, Object.assign({ exercise: true, at: Date.now() }, ev)),
+    });
+    db.audit(user.id, 'exercise_pump', `leo=${acc.id} gained=${r.gained} ${r.before}->${r.after}`, clientIp(req));
+    return sendJson(res, 200, r);
   }
 
   /* ------------------------- 系统状态 ------------------------- */

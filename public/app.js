@@ -123,10 +123,11 @@ $('btn-logout').addEventListener('click', async () => {
 document.querySelectorAll('.nav-btn').forEach((btn) => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.nav-btn').forEach((b) => b.classList.toggle('active', b === btn));
-    ['grind', 'accounts', 'jobs', 'tunnel', 'admin'].forEach((t) => {
+    ['grind', 'practice', 'accounts', 'jobs', 'tunnel', 'admin'].forEach((t) => {
       $('tab-' + t).classList.toggle('hidden', t !== btn.dataset.tab);
     });
     const t = btn.dataset.tab;
+    if (t === 'practice') { loadPractice(); }
     if (t === 'accounts') { loadLeoAccounts(); }
     if (t === 'jobs') { loadJobs(); }
     if (t === 'tunnel') { loadTunnel(); }
@@ -631,6 +632,11 @@ async function showJobDetail(id) {
 
 $('btn-refresh-jobs').addEventListener('click', loadJobs);
 
+/* ---- 刷练习页按钮 ---- */
+$('prac-refresh').addEventListener('click', refreshPractice);
+$('prac-pump').addEventListener('click', pumpPractice);
+$('prac-exam').addEventListener('click', fetchPracticeExam);
+
 /* ---------------------------- 穿透页 ---------------------------- */
 
 async function loadTunnel() {
@@ -753,6 +759,129 @@ async function bootstrapAfterLogin() {
   await loadLeoAccounts();
   await loadJobs();
 }
+
+/* ========================= 刷练习 =========================
+ *
+ * 与「刷局」是两条独立链路（PK 走 leo-game-pk，练习走 leo-star / leo-math）。
+ * 关键：练习的公共参数必须 version=3.140.1 + platform=android37，
+ * 否则被 solar-encoder 拦成 417（服务端拒绝未知版本号）。
+ */
+
+/** 把已导入的小猿账号填进练习页的下拉框。 */
+function fillPracticeLeo(accounts) {
+  const sel = $('prac-leo');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  for (const a of accounts) {
+    const o = document.createElement('option');
+    o.value = String(a.id);
+    o.textContent = a.name + '（uid ' + (a.yfdU || '?') + '）';
+    sel.appendChild(o);
+  }
+  if (prev && accounts.some((a) => String(a.id) === prev)) sel.value = prev;
+}
+
+/** 进 tab 时调用：拉账号列表填下拉，并给点提示。 */
+async function loadPractice() {
+  try {
+    const r = await api('/api/leo/accounts');
+    fillPracticeLeo(r.accounts || []);
+    if (!(r.accounts || []).length) {
+      $('prac-status').textContent = '还没有导入小猿账号 —— 先去「小猿账号」页添加。';
+    }
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+/** 刷新分数 / 任务 / 道具。 */
+async function refreshPractice() {
+  const id = $('prac-leo').value;
+  if (!id) return toast('先选择小猿账号', 'err');
+  const box = $('prac-status');
+  box.textContent = '请求中…';
+  try {
+    const r = await api('/api/exercise/overview?leoAccountId=' + id);
+    if (!r.ok) { box.textContent = '失败：' + (r.error || '未知'); return toast(r.error || '失败', 'err'); }
+    const lines = [
+      '当前周分数 curWeekScore : ' + (r.curWeekScore == null ? '?' : r.curWeekScore),
+      '本周经验 curWeekExp     : ' + (r.curWeekExp == null ? '?' : r.curWeekExp),
+      '今日获得积分             : ' + (r.todayObtainedPoints == null ? '?' : r.todayObtainedPoints),
+      '下次倍数 nextMultiplier : ' + (r.nextMultiplier == null ? '?' : r.nextMultiplier),
+      '连续打卡三天数           : ' + (r.continuousDays == null ? '?' : r.continuousDays),
+      '当前排名 curRank        : ' + (r.curRank == null ? '?' : r.curRank),
+      '',
+      '道具: ' + (r.item ? (r.item.itemName + ' ×' + r.item.multiple + '（' + (r.item.duration / 60000) + ' 分钟）') : '无'),
+      '',
+      '今日任务:',
+    ];
+    for (const t of (r.tasks || [])) {
+      lines.push('  · ' + t.taskName + '  ' + t.curCnt + '/' + t.targetCnt +
+        '  ' + (t.taskStatus === 2 ? '已完成' : '进行中') + '  +' + t.taskScore);
+    }
+    if (r.limits) lines.push('', '上限：' + r.limits.note);
+    box.textContent = lines.join('\n');
+  } catch (e) {
+    box.textContent = '异常：' + e.message;
+    toast(e.message, 'err');
+  }
+}
+
+/** 刷分：对若干 ruleType 各上报一次。 */
+async function pumpPractice() {
+  const id = $('prac-leo').value;
+  if (!id) return toast('先选择小猿账号', 'err');
+  const out = $('prac-log');
+  out.textContent = '';
+  const say = (s) => { out.textContent += s + '\n'; out.scrollTop = out.scrollHeight; };
+  const ruleTypes = $('prac-rts').value.split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n));
+  try {
+    say('开始上报…');
+    const r = await api('/api/exercise/pump', {
+      method: 'POST',
+      body: { leoAccountId: Number(id), delta: Number($('prac-delta').value || 200), ruleTypes },
+    });
+    for (const a of (r.applied || [])) {
+      say(`  ruleType=${a.ruleType}  HTTP ${a.status}  ` + (a.gained > 0 ? `★ 入账 +${a.gained}` : '未增加（今日已记过）'));
+    }
+    say('');
+    say(`合计入账 +${r.gained}    ${r.before} → ${r.after}`);
+    if (r.gained === 0) say('（每个 ruleType 每天只记一次；今天已经报过了）');
+    toast(r.gained > 0 ? ('入账 +' + r.gained) : '本次未增加', r.gained > 0 ? 'ok' : 'err');
+  } catch (e) {
+    say('异常：' + e.message);
+    toast(e.message, 'err');
+  }
+}
+
+/** 出题（看题 / 抄答案）。 */
+async function fetchPracticeExam() {
+  const id = $('prac-leo').value;
+  if (!id) return toast('先选择小猿账号', 'err');
+  const out = $('prac-examout');
+  out.textContent = '请求中…';
+  try {
+    const r = await api('/api/exercise/exam', {
+      method: 'POST',
+      body: { leoAccountId: Number(id), keypointId: Number($('prac-kp').value || 235001), limit: Number($('prac-limit').value || 10) },
+    });
+    if (!r.ok) { out.textContent = '失败 HTTP ' + r.status + '\n' + (r.text || ''); return toast('出题失败', 'err'); }
+    const ex = r.exam || {};
+    const lines = [
+      'examId  : ' + ex.idString,
+      '知识点  : ' + ex.keypoint + ' (id=' + ex.keypointId + ')',
+      '题数    : ' + ex.questionCnt + '   预计经验 = 答对题数 × 2 = ' + (ex.questionCnt * 2),
+      '',
+    ];
+    for (const [i, q] of (ex.questions || []).entries()) {
+      lines.push(String(i + 1).padStart(3) + '. ' + q.content + '   答案=' + q.answer);
+    }
+    out.textContent = lines.join('\n');
+  } catch (e) {
+    out.textContent = '异常：' + e.message;
+    toast(e.message, 'err');
+  }
+}
+
+/* ========================= 刷练习 结束 ========================= */
 
 (async function init() {
   try {

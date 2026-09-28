@@ -58,6 +58,14 @@ const config = {
     brand: process.env.PK_DEVICE_BRAND || 'Redmi',
     model: process.env.PK_DEVICE_MODEL || '25053RT47C',
     sdk: envInt('PK_DEVICE_SDK', 37),
+    /**
+     * UA 里那个「Android NN」的数字。
+     *
+     * ⚠️ **与 [sdk] 不是一回事**：query 的 `platform=android37` 用 SDK 号，
+     * 而原版 UA 写的是 `Android 17`（实测抓包逐字）。两个值必须都按原版来，
+     * 不然风控会把请求判成异构（练习端点实测 417）。
+     */
+    uaSdk: envInt('PK_DEVICE_UA_SDK', 17),
     scale: process.env.PK_DEVICE_SCALE || '3.25',
   },
 
@@ -132,6 +140,38 @@ const PK = {
   productIdPk: '631',
   appIdPk: '6',
 
+  /**
+   * 练习（`/leo-star` `/leo-math` `/leo-reward` 主域端点）的公共参数。
+   *
+   * ## ★ 为什么单独一套（2026-09-28 实测，417 墙的根因）
+   *
+   * 主域端点被 `solar-encoder` 拦成 417，**根因是 `version`**：
+   * 拿原版真实抓包（`auto_oral-2026-09-27.log`）逐行对比后逐项 A/B：
+   *
+   * ```
+   * 417   platform=android36 + version=3.141.1   ← 我们原来的值
+   * 417   + platform=android37
+   * 200   + version=3.140.1                    ← 改这一个就通
+   * ```
+   *
+   * 注意：App 包名版本是 3.141.1，但**服务端放行的是 3.140.1**
+   * —— 未知版本号直接被判可疑。所以练习一律用 `3.140.1` + `android37`。
+   *
+   * PK 端点（`leo-game-pk`）**不受此限**（它走另一套校验，且不需要 sign），
+   * 所以 PK 仍沿用 [PK.commonQuery]，两边互不影响。
+   */
+  exercise: {
+    platform: 'android37',
+    version: '3.140.1',
+    vendor: 'UC',
+    av: '5',
+    deviceCategory: 'phone',
+    webviewVersion: '150',
+    whRatio: '2.17',
+    isBackground: '0',
+    /** 练习一律 611。 */
+    productId: '611',
+  },
   /** 风控头（真机抓包逐字）。 */
   headers: {
     'X-XYKS-REQ-NETWORK-ENV': 'mobile',

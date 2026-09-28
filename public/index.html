@@ -41,6 +41,7 @@
     <div class="brand">pk-node</div>
     <nav class="nav">
       <button class="nav-btn active" data-tab="grind">刷局</button>
+      <button class="nav-btn" data-tab="practice">刷练习</button>
       <button class="nav-btn" data-tab="accounts">小猿账号</button>
       <button class="nav-btn" data-tab="jobs">任务</button>
       <button class="nav-btn" data-tab="tunnel">穿透</button>
@@ -127,6 +128,57 @@
         <h2>实时日志 <span id="job-badge" class="badge"></span></h2>
         <div id="log" class="log"></div>
       </div>
+    </div>
+  </main>
+
+  <!-- 刷练习（/leo-star 主域；417 已破） -->
+  <main class="panel hidden" id="tab-practice">
+    <div class="card">
+      <h2>练习 / 刷分</h2>
+      <p class="muted small">
+        走 <code>/leo-star</code> 主域（与 PK 不同链路）。<b>关键在于 <code>version=3.140.1</code></b> ——
+        开 3.141.1 会被 <code>solar-encoder</code> 拦成 417。
+      </p>
+      <div class="row">
+        <select id="prac-leo"></select>
+        <button id="prac-refresh" class="grow">刷新分数/任务</button>
+      </div>
+      <pre id="prac-status" class="log" style="max-height:220px">（点「刷新分数/任务」）</pre>
+    </div>
+
+    <div class="card">
+      <h2>经验上报（刷分）</h2>
+      <p class="muted small">
+        <code>POST /leo-star/android/exercise/rank/login/attend</code>（gzip + 内容编码）。<br>
+        <b>每个 ruleType 每天只记一次</b>；实测可记账的只有 <code>0</code> 与 <code>1</code>，
+        单次上限 200 ⇒ <b>日上限 400 分</b>。同一类型当天再报会返回 200 但不加分（服务端静默去重）。
+      </p>
+      <div class="row">
+        <label class="grow">每次增量 obtainExp<input id="prac-delta" type="number" value="200" min="1" max="200"></label>
+        <label class="grow">ruleType（逗号分隔）<input id="prac-rts" value="0,1"></label>
+      </div>
+      <div class="row">
+        <button id="prac-pump" class="primary grow">开始上报</button>
+      </div>
+      <pre id="prac-log" class="log" style="max-height:260px"></pre>
+    </div>
+
+    <div class="card">
+      <h2>练习出题（看题 / 抄答案）</h2>
+      <p class="muted small">
+        <code>POST /leo-math/android/exams</code>（form：<code>keypointId</code> + <code>limit</code>）。
+        返回的每题<b>自带 <code>answer</code></b>。经验公式 = <b>答对题数 × 2</b>（10 题 20 分 / 100 题 200 分）。
+      </p>
+      <div class="row">
+        <label class="grow">知识点 ID<input id="prac-kp" type="number" value="235001"></label>
+        <label class="grow">题数 limit<input id="prac-limit" type="number" value="10" min="1" max="200"></label>
+        <button id="prac-exam">出题</button>
+      </div>
+      <pre id="prac-examout" class="log" style="max-height:300px"></pre>
+      <p class="muted small">
+        ⚠️ 整卷提交 <code>PUT /leo-math/android/exams/v2/{examId}</code> <b>尚未打通</b>（恒 400，体校验问题）。
+        所以出题目前只用于「看题」，加分走上面的经验上报。
+      </p>
     </div>
   </main>
 

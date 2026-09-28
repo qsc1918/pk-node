@@ -283,6 +283,42 @@ GET /leo-game-pk/{client}/math/pk/history/detail?pkIdStr=<pkIdStr>
 `english/pk/submit`、`word/eliminate/submit`、`math/pk/reward/claim`、`pk/pros/use`、
 `pk/login/sync`。`/v2` 系列返回 **arraybuffer 加密体**，本项目走旧版明文接口。）
 
+### 4.7 练习链路（`/leo-star` / `/leo-math`）—— **417 已破**
+
+与 PK 是**两条独立链路**。主域端点被 `solar-encoder` 拦成 417，根因只有一个：
+
+```
+version=3.141.1  → 417        version=3.140.1  → 200   ← 服务端拒绝未知版本号
+platform=android36 → 417      platform=android37 → 200
+```
+
+另外两处也要对齐原版（拿真机抓包 `auto_oral-2026-09-27.log` 逐行比出来的）：
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| 请求头 | `leo-client-trace-id` + `default-namespace-sw8` | 主域风控会看 |
+| UA | `Leo/3.140.1 (...; Android 17; ...)` | **是 17 不是 37**（37 是 query 的 `platform`） |
+| `sign` | **必须带** | 不带就 417；与 PK 相反（PK 不需要） |
+
+> ⚠️ 练习依赖 `sign`，而 `sign` 需要 arm64 原生库 —— 所以练习**不能在 x86 / Windows 上跑**（PK 可以）。
+
+#### 三条链路
+
+| 链路 | 端点 | 状态 |
+|---|---|---|
+| **出题** | `POST /leo-math/android/exams`（form: `keypointId` + `limit`） | ✅ 每题自带 `answer` |
+| **经验上报（刷分）** | `POST /leo-star/.../rank/login/attend`（`@NeedEncode`） | ✅ 每次 +200 |
+| 整卷提交 | `PUT /leo-math/android/exams/v2/{examId}` | ⚠️ 尚未打通（恒 400） |
+
+#### 刷分的硬上限（实测）
+
+**每个可记账 `ruleType` 每天只记一次**，实测**只有 `0` 与 `1` 有效** ⇒ 日上限 **400 分**。
+同一 ruleType 当天再报会返回 `200 {data:true}` 但**分数不动**（服务端静默去重）。
+
+#### 练习页
+
+网页顶部多了「**刷练习**」tab：刷新分数/任务、经验上报、出题看题（含答案）。
+
 ### 5. 登录（短信 / 密码）的加密口径 —— **两条路的字段不一样**
 
 | 接口 | 字段 | 加密？ |

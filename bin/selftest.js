@@ -153,6 +153,24 @@ const missingLeo = REQUIRED_LEO.filter((k) => typeof leoLib[k] === 'undefined');
 check('leo.js 导出齐全', missingLeo.length === 0,
   missingLeo.length === 0 ? REQUIRED_LEO.length + ' 项' : '缺少 ' + missingLeo.join(', '));
 
+// 练习协议层（/leo-star /leo-math；417 已破，version 必须 3.140.1）
+const exLib = require(path.join(root, 'src', 'exercise'));
+const REQUIRED_EX = ['buildExerciseUrl', 'exerciseHeaders', 'overview', 'getExam', 'attend', 'pumpScore'];
+const missingEx = REQUIRED_EX.filter((k) => typeof exLib[k] !== 'function');
+check('exercise.js 导出齐全', missingEx.length === 0,
+  missingEx.length === 0 ? REQUIRED_EX.length + ' 项' : '缺少 ' + missingEx.join(', '));
+
+// 练习 URL 必须带 version=3.140.1 + platform=android37（否则 417）
+{
+  const u = exLib.buildExerciseUrl('/leo-star/android/exercise/homepage');
+  const okVer = u.includes('version=3.140.1');
+  const okPlat = u.includes('platform=android37');
+  const okProd = u.includes('_productId=611');
+  check('练习参数 version=3.140.1 / platform=android37 / _productId=611',
+    okVer && okPlat && okProd,
+    (okVer ? '' : 'version 错 ') + (okPlat ? '' : 'platform 错 ') + (okProd ? '' : '_productId 错 '));
+}
+
 const engineLib = require(path.join(root, 'src', 'pk-engine'));
 const REQUIRED_ENGINE = ['makePath', 'buildSubmitBody', 'pickAnswer', 'isRateLimited', 'backoffMs', 'runOneRound'];
 const missingEngine = REQUIRED_ENGINE.filter((k) => typeof engineLib[k] === 'undefined');
