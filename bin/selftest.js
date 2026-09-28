@@ -180,6 +180,17 @@ check('pk-engine.js 导出齐全', missingEngine.length === 0,
 const jobsLib = require(path.join(root, 'src', 'jobs'));
 const REQUIRED_JOBS = ['startJob', 'stopJob', 'subscribe', 'publish', 'bufferedEvents', 'isBusy'];
 const missingJobs = REQUIRED_JOBS.filter((k) => typeof jobsLib[k] === 'undefined');
+// ---- cookie 加密 + 设备链池 ----
+const cookiecrypt = require(path.join(root, 'src', 'cookiecrypt'));
+const ct = cookiecrypt.selfTest();
+check('cookie 加密（AES-256-GCM）往返一致', ct.ok, ct.detail + ' | 密钥来源: ' + ct.mode);
+const encSample = cookiecrypt.encryptValue('ks_deviceid=352949417');
+check('密文不含明文', encSample.indexOf('352949417') < 0 && encSample.indexOf(cookiecrypt.PREFIX) === 0);
+const laLib = require(path.join(root, 'src', 'services', 'leo-accounts'));
+check('设备链解析 extractDeviceChain',
+  !!laLib.extractDeviceChain('ks_deviceid=1; ks_r=2; ks_u=3') &&
+  laLib.extractDeviceChain('sess=abc') === null);
+
 check('jobs.js 导出齐全', missingJobs.length === 0,
   missingJobs.length === 0 ? REQUIRED_JOBS.length + ' 项' : '缺少 ' + missingJobs.join(', '));
 

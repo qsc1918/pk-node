@@ -8,16 +8,17 @@
  *   唯一要注意的是别在热路径里做全表扫描（都加了索引）。
  * - **用户口令**：`scrypt` + 每用户随机 salt（Node `crypto.scryptSync`）。
  *   不用 bcrypt/argon2 是为了零依赖；scrypt 本身是抗暴力破解的 KDF。
- * - **小猿 cookie 的存储**：整份 cookie 以 JSON 存 **明文**（`sub_accounts.cookies_json`）。
- *   这一点必须诚实说明：服务要拿它去请求小猿，本地又没密钥管理，
- *   所以「谁能读到这台机器的 db 文件，谁就能拿到 cookie」。
- *   缓解：默认只监听 `127.0.0.1`；管理后台可随时清空。
+ * - **小猿 cookie 的存储**：`leo_accounts.cookies_json` 里每个 cookie 的 **value 都加密**
+ *   （AES-256-GCM，见 [cookiecrypt]）。`name/domain/path` 保持明文，便于「只列 cookie 名」。
+ *   密钥来自 `PK_SECRET`（>=16 字符）或 `data/secret.key`（0600，自动生成）。
+ *   => 光拿到 db 文件**打不开登录态与设备链**；要同时拿到密钥文件才行。
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
+const cookiecrypt = require('./cookiecrypt');
 const { config } = require('./config');
 
 let db = null;
@@ -82,6 +83,18 @@ CREATE TABLE IF NOT EXISTS leo_accounts (
   updated_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_leo_accounts_user ON leo_accounts(user_id);
+
+-- ★ 设备链池：多份 ks_*（同一设备可来自不同 App 账号），登录账号自动挑一份补齐。
+--   value 同样加密存储（见 cookiecrypt）；label 只是给人看的备注。
+CREATE TABLE IF NOT EXISTS device_chains (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  label      TEXT    NOT NULL DEFAULT '设备链',
+  cookies_json TEXT  NOT NULL,          -- [{name,value,domain,path}]（value 加密）
+  device_id  TEXT,                      -- ks_deviceid（明文，便于识别/去重）
+  enabled    INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 
 -- 子账号（从小猿上下文接口拉取，可随时刷新）
 CREATE TABLE IF NOT EXISTS sub_accounts (
@@ -153,6 +166,18 @@ function init() {
   fs.mkdirSync(path.dirname(config.dbFile), { recursive: true });
   db = new DatabaseSync(config.dbFile);
   db.exec(SCHEMA);
+
+  // 启动即把历史明文 cookie 迁移为加密（幂等，已加密的会跳过）
+  try {
+    const m = migrateCookieEncryption();
+    if (m.reEncrypted > 0) {
+      // VACUUM：把旧明文页从 db / WAL 里彻底清掉（否则 checkpoint 前明文还在）
+      try { db.exec('VACUUM'); } catch (e) { /* 忽略 */ }
+      console.log(`[db] cookie 加密迁移：${m.reEncrypted}/${m.scanned} 条已加密（已 VACUUM 清除旧明文页）`);
+    }
+  } catch (e) {
+    console.warn('[db] cookie 加密迁移失败（不影响启动）：' + e.message);
+  }
 
   // 首次启动写入默认管理员（用户要求 admin/admin）。
   const row = db.prepare('SELECT COUNT(*) AS n FROM users WHERE role = ?').get('admin');
@@ -252,7 +277,7 @@ function addLeoAccount(userId, name, cookies, extra = {}) {
     .run(
       Number(userId),
       String(name),
-      JSON.stringify(cookies),
+      JSON.stringify(cookiecrypt.encryptItems(cookies)),
       extra.yfdU == null ? null : String(extra.yfdU),
       extra.grade == null ? null : Number(extra.grade),
       now,
@@ -269,7 +294,7 @@ function updateLeoAccount(id, name, cookies, extra = {}) {
     )
     .run(
       String(name),
-      JSON.stringify(cookies),
+      JSON.stringify(cookiecrypt.encryptItems(cookies)),
       extra.yfdU == null ? null : String(extra.yfdU),
       extra.grade == null ? null : Number(extra.grade),
       Date.now(),
@@ -277,18 +302,117 @@ function updateLeoAccount(id, name, cookies, extra = {}) {
     );
 }
 
+/** 把一行 leo_accounts 的 cookies_json 解密成明文 JSON 文本（对上层透明）。 */
+function decryptAccountRow(row) {
+  if (!row) return row;
+  let items = null;
+  try { items = JSON.parse(row.cookies_json); } catch (e) { return row; }
+  const plain = cookiecrypt.decryptItems(items);
+  return Object.assign({}, row, { cookies_json: JSON.stringify(plain) });
+}
 function listLeoAccounts(userId) {
   return get()
     .prepare('SELECT * FROM leo_accounts WHERE user_id = ? ORDER BY id DESC')
-    .all(Number(userId));
+    .all(Number(userId)).map(decryptAccountRow);
 }
 
 function getLeoAccount(id) {
-  return get().prepare('SELECT * FROM leo_accounts WHERE id = ?').get(Number(id));
+  return decryptAccountRow(get().prepare('SELECT * FROM leo_accounts WHERE id = ?').get(Number(id)));
 }
 
 function deleteLeoAccount(id) {
   get().prepare('DELETE FROM leo_accounts WHERE id = ?').run(Number(id));
+}
+
+/**
+ * 把历史遗留的**明文** cookie 迁移为加密存储（幂等：已加密的会跳过）。
+ *
+ * @returns {{scanned:number, reEncrypted:number}}
+ */
+function migrateCookieEncryption() {
+  const rows = get().prepare('SELECT id, cookies_json FROM leo_accounts').all();
+  let re = 0;
+  const upd = get().prepare('UPDATE leo_accounts SET cookies_json = ?, updated_at = ? WHERE id = ?');
+  for (const row of rows) {
+    let items = null;
+    try { items = JSON.parse(row.cookies_json); } catch (e) { continue; }
+    if (!Array.isArray(items)) continue;
+    const plainCount = items.filter((c) => !String(c.value == null ? '' : c.value).startsWith(cookiecrypt.PREFIX)).length;
+    if (plainCount === 0) continue;                    // 全是密文 → 跳过
+    const enc = cookiecrypt.encryptItems(items);
+    upd.run(JSON.stringify(enc), Date.now(), row.id);
+    re++;
+  }
+  // 设备链池同样处理
+  const prows = get().prepare('SELECT id, cookies_json FROM device_chains').all();
+  const pupd = get().prepare('UPDATE device_chains SET cookies_json = ?, updated_at = ? WHERE id = ?');
+  for (const row of prows) {
+    let items = null;
+    try { items = JSON.parse(row.cookies_json); } catch (e) { continue; }
+    if (!Array.isArray(items)) continue;
+    const plainCount = items.filter((c) => !String(c.value == null ? '' : c.value).startsWith(cookiecrypt.PREFIX)).length;
+    if (plainCount === 0) continue;
+    pupd.run(JSON.stringify(cookiecrypt.encryptItems(items)), Date.now(), row.id);
+    re++;
+  }
+  return { scanned: rows.length + prows.length, reEncrypted: re };
+}
+
+/* --------------------------- 设备链池 --------------------------- */
+/** 新增一份设备链。 */
+function addDeviceChain(label, cookies, extra = {}) {
+  const now = Date.now();
+  const info = get()
+    .prepare(
+      `INSERT INTO device_chains (label, cookies_json, device_id, enabled, created_at, updated_at)
+       VALUES (?,?,?,?,?,?)`,
+    )
+    .run(
+      String(label || '设备链'),
+      JSON.stringify(cookiecrypt.encryptItems(cookies)),
+      extra.deviceId == null ? null : String(extra.deviceId),
+      extra.enabled === 0 ? 0 : 1,
+      now,
+      now,
+    );
+  return Number(info.lastInsertRowid);
+}
+
+/** 设备链池（已解密，可直接用）。 */
+function listDeviceChains(onlyEnabled) {
+  const rows = onlyEnabled
+    ? get().prepare('SELECT * FROM device_chains WHERE enabled = 1 ORDER BY id ASC').all()
+    : get().prepare('SELECT * FROM device_chains ORDER BY id ASC').all();
+  return rows.map((row) => {
+    let items = [];
+    try { items = JSON.parse(row.cookies_json); } catch (e) { items = []; }
+    return Object.assign({}, row, { cookies: cookiecrypt.decryptItems(items) });
+  });
+}
+
+function getDeviceChain(id) {
+  const row = get().prepare('SELECT * FROM device_chains WHERE id = ?').get(Number(id));
+  if (!row) return null;
+  let items = [];
+  try { items = JSON.parse(row.cookies_json); } catch (e) { items = []; }
+  return Object.assign({}, row, { cookies: cookiecrypt.decryptItems(items) });
+}
+
+function deleteDeviceChain(id) {
+  get().prepare('DELETE FROM device_chains WHERE id = ?').run(Number(id));
+}
+
+/** 按 ks_deviceid 去重（已存在则更新 value，返回 {id, created}）。 */
+function upsertDeviceChain(label, cookies, deviceId) {
+  if (deviceId) {
+    const row = get().prepare('SELECT id FROM device_chains WHERE device_id = ?').get(String(deviceId));
+    if (row) {
+      get().prepare('UPDATE device_chains SET label = ?, cookies_json = ?, updated_at = ? WHERE id = ?')
+        .run(String(label || '设备链'), JSON.stringify(cookiecrypt.encryptItems(cookies)), Date.now(), row.id);
+      return { id: row.id, created: false };
+    }
+  }
+  return { id: addDeviceChain(label, cookies, { deviceId: deviceId }), created: true };
 }
 
 /* ---------------------------- 子账号 ---------------------------- */
@@ -459,6 +583,12 @@ module.exports = {
   getUserBySession,
   deleteSession,
   purgeExpiredSessions,
+  migrateCookieEncryption,
+  addDeviceChain,
+  listDeviceChains,
+  getDeviceChain,
+  deleteDeviceChain,
+  upsertDeviceChain,
   addLeoAccount,
   updateLeoAccount,
   listLeoAccounts,

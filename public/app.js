@@ -129,6 +129,7 @@ document.querySelectorAll('.nav-btn').forEach((btn) => {
     });
     const t = btn.dataset.tab;
     if (t === 'practice') { loadPractice(); }
+    if (t === 'accounts') { loadDeviceChains(); }
     if (t === 'accounts') { loadLeoAccounts(); }
     if (t === 'jobs') { loadJobs(); }
     if (t === 'tunnel') { loadTunnel(); }
@@ -178,14 +179,17 @@ function renderLeoList(accounts) {
       '<div><div class="title"></div><div class="meta"></div></div>' +
       '<div class="actions">' +
       '<button class="mini" data-act="identity">当前身份</button>' +
+      '<button class="mini" data-act="chain">复制设备链</button>' +
       '<button class="mini" data-act="refresh">刷新子账号</button>' +
       '<button class="mini" data-act="subs">查看</button>' +
       '<button class="mini danger" data-act="del">删除</button>' +
       '</div>';
     el.querySelector('.title').textContent = a.name;
+    const ks = (a.cookieNames || []).filter((n) => n.indexOf('ks_') === 0);
     el.querySelector('.meta').textContent =
       'uid ' + (a.yfdU || '?') + ' · 年级 ' + (a.grade == null ? '?' : a.grade) +
-      ' · cookie: ' + (a.cookieNames || []).join(',');
+      ' · cookie ' + (a.cookieNames || []).length + ' 条' +
+      (ks.length ? ' · 设备链 ✓(' + ks.length + ')' : ' · 设备链 ✗（PK 刷不了，可「复制设备链」）');
     // 当前身份以服务端回包为准（子账号切换本服务做不到，见 docs）
     el.querySelector('[data-act="identity"]').addEventListener('click', async () => {
       try {
@@ -195,6 +199,25 @@ function renderLeoList(accounts) {
           ? '取不到生效身份（登录态可能已失效）'
           : '实际生效身份：' + cur + (String(cur) === String(a.yfdU) ? '（与库中一致）' : '（注意：与库中 uid 不一致）'),
           cur == null ? 'err' : 'ok');
+      } catch (err) { toast(err.message, 'err'); }
+    });
+    el.querySelector('[data-act="chain"]').addEventListener('click', async () => {
+      const others = (state.leoAccounts || []).filter((x) => x.id !== a.id);
+      if (others.length === 0) return toast('没有其它账号可作为设备链来源', 'err');
+      const src = prompt('从哪个账号复制设备链（填序号或 id）？\n' +
+        others.map((x, i) => (i + 1) + '. ' + x.name + ' (id=' + x.id + ', 设备链' +
+          ((x.cookieNames || []).some((n) => n.indexOf('ks_') === 0) ? '✓' : '✗') + ')').join('\n'));
+      if (!src) return;
+      const idx = Number(src) - 1;
+      const pick = (idx >= 0 && idx < others.length && String(Number(src)) === String(idx + 1))
+        ? others[idx] : others.find((x) => String(x.id) === String(src));
+      if (!pick) return toast('没找到该账号', 'err');
+      try {
+        const r = await api('/api/leo/accounts/' + a.id + '/device-chain', {
+          method: 'POST', body: { sourceId: pick.id },
+        });
+        toast(r.message || '已复制设备链', r.ok ? 'ok' : 'err');
+        await loadLeoAccounts();
       } catch (err) { toast(err.message, 'err'); }
     });
     el.querySelector('[data-act="refresh"]').addEventListener('click', async () => {
@@ -638,6 +661,8 @@ $('prac-refresh').addEventListener('click', refreshPractice);
 $('prac-pump').addEventListener('click', pumpPractice);
 $('prac-exam').addEventListener('click', fetchPracticeExam);
 $('prac-run').addEventListener('click', runPractice);
+$('dc-add').addEventListener('click', addDeviceChain);
+$('dc-list').addEventListener('click', onDeviceChainListClick);
 
 /* ---------------------------- 穿透页 ---------------------------- */
 
@@ -931,6 +956,53 @@ function attachPracticeStream() {
 /** 关闭练习事件流。 */
 function stopPracticeStream() {
   if (state.practiceStream) { state.practiceStream.close(); state.practiceStream = null; }
+}
+/* ========================= 设备链池 ========================= */
+async function loadDeviceChains() {
+  try {
+    const r = await api('/api/device-chains');
+    renderDeviceChains(r.chains || []);
+  } catch (e) { /* 未登录等，忽略 */ }
+}
+function renderDeviceChains(list) {
+  const box = $('dc-list');
+  box.innerHTML = '';
+  if (!list.length) {
+    box.innerHTML = '<p class="muted small">池子里还没有设备链。新登录的账号将没有 ks_*（PK 会 400）。</p>';
+    return;
+  }
+  for (const c of list) {
+    const el = document.createElement('div');
+    el.className = 'item';
+    el.innerHTML = '<div><div class="title"></div><div class="meta"></div></div>' +
+      '<div class="actions"><button class="mini danger" data-dc-del="' + c.id + '">删除</button></div>';
+    el.querySelector('.title').textContent = c.label + '（ks_deviceid=' + (c.deviceId || '?') + '）';
+    el.querySelector('.meta').textContent = (c.names || []).join(',') + ' · ' + c.bytes + 'B · ' + (c.enabled ? '启用' : '停用');
+    box.appendChild(el);
+  }
+}
+async function addDeviceChain() {
+  const cookie = $('dc-cookie').value.trim();
+  if (!cookie) return toast('先粘贴设备链 cookie', 'err');
+  try {
+    const r = await api('/api/device-chains', {
+      method: 'POST', body: { label: $('dc-label').value.trim(), cookie: cookie },
+    });
+    toast((r.created ? '已保存' : '已更新') + '：ks_deviceid=' + r.deviceId, 'ok');
+    $('dc-cookie').value = '';
+    $('dc-label').value = '';
+    await loadDeviceChains();
+  } catch (e) { toast(e.message, 'err'); }
+}
+async function onDeviceChainListClick(ev) {
+  const id = ev.target && ev.target.getAttribute && ev.target.getAttribute('data-dc-del');
+  if (!id) return;
+  if (!confirm('删除这份设备链？已用它补齐的账号不受影响，但新账号将无法自动补链。')) return;
+  try {
+    await api('/api/device-chains/' + id, { method: 'DELETE' });
+    toast('已删除', 'ok');
+    await loadDeviceChains();
+  } catch (e) { toast(e.message, 'err'); }
 }
 /* ========================= 刷练习 结束 ========================= */
 

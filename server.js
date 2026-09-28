@@ -214,6 +214,61 @@ async function handleApi(req, res, u, user) {
     return sendJson(res, r.ok ? 200 : 400, r);
   }
 
+  /* ---------------- 设备链池（多份 ks_*，登录账号自动挑一份补齐） ---------------- */
+  if (p === '/api/device-chains' && method === 'GET') {
+    const list = db.listDeviceChains(false).map((x) => ({
+      id: x.id,
+      label: x.label,
+      deviceId: x.device_id,
+      enabled: !!x.enabled,
+      names: (x.cookies || []).map((c) => c.name),
+      bytes: JSON.stringify(x.cookies || []).length,
+    }));
+    return sendJson(res, 200, { ok: true, chains: list });
+  }
+  if (p === '/api/device-chains' && method === 'POST') {
+    const b = await readJson(req);
+    const chain = leoAccounts.extractDeviceChain(b.cookie);
+    if (!chain) return sendJson(res, 400, { ok: false, message: '这段文本里没有可用设备链（需含 ks_deviceid）' });
+    const deviceId = (chain.find((c) => c.name === 'ks_deviceid') || {}).value;
+    const r = db.upsertDeviceChain(String(b.label || ('设备链 ' + deviceId)), chain, deviceId);
+    db.audit(user.id, 'device_chain_add', `id=${r.id} device=${deviceId} created=${r.created}`, clientIp(req));
+    return sendJson(res, 200, { ok: true, id: r.id, created: r.created, deviceId: deviceId, names: chain.map((c) => c.name) });
+  }
+  const dcItem = /^\/api\/device-chains\/(\d+)$/.exec(p);
+  if (dcItem && method === 'DELETE') {
+    db.deleteDeviceChain(Number(dcItem[1]));
+    db.audit(user.id, 'device_chain_del', 'id=' + dcItem[1], clientIp(req));
+    return sendJson(res, 200, { ok: true });
+  }
+
+  /* ---------------- cookie 加密迁移（旧明文 → 加密） ---------------- */
+  if (p === '/api/leo/accounts/migrate-crypt' && method === 'POST') {
+    const r = db.migrateCookieEncryption();
+    db.audit(user.id, 'leo_migrate_crypt', JSON.stringify(r), clientIp(req));
+    return sendJson(res, 200, Object.assign({ ok: true }, r));
+  }
+
+  // 设备链状态（给 UI：每个账号是否含 ks_*）
+  const leoChain = /^\/api\/leo\/accounts\/(\d+)\/device-chain$/.exec(p);
+  if (leoChain && method === 'GET') {
+    const id = Number(leoChain[1]);
+    const acc = db.getLeoAccount(id);
+    if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '账号不存在' });
+    return sendJson(res, 200, { ok: true, chain: leoAccounts.cookieNamesOf(id) });
+  }
+  if (leoChain && method === 'POST') {
+    const b = await readJson(req);
+    const targetId = Number(leoChain[1]);
+    const acc = db.getLeoAccount(targetId);
+    if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '账号不存在' });
+    const src = db.getLeoAccount(Number(b.sourceId));
+    if (!src || src.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '源账号不存在' });
+    const r = leoAccounts.graftDeviceChain(targetId, Number(b.sourceId));
+    db.audit(user.id, 'leo_graft_chain', `target=${targetId} source=${b.sourceId} ok=${r.ok}`, clientIp(req));
+    return sendJson(res, r.ok ? 200 : 400, r);
+  }
+
   const leoRefresh = /^\/api\/leo\/accounts\/(\d+)\/refresh$/.exec(p);
   if (leoRefresh && method === 'POST') {
     const r = await leoAccounts.refreshSubAccounts(Number(leoRefresh[1]));

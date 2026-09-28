@@ -413,6 +413,40 @@ platform=android36 → 417      platform=android37 → 200
 
 ---
 
+## 4.9 设备链池与 cookie 加密（2026-09-28）
+
+### 为什么需要设备链
+`ks_*`（`ks_deviceid` / `ks_r` / `ks_u` / `ks_sess` / `ks_persistent`）是**设备级**凭据，
+原版只有 `POST /leo-auth/android/user-devices` 才会下发 —— 而该路径整段被 `solar-encoder` 拦 **417**（纯 Node 无解）。
+
+**但 `ks_*` 可以不来自设备注册**：把同一台设备的 `ks_*` 复制到别的账号，服务端照样认。实测：
+
+```
+pk/match     无 ks_* → 400(×3)        有 ks_* → 200(×3)
+完整 PK 一局  跑不了                     ok=true，已结算
+```
+
+### 设备链池
+`「账号」页 → 设备链池`：粘贴含 `ks_deviceid` 的 cookie 即可入库（按 `ks_deviceid` 去重）。
+
+- **登录导入的账号会自动补链**：没 `ks_*` 时按 `轮询` 从池里挑一份（多份轮换，分摊风险）；
+- 导入完整 cookie 时，若自带设备链也会**自动收进池子**；
+- 池空则回退：从库里任意「有设备链的账号」借一份。
+
+API：`GET/POST /api/device-chains`，`DELETE /api/device-chains/:id`。
+
+### cookie 加密
+所有 cookie 的 **value** 在库里都是 **AES-256-GCM** 密文：
+
+```
+enc:v1:<b64 iv12>:<b64 tag16>:<b64 ciphertext>
+```
+
+- 密钥：`PK_SECRET`（≥16 字符，推荐）→ `sha256(PK_SECRET)`；否则 `data/secret.key`（32 随机字节、0600、首启自动生成）。
+- `name/domain/path` 保持明文（便于「只列 cookie 名」，页面永不回显 value）。
+- **历史明文自动迁移**：启动时检测到明文就加密，并 `VACUUM` 清掉旧页（`POST /api/leo/accounts/migrate-crypt` 可手动触发）。
+- ⚠️ **密钥别丢**：丢了 = 已加密的 cookie 无法解密，需要重新导入账号。
+
 ## 五、使用流程
 
 三种添加小猿账号的方式，效果完全一致（都走同一套「探活 + 拉子账号 + 落库」）：
@@ -516,11 +550,15 @@ bin/cloudflared tunnel --url http://127.0.0.1:8787 --no-autoupdate
 
 | 项 | 说明 |
 |---|---|
-| cookie 存储 | 小猿 cookie 以 **明文 JSON** 存在 `data/pk-node.sqlite`。谁能读到这个文件，谁就能拿到登录态。默认只监听 `127.0.0.1`；可在后台删除账号。 |
+| cookie 存储 | ✅ **已加密**：`leo_accounts.cookies_json` / `device_chains.cookies_json` 里每个 cookie 的 **value 都是 AES-256-GCM 密文**
+（`enc:v1:iv:tag:ct`），密钥来自 `PK_SECRET`（≥16 字符）或 `data/secret.key`（0600，自动生成）。
+**光拿到 db 文件打不开登录态与设备链**；要同时拿到密钥文件才行。默认只监听 `127.0.0.1`。 |
 | 默认密码 | `admin/admin` 只是为了「开箱能进」。**对外暴露前必须改密**。 |
 | 频控 | 服务端对提交接口有独立频控窗口。刷太快会 403/400，属正常保护，不是本项目的 bug。 |
 | 风控 | 连续高频出题可能触发「已封禁，暂时无法使用」的短时冷却，等几分钟再试。 |
-| 设备链 | `ks_*` 由原版 App 的设备注册下发；本服务只拿得到服务端在主域请求里补发的 **`sid`**（登录导入已自动收下）。
+| 设备链 | **PK 出题必须带 `ks_*`**（没它 `pk/match` 恒 400，登录账号刷不了 PK）。
+本服务用「**设备链池**」解决：把多份来源的 `ks_*` 存进池子，**登录导入的账号自动挑一份补齐**（多份轮换）。
+仍拿不到真值的只有「切换子账号」（`switch` 恒 417）。 | `ks_*` 由原版 App 的设备注册下发；本服务只拿得到服务端在主域请求里补发的 **`sid`**（登录导入已自动收下）。
 缺 `ks_*` → 子账号**明细**（昵称/头像）接口 401、且**切换子账号做不到**，退化为显示 `账号 {uid}`，**均不影响刷局 / 刷练习**。 |
 | 短信登录 | 未实现（默认走「导入登录态」）。如需要按 `ape-api.yuanfudao.com/accounts/android/safe/login` 补。 |
 

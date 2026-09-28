@@ -190,6 +190,10 @@ async function importAccount(o) {
     if (vo && vo.grade != null) grade = Number(vo.grade);
   }
 
+  // ★ 登录的账号若没有设备链，自动从「设备链池」补一份（多份轮换）
+  const chainInfo = applyDeviceChain(jar);
+  if (chainInfo.applied) console.log('[leo] 已自动补齐设备链:', chainInfo.from, chainInfo.deviceId || '');
+
   // 只落「有值」的 cookie：服务端曾用 Set-Cookie 发 ks_deviceid=空 表示设备链无效，
   // 存空值反而会覆盖已有的好值。
   const cookies = jar.toJSON().filter((c) => String(c.value == null ? '' : c.value).length > 0);
@@ -335,6 +339,154 @@ async function switchTo(leoAccountId, targetUserId) {
   };
 }
 
+/**
+ * 设备链 cookie 名（原版由 POST /leo-auth/android/user-devices 下发）。
+ */
+const DEVICE_CHAIN_COOKIES = ['ks_deviceid', 'ks_r', 'ks_u', 'ks_sess', 'ks_persistent'];
+
+/** 只暴露 cookie 名 + 是否含设备链（不泄露值）。 */
+function cookieNamesOf(id) {
+  const acc = db.getLeoAccount(Number(id));
+  if (!acc) return null;
+  let items = [];
+  try { items = JSON.parse(acc.cookies_json); } catch (e) { return null; }
+  const names = items.map((c) => c.name);
+  const ks = names.filter((n) => n.indexOf('ks_') === 0);
+  return { id: acc.id, name: acc.name, names: names, ks: ks, hasDeviceChain: ks.length > 0 };
+}
+
+/**
+ * 从任意 cookie 文本里抽出设备链（`ks_*`）。
+ * 只要含 `ks_deviceid` 就认为是一份可用设备链。
+ */
+function extractDeviceChain(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  let items = [];
+  try {
+    if (raw.startsWith('[') || raw.startsWith('{')) {
+      const j = JSON.parse(raw);
+      items = Array.isArray(j) ? j : (j.items || []);
+    } else {
+      items = raw.replace(/\r?\n/g, '; ').split(';').map((part) => {
+        const seg = part.trim();
+        const i = seg.indexOf('=');
+        if (i <= 0) return null;
+        return { name: seg.slice(0, i).trim(), value: seg.slice(i + 1).trim(), domain: '.yuanfudao.com', path: '/' };
+      }).filter(Boolean);
+    }
+  } catch (e) { return null; }
+  const chain = DEVICE_CHAIN_COOKIES
+    .map((n) => items.find((c) => c.name === n))
+    .filter((c) => c && String(c.value || '').length > 0)
+    .map((c) => ({ name: c.name, value: c.value, domain: c.domain || '.yuanfudao.com', path: c.path || '/' }));
+  if (!chain.some((c) => c.name === 'ks_deviceid')) return null;
+  return chain;
+}
+
+/** 自动把含设备链的 cookie 文本收进「设备链池」（按 ks_deviceid 去重）。 */
+function autoPoolDeviceChain(cookieText, label) {
+  const chain = extractDeviceChain(cookieText);
+  if (!chain) return null;
+  const deviceId = (chain.find((c) => c.name === 'ks_deviceid') || {}).value;
+  try {
+    return db.upsertDeviceChain(label || ('设备链 ' + deviceId), chain, deviceId);
+  } catch (e) { return null; }
+}
+
+/**
+ * ★ 给一个 jar 自动补齐设备链。
+ *
+ * 优先级：
+ *   1. jar 里已经有 `ks_deviceid` → 什么都不做；
+ *   2. 设备链池里有 enabled 的份 → 取第 `pick % 池大小` 份（多份轮换，分摊风险）；
+ *   3. 池空 → 从库里任意「有设备链的账号」借一份（向后兼容）。
+ *
+ * @returns {{applied:boolean, from?:string, deviceId?:string}}
+ */
+function applyDeviceChain(jar, pick) {
+  const has = jar.toJSON().some((c) => c.name === 'ks_deviceid' && String(c.value || '').length > 0);
+  if (has) return { applied: false, from: 'self' };
+
+  let pool = [];
+  try { pool = db.listDeviceChains(true); } catch (e) { pool = []; }
+
+  // 池空则回退：从已有账号借
+  let chain = null;
+  let from = null;
+  if (pool.length > 0) {
+    const idx = Number.isFinite(pick) ? (Math.abs(Number(pick)) % pool.length) : Math.floor(Math.random() * pool.length);
+    chain = pool[idx].cookies;
+    from = 'pool#' + pool[idx].id + (pool[idx].device_id ? '(' + pool[idx].device_id + ')' : '');
+  } else {
+    let accs = [];
+    try { accs = db.listLeoAccounts(0); } catch (e) { accs = []; }
+    if (!accs.length) {
+      try { accs = db.get().prepare('SELECT * FROM leo_accounts').all(); } catch (e) { accs = []; }
+    }
+    for (const a of accs) {
+      let items = [];
+      try { items = JSON.parse(a.cookies_json); } catch (e) { continue; }
+      const c = DEVICE_CHAIN_COOKIES.map((n) => items.find((x) => x.name === n)).filter((x) => x && String(x.value || '').length > 0);
+      if (c.some((x) => x.name === 'ks_deviceid')) { chain = c; from = 'account#' + a.id; break; }
+    }
+  }
+  if (!chain) return { applied: false, from: 'none' };
+
+  for (const c of chain) {
+    jar.set({ name: c.name, value: c.value, domain: c.domain || '.yuanfudao.com', path: c.path || '/' });
+  }
+  const dev = (chain.find((c) => c.name === 'ks_deviceid') || {}).value;
+  return { applied: true, from: from, deviceId: dev };
+}
+
+/**
+ * ★ 设备链移植（2026-09-28 实测可行）。
+ *
+ * ## 为什么需要
+ * 登录（短信/密码）导入的账号只有 6~7 条 cookie，**没有 ks_**；
+ * 而没有设备链时 PK 出题（pk/match）实测**恒定 400**「No message available」，
+ * 也就是「登录进来的账号刷不了 PK」。
+ *
+ * ## 为什么能移植
+ * ks_deviceid 是**设备级**标识（真机值是数字串），不是账号级；
+ * 把同一台设备/同一个 App 的 ks_* 复制到另一个账号，服务端照样认。
+ *
+ * ## 实测效果（账号5 移植账号4 的 5 个 ks_*）
+ *   pkMatch        400(x3)  ->  200(x3)
+ *   完整 PK 一局   跑不了    ->  ok=true，已结算，pkIdStr=869321703547867169
+ *   batchGet       401      ->  417（认证层过了，卡传输层 solar-encoder）
+ * 注意：只对**读/出题**类有效；switch（切子账号）仍 417，做不到。
+ *
+ * @param {number} targetId 目标账号（补齐设备链）
+ * @param {number} sourceId 源账号（提供 ks_*）
+ */
+function graftDeviceChain(targetId, sourceId) {
+  const t = db.getLeoAccount(Number(targetId));
+  const s = db.getLeoAccount(Number(sourceId));
+  if (!t) return { ok: false, message: '目标账号不存在' };
+  if (!s) return { ok: false, message: '源账号不存在' };
+  let tItems = [];
+  let sItems = [];
+  try { tItems = JSON.parse(t.cookies_json); } catch (e) { tItems = []; }
+  try { sItems = JSON.parse(s.cookies_json); } catch (e) { sItems = []; }
+  const src = sItems.filter((c) => DEVICE_CHAIN_COOKIES.indexOf(c.name) >= 0 && String(c.value || '').length > 0);
+  if (src.length === 0) return { ok: false, message: '源账号没有设备链 cookie（ks_*）' };
+  const jar = new leo.CookieJar(tItems);
+  for (const c of src) {
+    jar.set({ name: c.name, value: c.value, domain: c.domain || '.yuanfudao.com', path: c.path || '/' });
+  }
+  const merged = jar.toJSON().filter((c) => String(c.value == null ? '' : c.value).length > 0);
+  db.updateLeoAccount(t.id, t.name, merged, {});
+  return {
+    ok: true,
+    id: t.id,
+    copied: src.map((c) => c.name),
+    cookies: merged.length,
+    message: '已从「' + s.name + '」移植设备链：' + src.map((c) => c.name).join(', '),
+  };
+}
+
 /** 从错误体里抠出 message，仅用于展示。 */
 function r0Code(text) {
   try {
@@ -346,6 +498,12 @@ function r0Code(text) {
 }
 
 module.exports = {
+  DEVICE_CHAIN_COOKIES,
+  extractDeviceChain,
+  autoPoolDeviceChain,
+  applyDeviceChain,
+  cookieNamesOf,
+  graftDeviceChain,
   REQUIRED_COOKIES,
   parseCookieInput,
   probe,
