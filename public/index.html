@@ -164,21 +164,23 @@
     </div>
 
     <div class="card">
-      <h2>练习出题（看题 / 抄答案）</h2>
+      <h2>自动刷练习（出题 → 抄答案 → 提交）</h2>
       <p class="muted small">
-        <code>POST /leo-math/android/exams</code>（form：<code>keypointId</code> + <code>limit</code>）。
-        返回的每题<b>自带 <code>answer</code></b>。经验公式 = <b>答对题数 × 2</b>（10 题 20 分 / 100 题 200 分）。
+        完整闭环：<code>POST /leo-math/android/exams</code> 出题（每题自带 <code>answer</code>）→
+        <code>PUT /leo-math/android/exams/{examId}</code> <b>JSON 明文</b>提交（含笔迹 <code>script</code>，服务端凭笔迹判卷）。
+        经验 = <b>答对题数 × 2</b>（10 题 20 / 100 题 200）。<br>
+        出题冷却 <b>≈62 秒/账号</b>（与 PK 同源）；引擎<b>贴着冷却自动配速</b>，撞频控（429）会自动重试。建议 <code>limit=100</code>。
       </p>
       <div class="row">
-        <label class="grow">知识点 ID<input id="prac-kp" type="number" value="235001"></label>
-        <label class="grow">题数 limit<input id="prac-limit" type="number" value="10" min="1" max="200"></label>
-        <button id="prac-exam">出题</button>
+        <label class="grow">知识点 ID<input id="prac-kp" type="number" value="16"></label>
+        <label class="grow">每轮题数 limit<input id="prac-limit" type="number" value="100" min="1" max="200"></label>
+        <label class="grow">轮数<input id="prac-rounds" type="number" value="1" min="1" max="99"></label>
       </div>
-      <pre id="prac-examout" class="log" style="max-height:300px"></pre>
-      <p class="muted small">
-        ⚠️ 整卷提交 <code>PUT /leo-math/android/exams/v2/{examId}</code> <b>尚未打通</b>（恒 400，体校验问题）。
-        所以出题目前只用于「看题」，加分走上面的经验上报。
-      </p>
+      <div class="row">
+        <button id="prac-run" class="primary grow">开始刷练习</button>
+        <button id="prac-exam">只看题（不提交）</button>
+      </div>
+      <pre id="prac-runlog" class="log tall" style="max-height:360px"></pre>
     </div>
   </main>
 

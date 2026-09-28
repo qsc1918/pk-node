@@ -155,7 +155,7 @@ check('leo.js 导出齐全', missingLeo.length === 0,
 
 // 练习协议层（/leo-star /leo-math；417 已破，version 必须 3.140.1）
 const exLib = require(path.join(root, 'src', 'exercise'));
-const REQUIRED_EX = ['buildExerciseUrl', 'exerciseHeaders', 'overview', 'getExam', 'attend', 'pumpScore'];
+const REQUIRED_EX = ['buildExerciseUrl', 'exerciseHeaders', 'overview', 'getExam', 'attend', 'pumpScore', 'readScore', 'runPractice', 'practiceLoop', 'submitExam', 'answerAll'];
 const missingEx = REQUIRED_EX.filter((k) => typeof exLib[k] !== 'function');
 check('exercise.js 导出齐全', missingEx.length === 0,
   missingEx.length === 0 ? REQUIRED_EX.length + ' 项' : '缺少 ' + missingEx.join(', '));

@@ -308,7 +308,7 @@ platform=android36 → 417      platform=android37 → 200
 |---|---|---|
 | **出题** | `POST /leo-math/android/exams`（form: `keypointId` + `limit`） | ✅ 每题自带 `answer` |
 | **经验上报（刷分）** | `POST /leo-star/.../rank/login/attend`（`@NeedEncode`） | ✅ 每次 +200 |
-| 整卷提交 | `PUT /leo-math/android/exams/v2/{examId}` | ⚠️ 尚未打通（恒 400） |
+| **整卷提交** | `PUT /leo-math/android/exams/{examId}`（**不是 `/v2/`**，`Content-Type: application/json`，**body 是 JSON 明文不编码**） | ✅ **已打通**：必须带笔迹 `script`，服务端靠回放笔迹判卷（不信任 `status`） |
 
 #### 刷分的硬上限（实测）
 
@@ -317,7 +317,11 @@ platform=android36 → 417      platform=android37 → 200
 
 #### 练习页
 
-网页顶部多了「**刷练习**」tab：刷新分数/任务、经验上报、出题看题（含答案）。
+网页顶部多了「**刷练习**」tab：
+
+- **自动刷练习**：`出题 → 抄答案 → 提交` 完整闭环（`/api/exercise/run` + SSE 实时日志 `/api/exercise/stream`）。
+  引擎按出题冷却（≈62s/账号）自动配速，撞频控（429）自动重试；建议 `limit=100`（=200 经验）。
+- 刷新分数/任务、经验上报（刷分）、只看题（不提交）。
 
 ### 5. 登录（短信 / 密码）的加密口径 —— **两条路的字段不一样**
 

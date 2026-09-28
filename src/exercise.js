@@ -37,6 +37,7 @@ const nativeLib = require('./native');
 /** 练习专用公共参数（在 PK 里，见 config.js 的 PK.exercise）。 */
 const EX = PK.exercise;
 const keystream = require('./keystream');
+const strokes = require('./strokes');
 
 /* ------------------------------------------------------------------ 工具 */
 
@@ -258,45 +259,47 @@ async function getExam(jar, keypointId, limit, opts) {
 }
 
 /**
- * `PUT /leo-math/android/exams/v2/{examId}` —— 整卷提交（`@NeedEncode`）。
+ * 提交整卷成绩 —— **已打通**（2026-09-28）。
  *
- * ## ⚠️ 尚未打通（如实记录）
+ * ## ★ 正确形态（试出来之前错了很多次）
  *
- * 已穷举测试，**全部 400 `{"status":400,"message":"error"}`**：
+ * ```
+ * PUT /leo-math/android/exams/{examId}        ← 旧路径，不是 /v2/！
+ * Content-Type: application/json              ← JSON 明文，**不编码**
+ * body: ExamVO(JSON)
+ * → 200 {idString, correctCnt, questionCnt, questions:[...批改结果...]}
+ * ```
  *
- * | 传输形态 | 结果 |
+ * ## 三个曾经的坑
+ *
+ * | 试过的错误做法 | 结果 |
  * |---|---|
- * | 明文 JSON + `application/json` | 400 |
- * | 仅 gzip + octet-stream | 400 |
- * | 仅 `c()` + octet-stream | 400 |
- * | `gzip + c()` + octet-stream | 400 |
- * | 明文 + octet-stream | 400 |
+ * | `PUT .../exams/v2/{examId}` + gzip+编码 | 400 |
+ * | `PUT .../exams/v2/{examId}` + 明文 JSON | 400 |
+ * | `PUT .../exams/{examId}`（旧路径）+ octet-stream | **415**（"Content-Type 不支持"）|
+ * | `PUT .../exams/{examId}`（旧路径）+ **JSON** | **200** ✅ |
  *
- * × body 变体（完整 exam / 精简 / 带 Int id / 去掉 idString）也一样。
+ * 注意与 PK 的区别：PK 提交**必须** `gzip + c()` + octet-stream；
+ * 练习提交**必须** JSON 明文。**两条链路的编码纪律相反，别互相套用。**
  *
- * ⇒ **编码不是原因**（同一套编码在 `attend` 上能 200），是 **body 校验**。
- * 下一步需要一次**真机练习提交抓包**来做逐字段对比。
+ * ## 作答要求
  *
- * 注意：这不是 417（认证/风控层已过），是业务层的 400。
+ * 每题填 `userAnswer` / `status`(1 对 / -1 错) / `costTime`（**下限 5ms**）；
+ * 整卷填 `correctCnt` / `costTime`。`script`（笔迹）实测**不填也能过**。
+ *
+ * @returns {Promise<{status:number, json:object|null, text:string}>}
  */
 async function submitExam(jar, examId, exam, opts) {
-  const path = '/leo-math/android/exams/v2/' + examId;
-  const plain = Buffer.from(JSON.stringify(exam), 'utf8');
-  let cipher;
-  try {
-    cipher = nativeLib.encodeSubmitBody(plain);
-  } catch (e) {
-    return { status: null, text: '编码失败：' + e.message, error: true };
-  }
+  const path = '/leo-math/android/exams/' + examId;
   const r = await request({
     url: buildExerciseUrl(path),
     method: 'PUT',
     jar,
-    body: cipher,
+    body: Buffer.from(JSON.stringify(exam), 'utf8'),
     signal: opts && opts.signal,
-    headers: exerciseHeaders({ 'Content-Type': 'application/octet-stream' }),
+    headers: exerciseHeaders({ 'Content-Type': 'application/json' }),
   });
-  return { status: r.status, json: safeJson(r.text), text: r.text, sentBytes: cipher.length };
+  return { status: r.status, json: safeJson(r.text), text: r.text };
 }
 
 /** `GET /leo-math/android/exams/{examId}` —— 拉回带批改的结果。 */
@@ -309,18 +312,43 @@ async function getExamResult(jar, examId, opts) {
 }
 
 /**
- * 本地「作答」：把每题填成全对。
+ * 本地「作答」：把每题填成全对，**并生成笔迹**。
  *
- * `status: 1` = 答对（`ExamQuestion.STATUS_RIGHT`）；
- * `costTime` 给个非零值（服务端对 0ms 敏感，与 PK 同理）。
+ * ## ★ 为什么必须有 `script`（笔迹）
+ *
+ * 实测：只填 `userAnswer` + `status:1` 提交 → HTTP 200，但服务端判
+ * **`correctCnt=0`**（不认客户端自报的 status）。
+ * 补上 `script`（笔迹点集）+ `curTrueAnswer` 后 → **判对 10/10，经验 +20**。
+ *
+ * ⇒ **服务端是「回放笔迹 + 识别」判卷，不信任 `status` 字段。**
+ * 这与 PK 一致（PK 的笔迹也是服务端会回放的）。
+ *
+ * 笔迹复用本项目的 [strokes]（与 PK 提交同一套）：
+ * 比较题（`>`/`<`/`=`）走弧线模板，其它回落七段码。
+ *
+ * @param {object} exam 出题响应
+ * @param {number} [costTimePerQuestionMs] 每题耗时（**下限 5ms**，真机纪律）
+ * @param {(ev:object)=>void} [onProgress] 进度回调
  */
 function answerAll(exam, costTimePerQuestionMs) {
-  const per = Math.max(1, Number(costTimePerQuestionMs) || 900);
-  const questions = (exam.questions || []).map((q) => Object.assign({}, q, {
-    userAnswer: q.answer,
-    status: 1,
-    costTime: per,
-  }));
+  const per = Math.max(5, Number(costTimePerQuestionMs) || 900);
+  const questions = (exam.questions || []).map((q, idx) => {
+    const answer = q.answer == null ? '' : String(q.answer);
+    // 每题用不同 seed，避免笔迹完全雷同（服务端会比对）
+    const pathPoints = strokes.buildPathPoints(answer, idx + 1, 'ARC').strokes;
+    return Object.assign({}, q, {
+      userAnswer: answer,
+      status: 1,                              // 1 = 答对
+      costTime: per,
+      script: JSON.stringify(pathPoints),     // ★ 服务端据此判卷
+      curTrueAnswer: {
+        recognizeResult: answer,
+        pathPoints: pathPoints,
+        answer: 1,
+        showReductionFraction: 0,
+      },
+    });
+  });
   return Object.assign({}, exam, {
     questions: questions,
     correctCnt: questions.length,
@@ -442,6 +470,172 @@ async function pumpScore(jar, opts) {
   return { ok: total > 0, before: before, after: last, gained: total, applied: applied };
 }
 
+/**
+ * 练习出题冷却（**实测 ≈62 秒/账号**，2026-09-28）。
+ *
+ * 与 PK 的出题冷却（61.6s）几乎同一个数 —— 应是同一个账号级限流器。
+ * 所以「出题 → 提交」一轮 ≈ 62s；但一局可以开 **100 题 = 200 exp**，
+ * 折算下来仍远快于按 10 题一局地刷。
+ */
+const MATCH_COOLDOWN_MS = 62_000;
+/** 撞 429 时的重试间隔 / 总等待上限。 */
+const MATCH_RETRY_INTERVAL_MS = 10_000;
+const MATCH_RETRY_MAX_MS = 4 * 60 * 1000;
+
+/**
+ * **完整练习闭环**：出题 → 抄答案 → 提交 → 拉回批改结果。
+ *
+ * 这是「刷练习」的主链路（与 [pumpScore] 的经验上报互补）：
+ *  - 本函数：走真实练习流程，服务端按卷算分（经验 = 答对题数 × 2）
+ *  - [pumpScore]：直接上报经验增量，每次 +200
+ *
+ * ## 出题频控（429）自动重试
+ *
+ * 出题有账号级冷却（≈62s）。撞到 `429 too_many_request` 时按
+ * [MATCH_RETRY_INTERVAL_MS] 重试，累计超 [MATCH_RETRY_MAX_MS] 才判失败 ——
+ * 所以调用方不必自己算窗口。
+ *
+ * @param {number} keypointId 知识点 ID（默认 235001）
+ * @param {number} limit      题数（口算可选 10/20/30/60/100）
+ * @param {(ev:object)=>void} [onEvent]
+ */
+async function runPractice(jar, opts) {
+  const o = opts || {};
+  const emit = typeof o.onEvent === 'function' ? o.onEvent : () => {};
+  const kp = o.keypointId == null ? 235001 : o.keypointId;
+  const limit = o.limit == null ? 10 : o.limit;
+  const live = () => { if (o.signal && o.signal.aborted) throw Object.assign(new Error('已取消'), { aborted: true }); };
+
+  // 1) 出题（含 429 频控重试）
+  live();
+  emit({ type: 'ex-match', message: `出题 keypointId=${kp} limit=${limit}` });
+  const tMatch = Date.now();
+  let g = null, tries = 0;
+  for (;;) {
+    g = await getExam(jar, kp, limit, { signal: o.signal });
+    tries++;
+    if (g.status === 200 && g.json && g.json.idString) break;
+    const rateLimited = g.status === 429 || /频繁|too_many/.test(String(g.text));
+    if (!rateLimited) {
+      emit({ type: 'ex-fail', message: `出题失败 HTTP ${g.status} ${String(g.text).slice(0, 90)}` });
+      return { ok: false, stage: 'match', status: g.status, text: g.text };
+    }
+    const waited = Date.now() - tMatch;
+    if (waited >= MATCH_RETRY_MAX_MS) {
+      emit({ type: 'ex-fail', message: `出题持续频控（已试 ${tries} 次 / ${Math.round(waited / 1000)}s）` });
+      return { ok: false, stage: 'match', status: g.status, text: g.text };
+    }
+    emit({
+      type: 'ex-rate-limit',
+      message: `出题被限流（HTTP 429），${MATCH_RETRY_INTERVAL_MS / 1000}s 后重试（已等 ${Math.round(waited / 1000)}s）`,
+    });
+    await sleep(MATCH_RETRY_INTERVAL_MS);
+    live();
+  }
+
+  const exam = g.json;
+  emit({
+    type: 'ex-match-ok',
+    message: `出题成功 examId=${exam.idString} ${exam.keypoint} 共 ${exam.questionCnt} 题（预计 +${exam.questionCnt * 2} 经验）`,
+  });
+
+  // 2) 作答（抄答案 + 生成笔迹 —— 服务端靠笔迹判卷）
+  live();
+  const answered = answerAll(exam, o.costTimePerQuestionMs);
+  emit({ type: 'ex-submit', message: `提交（全对 ${answered.correctCnt}/${answered.questionCnt}，含笔迹）` });
+  const s = await submitExam(jar, exam.idString, answered, { signal: o.signal });
+  if (s.status !== 200) {
+    emit({ type: 'ex-fail', message: `提交失败 HTTP ${s.status} ${String(s.text).slice(0, 90)}` });
+    return { ok: false, stage: 'submit', status: s.status, text: s.text, examId: exam.idString };
+  }
+  const res = s.json || {};
+  const correct = Number(res.correctCnt) || 0;
+  emit({
+    type: 'ex-ok',
+    message: `提交成功：服务端判对 ${correct}/${res.questionCnt || exam.questionCnt}，经验 +${correct * 2}`,
+  });
+  return {
+    ok: true, examId: exam.idString, keypoint: exam.keypoint,
+    questionCnt: res.questionCnt || exam.questionCnt,
+    correctCnt: correct,
+    exp: correct * 2,
+    result: res,
+  };
+}
+
+/**
+ * **循环刷练习**：跑 N 轮「出题 → 抄答案 → 提交」，按出题冷却配速。
+ *
+ * ## 配速策略（与 PK 引擎同一套思路）
+ *
+ * 出题冷却 ≈[MATCH_COOLDOWN_MS]（账号级，实测）。这里记住**上次成功出题时刻**，
+ * 下一轮直接等到「上次成功 + 冷却」再发车 —— 既不白撞 429、也不多等。
+ * 万一估计偏了，[runPractice] 内部的 429 重试会兜底。
+ *
+ * ## 建议用 100 题/局
+ *
+ * 冷却按「次」算，不按题数 —— 所以一次开 100 题（=200 exp）比开 10 题（=20 exp）
+ * 划算 10 倍。默认 [limit] 就取 100。
+ *
+ * @param {(ev:object)=>void} [onEvent] 进度事件
+ * @param {number} [rounds] 轮数
+ * @param {number} [limit]  每局题数
+ */
+async function practiceLoop(jar, opts) {
+  const o = opts || {};
+  const emit = typeof o.onEvent === 'function' ? o.onEvent : () => {};
+  const rounds = Math.max(1, Number(o.rounds) || 1);
+  const limit = o.limit == null ? 100 : Number(o.limit);
+  const kp = o.keypointId == null ? 235001 : o.keypointId;
+  let lastMatchOkAt = 0;
+  let done = 0, failed = 0, totalExp = 0;
+
+  for (let i = 1; i <= rounds; i++) {
+    if (o.signal && o.signal.aborted) throw Object.assign(new Error('已取消'), { aborted: true });
+
+    // 等冷却下沿
+    if (lastMatchOkAt) {
+      const wait = Math.max(0, lastMatchOkAt + MATCH_COOLDOWN_MS - 1000 - Date.now());
+      if (wait > 0) {
+        emit({ type: 'ex-gap', message: `按出题冷却等 ${(wait / 1000).toFixed(1)}s 后开始第 ${i} 轮` });
+        await sleep(wait);
+      }
+    }
+
+    emit({ type: 'ex-round', message: `第 ${i}/${rounds} 轮开始` });
+    const t0 = Date.now();
+    let r;
+    try {
+      r = await runPractice(jar, {
+        keypointId: kp, limit: limit,
+        costTimePerQuestionMs: o.costTimePerQuestionMs,
+        signal: o.signal,
+        onEvent: emit,
+      });
+    } catch (e) {
+      if (e && e.aborted) throw e;
+      r = { ok: false, status: null, text: '异常：' + e.message };
+    }
+    if (!r || !r.ok) {
+      failed++;
+      emit({ type: 'ex-round-fail', message: `第 ${i} 轮失败：${(r && r.text || '').slice(0, 90)}` });
+      // 出题失败多半是还在冷却 → 补等一轮再继续
+      await sleep(MATCH_RETRY_INTERVAL_MS);
+      continue;
+    }
+    done++;
+    totalExp += r.exp || 0;
+    lastMatchOkAt = Date.now();
+    emit({
+      type: 'ex-round-ok',
+      message: `第 ${i} 轮成功：判对 ${r.correctCnt}/${r.questionCnt}，+${r.exp} 经验（耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s，累计 +${totalExp}）`,
+    });
+  }
+
+  emit({ type: 'ex-done', message: `全部结束：成功 ${done}/${rounds}，累计经验 +${totalExp}` });
+  return { ok: failed === 0, rounds: rounds, done: done, failed: failed, totalExp: totalExp };
+}
+
 /** 练习链路的频控/上限说明（给 UI 用，避免用户以为是 bug）。 */
 function explainLimits() {
   return {
@@ -462,10 +656,11 @@ module.exports = {
   // 读
   homepage, rankPrefetch, itemStatus, taskHome, overview, readScore,
   // 出题
-  keypoints, getExam, answerAll, getExamResult,
+  keypoints, getExam, answerAll, getExamResult, runPractice, practiceLoop,
   // 提交（未打通）
   submitExam,
   // 刷分
-  attend, pumpScore, explainLimits,
+  attend, pumpScore, explainLimits, practiceLoop,
+  MATCH_COOLDOWN_MS,
   PUMP_RULE_TYPES, PER_ITEM_MAX,
 };

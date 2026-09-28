@@ -64,6 +64,7 @@ const state = {
   pollTimer: null,
   streamErrorNotified: false,
   seenRounds: new Set(),
+  practiceStream: null,
 };
 
 /* ------------------------------ 登录 ------------------------------ */
@@ -636,6 +637,7 @@ $('btn-refresh-jobs').addEventListener('click', loadJobs);
 $('prac-refresh').addEventListener('click', refreshPractice);
 $('prac-pump').addEventListener('click', pumpPractice);
 $('prac-exam').addEventListener('click', fetchPracticeExam);
+$('prac-run').addEventListener('click', runPractice);
 
 /* ---------------------------- 穿透页 ---------------------------- */
 
@@ -856,7 +858,7 @@ async function pumpPractice() {
 async function fetchPracticeExam() {
   const id = $('prac-leo').value;
   if (!id) return toast('先选择小猿账号', 'err');
-  const out = $('prac-examout');
+  const out = $('prac-runlog');
   out.textContent = '请求中…';
   try {
     const r = await api('/api/exercise/exam', {
@@ -881,6 +883,55 @@ async function fetchPracticeExam() {
   }
 }
 
+/**
+ * 开始自动刷练习：POST /api/exercise/run，然后订阅 /api/exercise/stream 看实时日志。
+ * 与「刷局」共用 jobs 的事件总线（服务端 publish(0, {exercise:true,...})）。
+ */
+async function runPractice() {
+  const id = $('prac-leo').value;
+  if (!id) return toast('先选择小猿账号', 'err');
+  const log = $('prac-runlog');
+  log.textContent = '';
+  const say = (s, cls) => logLine(log, s, cls);
+  stopPracticeStream();
+  try {
+    const r = await api('/api/exercise/run', {
+      method: 'POST',
+      body: {
+        leoAccountId: Number(id),
+        rounds: Number($('prac-rounds').value || 1),
+        limit: Number($('prac-limit').value || 100),
+        keypointId: Number($('prac-kp').value || 16),
+      },
+    });
+    say(r.message || '已开始', 'l-ok');
+    attachPracticeStream();
+  } catch (e) {
+    say('启动失败：' + e.message, 'l-warn');
+    toast(e.message, 'err');
+  }
+}
+/** 订阅练习事件流（服务端把所有练习事件 publish 到 id=0 的 exercise 通道）。 */
+function attachPracticeStream() {
+  stopPracticeStream();
+  const log = $('prac-runlog');
+  const es = new EventSource('/api/exercise/stream');
+  state.practiceStream = es;
+  es.onopen = () => logLine(log, '[已连接练习日志流…]', 'l-dim');
+  es.onmessage = (ev) => {
+    let d;
+    try { d = JSON.parse(ev.data); } catch (e) { return; }
+    const cls = d.type === 'ex-ok' ? 'l-ok'
+      : (d.type === 'ex-fail' || d.type === 'ex-rate-limit') ? 'l-warn'
+      : (d.type === 'ex-done' || d.type === 'ex-final') ? 'l-ok' : '';
+    logLine(log, (d.message || d.type), cls);
+  };
+  es.onerror = () => { /* EventSource 自动重连 */ };
+}
+/** 关闭练习事件流。 */
+function stopPracticeStream() {
+  if (state.practiceStream) { state.practiceStream.close(); state.practiceStream = null; }
+}
 /* ========================= 刷练习 结束 ========================= */
 
 (async function init() {

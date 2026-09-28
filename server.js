@@ -442,10 +442,64 @@ async function handleApi(req, res, u, user) {
     const jar = jobs.jarOf(acc);
     const r = await exercise.pumpScore(jar, {
       delta: b.delta, ruleTypes: b.ruleTypes,
-      onEvent: (ev) => publish(0, Object.assign({ exercise: true, at: Date.now() }, ev)),
+      onEvent: (ev) => jobs.publish(0, Object.assign({ exercise: true, at: Date.now() }, ev)),
     });
     db.audit(user.id, 'exercise_pump', `leo=${acc.id} gained=${r.gained} ${r.before}->${r.after}`, clientIp(req));
     return sendJson(res, 200, r);
+  }
+
+  /* ---- 完整练习闭环：出题 → 抄答案 → 提交 ---- */
+  if (p === '/api/exercise/run' && method === 'POST') {
+    const b = await readJson(req);
+    const acc = db.getLeoAccount(Number(b.leoAccountId));
+    if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '小猿账号不存在' });
+    const jar = jobs.jarOf(acc);
+    const rounds = Math.max(1, Math.min(99, Number(b.rounds) || 1));
+    const limit = Math.max(1, Math.min(200, Number(b.limit) || 100));
+    const keypointId = Number(b.keypointId) || 235001;
+    const before = await exercise.readScore(jar);
+
+    // 后台跑，日志走 SSE（与刷局同一套 publish）
+    (async () => {
+      try {
+        const r = await exercise.practiceLoop(jar, {
+          rounds: rounds, limit: limit, keypointId: keypointId,
+          onEvent: (ev) => jobs.publish(0, Object.assign({ exercise: true, at: Date.now() }, ev)),
+        });
+        // 服务端记账有延迟：先读一次，若与 before 相同再等 3s 复读，避免显示「+0」误导
+        let after = await exercise.readScore(jar);
+        if (after != null && before != null && after === before) {
+          await new Promise((res) => setTimeout(res, 3000));
+          const again = await exercise.readScore(jar);
+          if (again != null) after = again;
+        }
+        jobs.publish(0, {
+          exercise: true, at: Date.now(), type: 'ex-final',
+          message: `练习收尾：成功 ${r.done}/${r.rounds}，失败 ${r.failed}；curWeekScore ${before} → ${after}（+${(after != null && before != null) ? after - before : '?'}）`,
+        });
+      } catch (e) {
+        jobs.publish(0, { exercise: true, at: Date.now(), type: 'ex-fail', message: '任务异常：' + (e && e.message) });
+      }
+    })();
+    db.audit(user.id, 'exercise_run', `leo=${acc.id} rounds=${rounds} limit=${limit} kp=${keypointId}`, clientIp(req));
+    return sendJson(res, 200, { ok: true, message: `已开始：${rounds} 轮 × ${limit} 题（score=${before}）`, rounds: rounds, limit: limit });
+  }
+
+  if (p === '/api/exercise/stream' && method === 'GET') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.write(':ok\n\n');
+    const unsub = jobs.subscribe(0, (ev) => {
+      if (!ev || !ev.exercise) return;
+      try { res.write('data: ' + JSON.stringify(ev) + '\n\n'); } catch (e) { /* 客户端已断 */ }
+    });
+    const hb = setInterval(() => { try { res.write(':ping\n\n'); } catch (e) { /* ignore */ } }, 15000);
+    req.on('close', () => { clearInterval(hb); unsub(); });
+    return;
   }
 
   /* ------------------------- 系统状态 ------------------------- */
