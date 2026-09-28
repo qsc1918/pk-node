@@ -37,6 +37,7 @@ const OUTDIR = path.join(DIST, NAME);
 const INCLUDE = [
   'package.json',
   'README.md',
+  'DISCLAIMER.md',
   'LICENSE',
   'start.bat',
   'start.sh',
