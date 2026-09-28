@@ -661,6 +661,8 @@ $('prac-refresh').addEventListener('click', refreshPractice);
 $('prac-pump').addEventListener('click', pumpPractice);
 $('prac-exam').addEventListener('click', fetchPracticeExam);
 $('prac-run').addEventListener('click', runPractice);
+$('prac-leo').addEventListener('change', loadPracticeSubs);
+$('prac-switch').addEventListener('click', switchPracticeSub);
 $('dc-add').addEventListener('click', addDeviceChain);
 $('dc-list').addEventListener('click', onDeviceChainListClick);
 
@@ -813,6 +815,7 @@ async function loadPractice() {
   try {
     const r = await api('/api/leo/accounts');
     fillPracticeLeo(r.accounts || []);
+    await loadPracticeSubs();
     if (!(r.accounts || []).length) {
       $('prac-status').textContent = '还没有导入小猿账号 —— 先去「小猿账号」页添加。';
     }
@@ -1003,6 +1006,45 @@ async function onDeviceChainListClick(ev) {
     toast('已删除', 'ok');
     await loadDeviceChains();
   } catch (e) { toast(e.message, 'err'); }
+}
+/**
+ * 拉「选中小猿账号」的子账号列表，填进练习页的子账号下拉。
+ *
+ * ⚠️ 练习与「当前身份」绑定：切号后练习/刷分都跑在新身份下。
+ * 子账号名字/头像来自 batchGet（需 sign）。
+ */
+async function loadPracticeSubs() {
+  const id = $('prac-leo').value;
+  const sel = $('prac-sub');
+  sel.innerHTML = '<option value="">（当前身份）</option>';
+  if (!id) return;
+  try {
+    const r = await api('/api/leo/accounts/' + id + '/sub-accounts');
+    for (const s of (r.subs || [])) {
+      const o = document.createElement('option');
+      o.value = String(s.userId);
+      o.textContent = (s.nickname || ('账号 ' + s.userId)) + (s.isPrimary ? '（主）' : '') + (s.isCurrent ? ' ← 当前' : '');
+      sel.appendChild(o);
+    }
+  } catch (e) { /* 不影响其它功能 */ }
+}
+
+/** 切换练习用的子账号（走已攻破的 switch），成功后刷新分数。 */
+async function switchPracticeSub() {
+  const id = $('prac-leo').value;
+  const target = $('prac-sub').value;
+  if (!id) return toast('先选择小猿账号', 'err');
+  if (!target) return toast('先选择要切换的子账号', 'err');
+  try {
+    const r = await api('/api/leo/accounts/' + id + '/switch', {
+      method: 'POST', body: { userId: Number(target) },
+    });
+    toast(r.message || '已切换', r.ok ? 'ok' : 'err');
+    await loadPracticeSubs();
+    await refreshPractice();
+  } catch (e) {
+    toast(e.message, 'err');
+  }
 }
 /* ========================= 刷练习 结束 ========================= */
 
