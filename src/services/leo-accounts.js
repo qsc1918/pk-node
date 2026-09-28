@@ -90,8 +90,12 @@ function cloneJar(jar) {
  * @param {leo.CookieJar} jar
  * @returns {Promise<{ok:boolean, status:number, allSubUserIds?:number[], primarySubUserId?:number, message?:string}>}
  */
-async function probe(jar) {
-  const r = await leo.userInfosContext(cloneJar(jar));
+async function probe(jar, opts) {
+  // ★ capture=true 时在**真实 jar** 上跑：`context` 的 Set-Cookie 会下发 `sid`，
+  //   而默认的 cloneJar 会把这份副作用丢掉（导入瘦身后的真 bug，2026-09-28）。
+  const capture = !!(opts && opts.capture);
+  const target = capture ? jar : cloneJar(jar);
+  const r = await leo.userInfosContext(target);
   if (r.status !== 200 || !r.json) {
     return { ok: false, status: r.status, message: `上下文接口 HTTP ${r.status}` };
   }
@@ -168,7 +172,8 @@ async function importAccount(o) {
   if (!parsed.ok) return { ok: false, message: parsed.message };
 
   const jar = parsed.jar;
-  const p = await probe(jar);
+  // capture=true：把 context 下发的 sid 收进 jar（否则落库只有 6 条基础 cookie）
+  const p = await probe(jar, { capture: true });
   if (!p.ok) {
     return { ok: false, message: 'cookie 无效或已过期：' + (p.message || '') };
   }
@@ -185,7 +190,9 @@ async function importAccount(o) {
     if (vo && vo.grade != null) grade = Number(vo.grade);
   }
 
-  const cookies = jar.toJSON();
+  // 只落「有值」的 cookie：服务端曾用 Set-Cookie 发 ks_deviceid=空 表示设备链无效，
+  // 存空值反而会覆盖已有的好值。
+  const cookies = jar.toJSON().filter((c) => String(c.value == null ? '' : c.value).length > 0);
   const existingId = o.existingId == null ? null : Number(o.existingId);
   let id;
   if (existingId) {
