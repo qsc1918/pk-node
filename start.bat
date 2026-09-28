@@ -12,9 +12,10 @@ rem
 rem  原因：两个原本依赖 arm64 原生库的环节都已解决
 rem    1) 内容编码器 —— 已拆解为「固定密钥流 XOR」，纯 JS 实现
 rem       （bin/keystream.bin + src/keystream.js）
-rem    2) sign —— 实测 PK 的 home / match / submit 三个端点**都不需要**
-rem       它（不带 sign 时 match 与 submit 均返回 200），故默认关闭
-rem       （PK_SIGN_MODE=off）
+rem    2) sign —— 实测 PK 的 home / match / submit 三个端点**不需要**它
+rem       （不带 sign 时均 200）。但 **switch（切子账号）/ batchGet（子账号名字）
+rem       需要 sign**，而 sign 依赖 arm64 原生库 → 这两个功能在 Windows 上不可用
+rem       （默认 PK_SIGN_MODE=auto：算得出就带，算不出就跳过）
 rem
 rem  所以不需要 bin\native\ 里的 arm64 库，也不需要 WSL/qemu。
 rem  bin\native\ 可以整个删掉，只保留 bin\keystream.bin。

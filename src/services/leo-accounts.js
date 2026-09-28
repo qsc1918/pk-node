@@ -122,8 +122,9 @@ async function fetchSubAccounts(jar) {
   const current = ctx.currentUserId;
   const primary = ctx.primarySubUserId;
 
-  // 明细（名字/头像/年级）——失败就退化成「账号 {uid}」
-  // 同样跑在克隆 jar 上：batchGet 也会 Set-Cookie，别污染待落库的登录态。
+  // 明细（名字/头像/年级）—— 2026-09-28 起**可用**：batchGet 现在走 MAIN_COMMON_QUERY
+  // （android37/3.140.1 + sign）→ 实测 200，返回 nickname/avatarUrl。
+  // 仍跑在克隆 jar 上：batchGet 也会 Set-Cookie，别污染待落库的登录态。
   let detailMap = new Map();
   let note = '';
   const bg = await leo.subAccountsBatchGet(cloneJar(jar));
@@ -356,6 +357,61 @@ function cookieNamesOf(id) {
 }
 
 /**
+ * ★ 切换子账号（2026-09-28 攻破，可用）。
+ *
+ * ## 为什么之前「做不到」
+ * 旧结论说 switch 恒 417、是「传输层指纹」。**错的**。真实原因有两个：
+ *   1. 查询串里 `_productId` **必须放最前**（放最后 → 400）；
+ *   2. **必须带 sign**（不带 → 417 solar-encoder；带旧/错 sign 也 417）。
+ *      ⇒ 417 其实是「sign 校验失败」，不是 TLS 指纹。
+ *
+ * ## 实测（账号 4，真机 cookie）
+ * ```
+ * 切换前 cur=1155551346
+ * switch -> 200 {"code":1,...}     Set-Cookie: 新 sess + userid + ks_*
+ * 切换后 cur=511467407   ★ 成功
+ * 切回 -> 200 -> cur=1155551346   ★ 双向可用
+ * ```
+ * 注意：sign 需要 arm64 native（`bin/native/lre.so`）—— x86/Windows 上算不出，会 417。
+ *
+ * @param {number} leoAccountId 库里的小猿账号
+ * @param {number} targetUserId 目标子账号 userId
+ * @returns {Promise<{ok:boolean, status:number, before?:number, after?:number, message:string}>}
+ */
+async function switchToSubAccount(leoAccountId, targetUserId) {
+  const acc = db.getLeoAccount(Number(leoAccountId));
+  if (!acc) return { ok: false, status: 0, message: '账号不存在' };
+  const jar = new leo.CookieJar(JSON.parse(acc.cookies_json));
+
+  const before = await currentIdentity(jar);
+  const r = await leo.switchSubAccount(jar, Number(targetUserId));
+  if (r.status !== 200 || !r.json || Number(r.json.code) !== 1) {
+    return {
+      ok: false, status: r.status, before: before,
+      message: '切换失败 HTTP ' + r.status + '：' + rerr(r.text) +
+        (r.status === 417 ? '（417 = sign 校验失败：需 arm64 native 才能算 sign）' : ''),
+    };
+  }
+  // 成功：服务端已下发新 sess/userid（CookieJar 自动吸收）→ 写回库
+  const after = await currentIdentity(jar);
+  db.updateLeoAccount(acc.id, acc.name, jar.toJSON().filter((c) => String(c.value || '').length > 0), {
+    yfdU: after != null ? String(after) : null,
+  });
+  return {
+    ok: true, status: r.status, before: before, after: after,
+    message: after != null && String(after) === String(targetUserId)
+      ? '已切换到 ' + after
+      : ('切换接口成功，但生效身份为 ' + after + '（与目标 ' + targetUserId + ' 不一致）'),
+  };
+}
+
+/** 从错误体里抠 message。 */
+function rerr(text) {
+  try { const j = JSON.parse(String(text || '')); return j && j.message ? j.message : String(text || '').slice(0, 80); }
+  catch (e) { return String(text || '').slice(0, 80); }
+}
+
+/**
  * 从任意 cookie 文本里抽出设备链（`ks_*`）。
  * 只要含 `ks_deviceid` 就认为是一份可用设备链。
  */
@@ -499,6 +555,7 @@ function r0Code(text) {
 
 module.exports = {
   DEVICE_CHAIN_COOKIES,
+  switchToSubAccount,
   extractDeviceChain,
   autoPoolDeviceChain,
   applyDeviceChain,

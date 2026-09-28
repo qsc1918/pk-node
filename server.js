@@ -289,7 +289,7 @@ async function handleApi(req, res, u, user) {
     const acc = db.getLeoAccount(id);
     if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '账号不存在' });
     const b = await readJson(req);
-    const r = await leoAccounts.switchTo(id, Number(b.userId));
+    const r = await leoAccounts.switchToSubAccount(id, Number(b.userId));
     db.audit(user.id, 'leo_switch', `account=${id} target=${b.userId} ${r.ok ? '成功' : r.message.slice(0, 120)}`, clientIp(req));
     return sendJson(res, r.ok ? 200 : 400, r);
   }

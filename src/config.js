@@ -89,7 +89,15 @@ const config = {
    *
    * 若将来确认某端点确实需要 sign，把它设为 `on` 并保留 `bin/native/` 即可。
    */
-  signMode: process.env.PK_SIGN_MODE || 'off',
+  /**
+   * sign 模式：`auto`（默认）/ `on` / `off`。
+   *
+   * ★ 2026-09-28 修正：原以为「PK 不需要 sign」，实际 **提交/switch/batchGet 都需要**，
+   * 只是 PK 的 home/match 恰好放行。所以默认改成 `auto`：
+   *   - 有 arm64 native（bin/native/lre.so）→ 自动算 sign；
+   *   - 没有（Windows/x86）→ 静默不加，PK 出题仍可用，但 submit/switch 会 417。
+   */
+  signMode: process.env.PK_SIGN_MODE || 'auto',
 
   /**
    * 风控设备标识 `x-shepherd-did`（**需要你自己从本机取一次**）。

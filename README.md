@@ -413,6 +413,36 @@ platform=android36 → 417      platform=android37 → 200
 
 ---
 
+## 4.10 ★ 子账号切换 + 子账号明细（2026-09-28 攻破）
+
+**旧结论「switch 恒 417、是传输层指纹、做不到」被完全推翻。**
+
+### 真正的三个条件
+| # | 条件 | 错的后果 |
+|---|---|---|
+| 1 | `_productId` 必须在查询串**最前** | 放最后 → **400** |
+| 2 | **必须带 `sign`** | 不带 / 带旧 sign → **417**（417 = sign 校验失败，**不是** TLS 指纹） |
+| 3 | 主域公共参数 `version=3.140.1` + `platform=android37` | 用 PK 的 `3.141.1/android36` → 400/417 |
+
+### 实测（账号 4，3 个子账号）
+```
+context: cur=1155551346
+POST /leo-gateway/android/accounts/switch   body: targetUserId=511467407
+  -> 200 {"code":1,...}   Set-Cookie: 新 sess + userid + ks_*
+context: cur=511467407   ★ 切换成功
+再切回 -> 200 -> cur=1155551346   ★ 双向可用
+```
+
+### 子账号明细 `batchGet` 也通了
+`GET /leo-profile/android/user-infos/batchGet`（+sign，android37/3.140.1）→ **200**：
+`[{userId, nickname, avatarId, avatarUrl, ...}]` —— 名字/头像不再是「账号 {uid}」。
+
+### 代码
+- `src/leo.js`：`buildUrl` 按路径选公共参数（主域 `MAIN_COMMON_QUERY` / PK `COMMON_QUERY`），`_productId` 提到最前。
+- `config.signMode` 默认改 **`auto`**（有 arm64 native 就算 sign，没有则跳过）。
+- `leo-accounts.js`：`switchToSubAccount(id, targetUserId)` —— 切号 + 用服务端回包校验生效身份 + 写回库。
+- ⚠️ **sign 需要 arm64**：Windows/x86 上 switch / batchGet 仍不可用（PK 出题不受影响）。
+
 ## 4.9 设备链池与 cookie 加密（2026-09-28）
 
 ### 为什么需要设备链
@@ -556,10 +586,8 @@ bin/cloudflared tunnel --url http://127.0.0.1:8787 --no-autoupdate
 | 默认密码 | `admin/admin` 只是为了「开箱能进」。**对外暴露前必须改密**。 |
 | 频控 | 服务端对提交接口有独立频控窗口。刷太快会 403/400，属正常保护，不是本项目的 bug。 |
 | 风控 | 连续高频出题可能触发「已封禁，暂时无法使用」的短时冷却，等几分钟再试。 |
-| 设备链 | **PK 出题必须带 `ks_*`**（没它 `pk/match` 恒 400，登录账号刷不了 PK）。
-本服务用「**设备链池**」解决：把多份来源的 `ks_*` 存进池子，**登录导入的账号自动挑一份补齐**（多份轮换）。
-仍拿不到真值的只有「切换子账号」（`switch` 恒 417）。 | `ks_*` 由原版 App 的设备注册下发；本服务只拿得到服务端在主域请求里补发的 **`sid`**（登录导入已自动收下）。
-缺 `ks_*` → 子账号**明细**（昵称/头像）接口 401、且**切换子账号做不到**，退化为显示 `账号 {uid}`，**均不影响刷局 / 刷练习**。 |
+| 设备链 | **PK 出题必须带 `ks_*`**（没它 `pk/match` 恒 400）。本服务用「**设备链池**」解决：多份来源存进池子，登录导入的账号自动挑一份补齐（多份轮换）。 |
+| 子账号切换 | ✅ **已攻破**（见 4.10）：需 `sign` + `_productId` 最前 + `android37/3.140.1`。子账号名字/头像（batchGet）也 ✅。⚠️ 依赖 arm64 sign，Windows/x86 不可用。 |
 | 短信登录 | 未实现（默认走「导入登录态」）。如需要按 `ape-api.yuanfudao.com/accounts/android/safe/login` 补。 |
 
 ---

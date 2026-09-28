@@ -18,6 +18,20 @@ const { request, CookieJar } = require('./http');
 const nativeLib = require('./native');
 
 /** 默认公共参数（顺序固定，便于比对真机抓包）。 */
+/** 主域（leo-gateway / leo-profile / leo-auth / leo-star / leo-math）用的公共参数。
+ *  ★ 2026-09-28：和练习同源 —— 必须 version=3.140.1 + platform=android37，
+ *  否则 switch / batchGet 这类主域端点会被 solar-encoder 拦（400/417）。 */
+const MAIN_COMMON_QUERY = [
+  ['platform', PK.exercise.platform],
+  ['version', PK.exercise.version],
+  ['vendor', PK.exercise.vendor],
+  ['av', PK.exercise.av],
+  ['deviceCategory', PK.exercise.deviceCategory],
+  ['webviewVersion', PK.exercise.webviewVersion],
+  ['whRatio', PK.exercise.whRatio],
+  ['isBackground', PK.exercise.isBackground],
+];
+const MAIN_DOMAIN_PREFIXES = ['/leo-gateway', '/leo-profile', '/leo-auth', '/leo-star', '/leo-math', '/leo-reward', '/leo-account'];
 const COMMON_QUERY = [
   ['platform', PK.commonQuery.platform],
   ['version', PK.commonQuery.version],
@@ -114,12 +128,14 @@ function mainDomainHeaders(extra) {
 function buildUrl(urlPath, params = {}, opts = {}) {
   const q = new URLSearchParams();
 
-  // 1) 公共参数（固定顺序，先放）
-  for (const [k, v] of COMMON_QUERY) q.set(k, v);
-
-  // 2) 产品号 / appId
+  // ★ _productId 必须放**最前**（2026-09-28 实测）：原版真机 URL 就是
+  //   ?_productId=611&platform=...&sign=...；放到最后时 accounts/switch 直接 400。
   q.set('_productId', opts.productId || PK.productIdDefault);
   if (opts.appId) q.set('_appId', opts.appId);
+
+  // 1) 公共参数：主域用 MAIN_COMMON_QUERY（android37 / 3.140.1），PK 等用 COMMON_QUERY
+  const isMain = MAIN_DOMAIN_PREFIXES.some((pre) => String(urlPath).indexOf(pre) === 0);
+  for (const [k, v] of (isMain ? MAIN_COMMON_QUERY : COMMON_QUERY)) q.set(k, v);
 
   // 3) 业务参数（最后放，可覆盖前面任何同名键 —— 调用方优先）
   for (const [k, v] of Object.entries(params)) {
