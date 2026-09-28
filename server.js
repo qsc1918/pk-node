@@ -519,6 +519,8 @@ async function handleApi(req, res, u, user) {
       try {
         const r = await exercise.practiceLoop(jar, {
           rounds: rounds, limit: limit, keypointId: keypointId,
+          gapMinMs: Math.max(0, Number(b.gapMinMs) || 0),
+          gapMaxMs: Math.max(0, Number(b.gapMaxMs) || 0),
           onEvent: (ev) => jobs.publish(0, Object.assign({ exercise: true, at: Date.now() }, ev)),
         });
         // 服务端记账有延迟：先读一次，若与 before 相同再等 3s 复读，避免显示「+0」误导

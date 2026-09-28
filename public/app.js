@@ -930,6 +930,8 @@ async function runPractice() {
         rounds: Number($('prac-rounds').value || 1),
         limit: Number($('prac-limit').value || 100),
         keypointId: Number($('prac-kp').value || 16),
+        gapMinMs: Number($('prac-gapmin').value || 0),
+        gapMaxMs: Number($('prac-gapmax').value || 0),
       },
     });
     say(r.message || '已开始', 'l-ok');

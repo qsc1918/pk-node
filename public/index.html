@@ -184,6 +184,15 @@
         <label class="grow">轮数<input id="prac-rounds" type="number" value="1" min="1" max="99"></label>
       </div>
       <div class="row">
+        <label class="grow">每轮最小间隔 ms<input id="prac-gapmin" type="number" value="0" min="0" step="1000"></label>
+        <label class="grow">每轮最大间隔 ms<input id="prac-gapmax" type="number" value="0" min="0" step="1000"></label>
+      </div>
+      <p class="muted small">
+        每轮间隔 = <code>max(出题冷却剩余, 随机[最小, 最大])</code>。
+        <b>出题冷却 ≈62s/账号 是硬下限</b>，配得比它小也不会更快（会 429）；
+        都填 <code>0</code> = 贴着冷却下沿跑（最快）；想更稳就配大一点（如 0~10000）。
+      </p>
+      <div class="row">
         <button id="prac-run" class="primary grow">开始刷练习</button>
         <button id="prac-exam">只看题（不提交）</button>
       </div>

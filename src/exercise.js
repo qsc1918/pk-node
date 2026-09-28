@@ -587,17 +587,47 @@ async function practiceLoop(jar, opts) {
   const rounds = Math.max(1, Number(o.rounds) || 1);
   const limit = o.limit == null ? 100 : Number(o.limit);
   const kp = o.keypointId == null ? 235001 : o.keypointId;
+
+  /**
+   * 「每轮间隔」（用户在 UI 上配的）——与 PK 引擎同一套语义。
+   *
+   * 实际等待 = max(冷却剩余, 随机(下限, 上限))：
+   *   1. 服务端出题冷却（[MATCH_COOLDOWN_MS]）是**硬下限** —— 配得比它小也没用，
+   *      会 429；所以取 max 而不是覆盖。
+   *   2. 在冷却之上再随机 `[gapMinMs, gapMaxMs]`，避免固定节奏（更像人、更稳）。
+   *   3. [cooldownSafetyMs] 是从冷却下沿往回退的安全边距（默认 1000ms）。
+   *
+   * 想「最快」就把 gapMin=gapMax=0；想「更稳」就配大一点。
+   */
+  const gapMin = Math.max(0, Number(o.gapMinMs) || 0);
+  const gapMax = Math.max(gapMin, Number(o.gapMaxMs) || 0);
+  const safety = o.cooldownSafetyMs == null ? 1000 : Math.max(0, Number(o.cooldownSafetyMs));
+  const randGap = () => (gapMax > gapMin
+    ? gapMin + Math.floor(Math.random() * (gapMax - gapMin + 1))
+    : gapMin);
+
   let lastMatchOkAt = 0;
   let done = 0, failed = 0, totalExp = 0;
+  let lastWaitMs = 0;
 
   for (let i = 1; i <= rounds; i++) {
     if (o.signal && o.signal.aborted) throw Object.assign(new Error('已取消'), { aborted: true });
 
-    // 等冷却下沿
+    // 每轮间隔：冷却剩余 与 随机间隔 取大者
     if (lastMatchOkAt) {
-      const wait = Math.max(0, lastMatchOkAt + MATCH_COOLDOWN_MS - 1000 - Date.now());
+      const cooldownLeft = Math.max(0, lastMatchOkAt + MATCH_COOLDOWN_MS - safety - Date.now());
+      const gap = randGap();
+      const wait = Math.max(cooldownLeft, gap);
+      lastWaitMs = wait;
       if (wait > 0) {
-        emit({ type: 'ex-gap', message: `按出题冷却等 ${(wait / 1000).toFixed(1)}s 后开始第 ${i} 轮` });
+        emit({
+          type: 'ex-gap',
+          message: `间隔 ${(wait / 1000).toFixed(1)}s 后开始第 ${i} 轮` +
+            `（配置 ${(gap / 1000).toFixed(1)}s，冷却剩 ${(cooldownLeft / 1000).toFixed(1)}s）`,
+          configuredMs: gap,
+          cooldownLeftMs: cooldownLeft,
+          waitMs: wait,
+        });
         await sleep(wait);
       }
     }
@@ -633,7 +663,10 @@ async function practiceLoop(jar, opts) {
   }
 
   emit({ type: 'ex-done', message: `全部结束：成功 ${done}/${rounds}，累计经验 +${totalExp}` });
-  return { ok: failed === 0, rounds: rounds, done: done, failed: failed, totalExp: totalExp };
+  return {
+    ok: failed === 0, rounds: rounds, done: done, failed: failed, totalExp: totalExp,
+    gapMinMs: gapMin, gapMaxMs: gapMax, lastWaitMs: lastWaitMs,
+  };
 }
 
 /** 练习链路的频控/上限说明（给 UI 用，避免用户以为是 bug）。 */
