@@ -155,7 +155,8 @@ function needAuth(pathname) {
   if (pathname === '/api/auth/login' || pathname === '/api/auth/register' || pathname === '/api/auth/me') return false;
   // PK H5 诊断回传：页面本身不需要登录（登录态在 Node 侧注入），
   // 所以这条也免鉴权，否则 hook 的诊断会被 401 挡掉。
-  if (pathname === '/api/pk/h5/diag') return false;
+  // 同样：H5 hook 的响应解密委托（dataDecrypt 桥），不能要求管理后台会话。
+  if (pathname === '/api/pk/h5/diag' || pathname === '/api/pk/h5/decrypt') return false;
   if (pathname.startsWith('/api/')) return true;
   return false;
 }
@@ -375,6 +376,48 @@ async function handleApi(req, res, u, user) {
   // H5 页面里注入的 hook 会把「JS 报错 / 未捕获 rejection / 每个被代理请求的结果」
   // 用 sendBeacon 回传到这里，落到服务端日志。这样「点击没反应」这类
   // 纯前端问题也能在无头环境里看到真相，不用开 F12。
+  // H5 的响应解密委托端点（2026-09-30）。
+  //
+  // 为什么需要它：H5 的响应拦截器对 arraybuffer 响应会调桥
+  // LeoSecure.dataDecrypt（见 exercise-legacy 的 u/l 函数），而**浏览器里没有
+  // keystream**（解密密钥在 Android so 里）。所以桥必须把密文转发到 Node 侧解密：
+  //   1) 浏览器 hook：dataDecrypt → fetch 本端点
+  //   2) 本端点：keystream XOR + gunzip → 明文 JSON
+  //   3) 返回 { result: base64(明文JSON) }，与真机桥协议一致
+  if (p === '/api/pk/h5/decrypt') {
+    const txt = await new Promise((resolve) => {
+      const chunks = [];
+      let size = 0;
+      req.on('data', (d) => {
+        size += d.length;
+        if (size > 4 * 1024 * 1024) { req.destroy(); return; }
+        chunks.push(d);
+      });
+      req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      req.on('error', () => resolve(''));
+    });
+    let out = { ok: false };
+    try {
+      const body = JSON.parse(txt || '{}');
+      const raw = Buffer.from(String(body.base64 || ''), 'base64');
+      const plain = pkH5.decryptBuffer(raw);
+      if (!plain) {
+        out = { ok: false, message: 'decrypt failed' };
+      } else {
+        out = { ok: true, result: plain.toString('base64'), size: plain.length };
+      }
+    } catch (e) {
+      out = { ok: false, message: String(e && e.message) };
+    }
+    const buf = Buffer.from(JSON.stringify(out), 'utf8');
+    res.writeHead(out.ok ? 200 : 500, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Length': buf.length,
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(buf);
+    return;
+  }
   if (p === '/api/pk/h5/diag') {
     const txt = await new Promise((resolve) => {
       const chunks = [];

@@ -641,6 +641,36 @@ const H5_INJECT = `(function () {
       return location.origin + '/pk-h5-cdn/' + rest;
     }
 
+    /** 把密文交给 Node 侧解密（浏览器里没有 keystream）。
+     *
+     * ★★ 2026-09-30：这是「PK 一直匹配中」的真正最后一层。
+     *
+     * H5 的响应拦截器（exercise-legacy 的 u / l 函数）对 arraybuffer 响应：
+     *     r = btoa(String.fromCharCode.apply(null, new Uint8Array(resp)));
+     *     l(r)  →  桥 LeoSecure.dataDecrypt({base64: r, trigger:(err, res) => {
+     *                  resolve(JSON.parse(Base64.decode(res.result))) })}
+     * 即：**H5 自己会解密**，只是解密要调原生桥。
+     *
+     * 所以桥必须实现 dataDecrypt：把密文 POST 给 /api/pk/h5/decrypt，
+     * 拿回明文 JSON 的 base64，再按协议回调。
+     */
+    function nodeDecrypt(b64) {
+      return new Promise(function (resolve) {
+        try {
+          var x = new XMLHttpRequest();
+          x.open('POST', '/api/pk/h5/decrypt', true);
+          x.setRequestHeader('Content-Type', 'application/json');
+          x.onload = function () {
+            var out = null;
+            try { out = JSON.parse(x.responseText); } catch (e) { out = null; }
+            resolve(out && out.ok ? out.result : null);
+          };
+          x.onerror = function () { resolve(null); };
+          x.send(JSON.stringify({ base64: b64 }));
+        } catch (e) { resolve(null); }
+      });
+    }
+
     var HANDLERS = {
       openSchema: handleOpenSchema,
       // H5 的跳转既可能发 openSchema（schemas 数组），也可能直接发 openWebView。
@@ -680,6 +710,27 @@ const H5_INJECT = `(function () {
       // 所以必须返回**真实的** userId（非 0 即视为已登录）。
       // 数据由 Node 侧注入 window.__PK_USER（见 server.js 的 /pk-h5 分支）。
       getUserInfo: function () { return window.__PK_USER || {}; },
+
+      /* ★★ dataDecrypt（LeoSecure）—— 2026-09-30：「PK 一直匹配中」的最后一层
+       *
+       * H5 的响应拦截器（exercise-legacy 的 u / l）对 arraybuffer 响应会：
+       *   btoa(Uint8Array(resp)) → 调桥 dataDecrypt({base64, trigger})
+       *     → 拿到 res.result（base64 的明文 JSON）→ JSON.parse
+       * 而浏览器里**没有 keystream**（密钥在 Android so 里），所以桥必须
+       * 把密文转发给 Node 侧解（/api/pk/h5/decrypt，keystream XOR + gunzip）。
+       *
+       * 之前没实现这个桥 → bridge-miss → Promise 永久挂起 → 界面永远「匹配中」。
+       */
+      dataDecrypt: function (a) {
+        var b64 = (a && a.base64) || '';
+        return nodeDecrypt(b64).then(function (plainB64) {
+          if (!plainB64) return { __pkOut: ['DECRYPT_FAILED'] };
+          diag('dataDecrypt', { inB64: b64.length, outB64: plainB64.length });
+          // 真机桥回的是 { result: <base64 明文> }（H5 读 res.result 再 Base64.decode）
+          return { __pkOut: [null, { result: plainB64 }] };
+        });
+      },
+      dataEncrypt: function () { return ''; },   // 仅 PK 提交时用，暂不需要
       login: function () { return 'OK'; },
       // octopus 埋点 SDK 的配置读取。
       // ★ 键名必须是 method 本身：日志实测 H5 调的是 module=leo / method=getOrionConfig
@@ -753,6 +804,11 @@ const H5_INJECT = `(function () {
       if (NO_TRIGGER_METHODS[method]) p.skipTrigger = true;
 
       var fn = HANDLERS[method];
+      // 协议：回调首项是 err，后续是数据。
+      //  • 认识的方法   -> [null, <返回值>]
+      //  • 不认识的方法 -> ['METHOD_NOT_SUPPORT']（**必须回调**，否则 Promise 挂起）
+      //  • 处理器返回 Promise（异步桥，如 dataDecrypt 要问 Node 要密钥流）
+      //      -> 自行决定数组形态，用 { __pkOut: [...] } 包
       var out;
       if (!fn) {
         diag('bridge-miss', { module: module, method: method });
@@ -763,8 +819,18 @@ const H5_INJECT = `(function () {
         Object.keys(p.args || {}).forEach(function (k) {
           if (k !== 'trigger' && k !== 'shareTrigger' && k !== 'callback') a[k] = p.args[k];
         });
-        try { out = [null, fn(a, p)]; }
+        try { out = fn(a, p); }
         catch (e) { out = ['CALL_FAILED', String(e && e.message)]; }
+        // 同步返回值包成协议形态 [null, v]（除非处理器自己给了 __pkOut）
+        if (!(out && typeof out.then === 'function') && !(out && out.__pkOut)) {
+          out = [null, out];
+        }
+      }
+      if (out && typeof out.then === 'function') {
+        out.then(function (v) {
+          reply(p, v && v.__pkOut ? v.__pkOut : [null, v]);
+        }, function (e) { reply(p, ['CALL_FAILED', String(e && e.message)]); });
+        return true;
       }
       reply(p, out);
       return true;
@@ -1004,75 +1070,14 @@ const H5_INJECT = `(function () {
     } catch (e) { /* ignore */ }
   })();
 
-  /* ---- ArrayBuffer 响应 → 解析成对象（2026-09-30 关键补丁）----
+  /* 注：原有 patchArrayBufferResponse（response getter 重写）已删除 —— 2026-09-30。
    *
-   * H5 的部分接口（match/v2、props/v2 等）用：
-   *     a.post(url, null, { responseType: "arraybuffer" })
-   * 而调用方**直接当对象用**：
-   *     f = await getPkExerciseQuestionV2(...)
-   *     d(f.examVO.questions || [])        // 读 f.examVO
-   *
-   * 但 axios 对 arraybuffer **不做 JSON.parse**，H5 自己也没有解密/解析步骤
-   * （源码里没有任何 dataDecrypt 调用）—— 那一层是**真机原生 WebView** 干的。
-   *
-   * 现象：f 是 ArrayBuffer → f.examVO === undefined → 题目为空 →
-   *      界面永远停在「匹配中」。
-   *
-   * 我们在 XHR 层补上这一步：若 responseType 是 arraybuffer，
-   * 且响应体是 JSON 文本，就把 response 改写成**解析后的对象**。
+   * 当时误判「H5 不解密、ArrayBuffer 是原生层转成对象的」，于是改了 XHR 的
+   * response getter。实际上 H5 **有解密**：响应拦截器把 arraybuffer 转 base64
+   * 后调桥 LeoSecure.dataDecrypt（见 exercise-legacy 的 u/l 函数）。
+   * 那个补丁反而把「已解密的对象」再序列化去二次解密 → 必然失败。
+   * 正解：实现 dataDecrypt 桥（密文 → /api/pk/h5/decrypt → 明文）。
    */
-  (function patchArrayBufferResponse() {
-    function install(xhr) {
-      if (!xhr || xhr.__pkAbPatched) return;
-      xhr.__pkAbPatched = true;
-      var real = null;
-      try {
-        Object.defineProperty(xhr, "response", {
-          configurable: true,
-          get: function () {
-            if (real == null) return real;
-            // 只处理 ArrayBuffer / TypedArray；其它原样返回
-            var buf = null;
-            if (typeof ArrayBuffer !== "undefined" && real instanceof ArrayBuffer) buf = real;
-            else if (real && real.buffer instanceof ArrayBuffer) buf = real.buffer;
-            if (!buf) return real;
-            try {
-              var u8 = new Uint8Array(buf);
-              // 只对「看起来是 JSON」的内容解析（首字符 { 或 [）
-              var c0 = u8[0];
-              if (c0 !== 0x7b && c0 !== 0x5b) return real;
-              var txt = new TextDecoder("utf-8").decode(u8);
-              var obj = JSON.parse(txt);
-              diag('ab-parse', { len: u8.length, keys: Object.keys(obj).slice(0, 8).join(',') });
-              return obj;
-            } catch (e) { return real; }
-          },
-          set: function (v) { real = v; },
-        });
-      } catch (e) { /* 某些实现不可重定义，忽略 */ }
-    }
-    var _o = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function () {
-      try { install(this); } catch (e) {}
-      return _o.apply(this, arguments);
-    };
-  })();
-
-  /* ---- System 模块探针（2026-09-30）----
-   *
-   * 排行榜页的登录态来自它自己的 useUserInfo（d = 用户对象，
-   * isLogin = d.userId !== -1），而不是 window.__PK_USER。
-   * 它跑在 SystemJS 里，所以直接把已加载的模块表回传，
-   * 这样就能读到它到底拿到了什么 userId。
-   */
-  setTimeout(function () {
-    try {
-      if (!window.System || !System.entries) return;
-      var names = [];
-      System.entries().forEach(function (m) { names.push(String(m[0])); });
-      diag('sys-modules', { n: names.length, list: names.slice(-25).join(' | ') });
-    } catch (e) { /* ignore */ }
-  }, 6000);
 
   window.__pkH5Hook = { version: 2, local: LOCAL, hosts: TARGET_HOSTS };
 })();`;
@@ -1560,4 +1565,6 @@ module.exports = {
   serve,
   proxyApi,
   setUserInfoProvider,
+  // H5 的 dataDecrypt 桥委托 Node 侧解密时用（见 server.js /api/pk/h5/decrypt）。
+  decryptBuffer: decodeEncrypted,
 };
