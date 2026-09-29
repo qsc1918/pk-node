@@ -24,6 +24,53 @@ const pkH5 = require('./src/pk-h5-proxy');
 
 const PUBLIC_DIR = path.join(config.root, 'public');
 
+/* ---------------------------- PK H5 依赖注入 ---------------------------- */
+
+/**
+ * 给 PK H5 代理注册「取用户信息」的实现。
+ *
+ * ## 为什么必须（2026-09-30：「PK 界面一直刷新」的真因）
+ *
+ * H5 的登录态 isLogin 完全来自桥的 getUserInfo：
+ *   index-legacy.CHYoHfC0.js  r("i", ...)：
+ *     $t("getUserInfo") → n = r[0] → at("webviewLogin", n)
+ *   useHomeModel：isLogin = 上面那个函数的结果
+ * 返回空对象时 isLogin=false，pk-legacy 就会：
+ *     await dialog({loginTitle:"登录后开始PK"}); window.location.reload();
+ *   → 页面无限刷新。
+ *
+ * 所以每个 H5 页面都要带上该账号的真实 userId/昵称/头像（window.__PK_USER）。
+ * 优先用 /math/pk/home 响应里的 baseUserInfoVO（一次调用拿全）；
+ * 拿不到再退到 ytk 的 /accounts/api/current。
+ */
+pkH5.setUserInfoProvider(async (leoAccountId) => {
+  const acc = db.getLeoAccount(leoAccountId);
+  if (!acc) return null;
+  try {
+    const jar = jobs.jarOf(acc);
+    const leo = require('./src/leo');
+    const r = await leo.pkHome(jar, 3);
+    if (r.status === 200 && r.json && r.json.baseUserInfoVO) {
+      const u = r.json.baseUserInfoVO;
+      if (u.userId) {
+        return {
+          userId: u.userId,
+          nickName: u.userName || '',
+          nickname: u.userName || '',
+          avatarUrl: u.avatarUrl || '',
+          userPendantUrl: u.userPendantUrl || '',
+          // 有些分支会读 userTag / gradeId
+          userTag: r.json.userTag,
+          gradeId: r.json.gradeId,
+        };
+      }
+    }
+  } catch (e) {
+    console.log('[pk-h5] pkHome 取用户信息失败：' + e.message);
+  }
+  return null;
+});
+
 /* ---------------------------- 通用工具 ---------------------------- */
 
 /** 读 JSON body（限制大小，避免被塞爆内存）。 */

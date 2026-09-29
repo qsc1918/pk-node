@@ -557,6 +557,27 @@ const H5_INJECT = `(function () {
       // H5 头像 / 胜场 / 昵称的**首选来源**就是这里。
       // 不实现的话 H5 只能等服务端接口兜底 —— 表现就是
       // 「头像要切换年级后才显示、胜场显示 0」。数据由 Node 侧注入 window.__PK_USER。
+      //
+      // ★★ 2026-09-30：这里就是「isLogin 永远为 false → 无限刷新」的根因！
+      //
+      // H5 的登录态判定链（index-legacy.CHYoHfC0.js 的 r("i", ...)）：
+      //     $t("getUserInfo", {V1:Gt, validParams:{params:{trigger:true}}})
+      //     n = r[0]                 // ← 桥返回数组的第一个元素
+      //     at("webviewLogin", n)    // ← 写进 store
+      //     ...
+      //     return n
+      // 而 useHomeModel 的 isLogin 就是 setter v = e.i（即这个函数）的执行结果。
+      // 返回 {} 时 isLogin 恒为 false。
+      //
+      // 后果（pk-legacy 里三个入口都有这段）：
+      //     if (!isLogin && !unloginPkEnable) {
+      //       await dialog({ loginTitle: "登录后开始PK" });
+      //       window.location.reload();      // ← 死循环，页面一直刷新
+      //       return;
+      //     }
+      //
+      // 所以必须返回**真实的** userId（非 0 即视为已登录）。
+      // 数据由 Node 侧注入 window.__PK_USER（见 server.js 的 /pk-h5 分支）。
       getUserInfo: function () { return window.__PK_USER || {}; },
       login: function () { return 'OK'; },
       // octopus 埋点 SDK 的配置读取。
@@ -792,6 +813,8 @@ const H5_INJECT = `(function () {
 function rewriteHtml(html, opts) {
   let s = html.toString('utf8');
   const leoId = opts && opts.leoAccountId != null ? String(opts.leoAccountId) : '';
+  // ★ 真实用户信息（喂给桥的 getUserInfo）。见下面的详细说明。
+  const user = (opts && opts.user) || null;
 
   // 0) 把 leoAccountId 与「跳过新手引导」的存储标记提前注入：
   //    hook 脚本要用它们，且必须在 H5 主脚本**之前**执行。
@@ -800,9 +823,14 @@ function rewriteHtml(html, opts) {
   //    预置成 'true' 后：getItem 返回 'true' → showGuide=false → 浮层不弹。
   //    （值会被 StorageUtil 做 Base64 存储，所以这里给**明文** 'true'，
   //      由注入脚本的 presetStorage 负责编码。）
+  //
+  //    ★ __PK_USER：H5 的 isLogin 完全依赖桥的 getUserInfo（见 pk-h5-proxy 里
+  //      那段注释）。没有真实 userId 时会弹「登录后开始PK」并 location.reload()
+  //      → 页面无限刷新。所以这里把 Node 侧取到的真实用户信息塞进去。
   const pre = [
     leoId ? '<script>window.__PK_LEO_ID=' + JSON.stringify(leoId) + ';</script>' : '',
     '<script>window.__PK_STORAGE_PRESET={"oral-pk-guide":"true"};</script>',
+    user ? '<script>window.__PK_USER=' + JSON.stringify(user) + ';</script>' : '',
   ].join('');
 
   // 1) 把 CDN 上的 H5 目录换成本机 /pk-h5 前缀
@@ -846,6 +874,18 @@ function rewriteHtml(html, opts) {
 /* ------------------------------ 入口处理 ------------------------------ */
 
 /**
+ * 注册「取用户信息」的提供者（server.js 启动时注入）。
+ *
+ * H5 的登录态（isLogin）完全来自桥的 getUserInfo —— 没有真实 userId 时
+ * pk-legacy 会弹「登录后开始PK」并 location.reload()，页面无限刷新。
+ * 所以每个 HTML 页面都要带上该账号的真实用户信息（window.__PK_USER）。
+ *
+ * @param {(leoAccountId:number)=>Promise<object|null>} fn
+ */
+let fetchUserInfo = null;
+function setUserInfoProvider(fn) { fetchUserInfo = fn; }
+
+/**
  * 处理 `/pk-h5/*` 与 `/pk-h5-cdn/*`：把 CDN 资产（含 HTML）透传给浏览器。
  *
  * HTML 会被改写（URL 同源化 + 注入 hook）；其余资产原样透传。
@@ -886,7 +926,16 @@ async function serve(req, res, u) {
   let body = asset.body;
   let contentType = asset.contentType;
   if (contentType.indexOf('text/html') >= 0 || cdnUrl.endsWith('.html')) {
-    body = rewriteHtml(body, { leoAccountId: u.searchParams.get('leoAccountId') });
+    // ★ 取该小猿账号的真实用户信息，注入 window.__PK_USER —— H5 的 isLogin
+    //   完全依赖它（缺了会 location.reload() 死循环）。取不到就传 null，
+    //   页面会走「未登录」分支（至少不会崩）。
+    let user = null;
+    const leoId = u.searchParams.get('leoAccountId');
+    if (leoId && fetchUserInfo) {
+      try { user = await fetchUserInfo(Number(leoId)); }
+      catch (e) { console.log('[pk-h5] fetchUserInfo 失败：' + e.message); }
+    }
+    body = rewriteHtml(body, { leoAccountId: leoId, user });
     contentType = 'text/html';
   }
 
@@ -1066,4 +1115,5 @@ module.exports = {
   rewriteHtml,
   serve,
   proxyApi,
+  setUserInfoProvider,
 };
