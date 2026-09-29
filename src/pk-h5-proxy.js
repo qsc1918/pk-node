@@ -46,8 +46,27 @@ const H5_BASE_PATH = '/bh5/leo-web-oral-pk';
 /** 我方同源前缀 —— HTML 里所有 CDN URL 都会被改写成它。 */
 const LOCAL_PREFIX = '/pk-h5';
 
-/** 允许被代理的 API host（H5 会打这两个域）。 */
-const API_HOSTS = ['xyks.yuanfudao.com', 'xyst.yuanfudao.com', 'ape-api.yuanfudao.com'];
+/**
+ * 允许被代理的 API host。
+ *
+ * ## 为什么是这几个（2026-09-29 由浏览器诊断实测得出）
+ *
+ *  - `xyks` —— 主域（PK：`/leo-game-pk/*`）
+ *  - `xyst` —— solar 域（banner `/solar-activity/*`、配置中心）
+ *  - `ape-api` —— 账号域（登录相关）
+ *  - `oapi` —— 埋点/配置（`/orion-hubble-config/*`）
+ *  - `ytk` —— **登录态查询**（`/accounts/api/current`）。
+ *    这条最初漏了，导致 H5 判不出登录态 → 点 PK 没反应。
+ *
+ * 不在名单里的 host 会被 400 拒绝（见 [proxyApi]）。
+ */
+const API_HOSTS = [
+  'xyks.yuanfudao.com',
+  'xyst.yuanfudao.com',
+  'ape-api.yuanfudao.com',
+  'oapi.yuanfudao.com',
+  'ytk.yuanfudao.com',
+];
 
 /* ------------------------------ 资产缓存 ------------------------------ */
 
@@ -144,7 +163,7 @@ function normalizeContentType(ct, pathname) {
  * `"adapter"` 函数体），不是 fetch。包 fetch 无效。
  */
 const H5_INJECT = `(function () {
-  var TARGET_HOSTS = ['xyks.yuanfudao.com', 'xyst.yuanfudao.com', 'ape-api.yuanfudao.com', 'oapi.yuanfudao.com'];
+  var TARGET_HOSTS = ['xyks.yuanfudao.com', 'xyst.yuanfudao.com', 'ape-api.yuanfudao.com', 'oapi.yuanfudao.com', 'ytk.yuanfudao.com'];
   var LOCAL = '/api/pk/h5/api';
 
   /* ---- 诊断上报：把页面里的异常与请求结果回传本机，便于无头排查 ---- */
