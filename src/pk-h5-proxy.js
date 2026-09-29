@@ -166,6 +166,36 @@ const H5_INJECT = `(function () {
   var TARGET_HOSTS = ['xyks.yuanfudao.com', 'xyst.yuanfudao.com', 'ape-api.yuanfudao.com', 'oapi.yuanfudao.com', 'ytk.yuanfudao.com'];
   var LOCAL = '/api/pk/h5/api';
 
+  /* ---- 预置 H5 的 localStorage 标记：跳过「新手引导」遮罩 ---- */
+  //
+  // ## 为什么必须做（2026-09-29 由页面快照诊断确证）
+  //
+  // useHomeModel 首屏执行：
+  //     w.value = !s.getItem('oral-pk-guide')     // showGuide = 取反
+  // 而 StorageUtil 实际读写的是 localStorage 的 __local_<key>（Base64 编码值）。
+  //
+  // 首次打开时该键不存在 → showGuide = true → **弹出一层全屏新手引导浮层**，
+  // 把「开始PK / PK榜 / 好友挑战」全盖住 → 用户点击全部落在遮罩上 → 「点了没反应」。
+  //
+  // 快照诊断的原始证据（diag snapshot）：
+  //     guide: "dHJ1ZQ=="            ← Base64("true")，即引导标记为空 / 放行
+  //     overlays: ["pk 364x471", "content 364x471", ...]   ← 全屏层压在按钮上
+  //     clickable: ["开始PK [pk-btn]", "PK榜 [rank]", ...]  ← 按钮本身是存在的
+  //
+  // 这里在 H5 脚本执行前把标记写进去（值按 StorageUtil 的格式做 Base64），
+  // 于是 showGuide = false，浮层不弹，按钮可点。
+  (function presetStorage() {
+    try {
+      var M = window.__PK_STORAGE_PRESET || {};
+      Object.keys(M).forEach(function (k) {
+        var name = '__local_' + k;
+        var val = window.btoa ? window.btoa(M[k]) : M[k];
+        window.localStorage.setItem(name, val);
+      });
+      diag('storage-preset', { keys: Object.keys(M) });
+    } catch (e) { diag('storage-preset-err', { msg: String(e && e.message) }); }
+  })();
+
   /* ---- 诊断上报：把页面里的异常与请求结果回传本机，便于无头排查 ---- */
   function diag(kind, data) {
     try {
@@ -283,6 +313,9 @@ const H5_INJECT = `(function () {
       jsLoadComplete: function () { return 'OK'; },
       getImmerseStatusBarHeight: function () { return 0; },
       login: function () { return 'OK'; },
+      // octopus 埋点 SDK 的配置读取；不存在会打印 bridge-miss（不阻塞业务，
+      // 但会把日志搞脏）。返回空配置即可。
+      leo_getOrionConfig: function () { return {}; },
     };
 
     /** 统一入口：按 method 分派，回调以 JSON 字符串形式回。 */
@@ -412,7 +445,51 @@ const H5_INJECT = `(function () {
     };
   }
 
-  diag('hook-ready', { ver: 2, leoId: window.__PK_LEO_ID || null, ua: navigator.userAgent.slice(0, 200) });
+  diag('hook-ready', { ver: 3, leoId: window.__PK_LEO_ID || null, ua: navigator.userAgent.slice(0, 200) });
+
+  /* ---- 页面快照诊断：把「屏幕上到底有什么」回传，用于无头定位点击无反应 ---- */
+  (function snapshot() {
+    function dump(tag) {
+      try {
+        var info = {
+          tag: tag,
+          href: location.href.slice(-60),
+          // 关键 storage（H5 用它判断是否要弹「新手引导」遮罩）
+          guide: (function () {
+            try { return localStorage.getItem('__local_oral-pk-guide'); } catch (e) { return '(不可读)'; }
+          })(),
+          title: document.title,
+          // 屏幕上所有带「遮罩/引导」语义的元素尺寸（盖住按钮的元凶）
+          overlays: [],
+          // 可见按钮/可点元素的文案（用户说「按钮点了没反应」，先确认有哪些）
+          clickable: [],
+        };
+        var all = document.querySelectorAll('body *');
+        for (var i = 0; i < all.length && i < 900; i++) {
+          var el = all[i];
+          var cls = String(el.className || '');
+          var cs = window.getComputedStyle ? window.getComputedStyle(el) : null;
+          var vis = cs && cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity || 1) > 0.01;
+          if (!vis) continue;
+          var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+          if (!r) continue;
+          // 覆盖全屏的大块（可能是遮罩）
+          if (r.width >= window.innerWidth * 0.8 && r.height >= window.innerHeight * 0.6 && info.overlays.length < 8) {
+            info.overlays.push(cls.slice(0, 70) + ' ' + Math.round(r.width) + 'x' + Math.round(r.height) + ' z=' + (cs.zIndex || 'auto'));
+          }
+          var txt = (el.innerText || '').trim();
+          if (txt && txt.length > 0 && txt.length < 14 && r.width > 10 && r.height > 10 && info.clickable.length < 30) {
+            var looksClickable = (cs && (cs.cursor === 'pointer' || cs.position === 'fixed')) || /btn|button|tab|pk|rank|invite|start/i.test(cls);
+            if (looksClickable) info.clickable.push(txt + ' [' + cls.slice(0, 40) + ']');
+          }
+        }
+        diag('snapshot', info);
+      } catch (e) { diag('snapshot-err', { msg: String(e && e.message) }); }
+    }
+    // 首屏 + 稍后各抓一次（H5 是异步渲染）
+    setTimeout(function () { dump('t2.5s'); }, 2500);
+    setTimeout(function () { dump('t7s'); }, 7000);
+  })();
 
   window.__pkH5Hook = { version: 2, local: LOCAL, hosts: TARGET_HOSTS };
 })();`;
@@ -430,11 +507,17 @@ function rewriteHtml(html, opts) {
   let s = html.toString('utf8');
   const leoId = opts && opts.leoAccountId != null ? String(opts.leoAccountId) : '';
 
-  // 0) 把 leoAccountId 提前注入：hook 脚本要用它拼 API 代理 URL。
-  //    必须在 hook **之前**执行，所以直接拼进注入片段最前面。
-  const pre = leoId
-    ? '<script>window.__PK_LEO_ID=' + JSON.stringify(leoId) + ';</script>'
-    : '';
+  // 0) 把 leoAccountId 与「跳过新手引导」的存储标记提前注入：
+  //    hook 脚本要用它们，且必须在 H5 主脚本**之前**执行。
+  //
+  //    oral-pk-guide 见 useHomeModel：showGuide = !getItem('oral-pk-guide')。
+  //    预置成 'true' 后：getItem 返回 'true' → showGuide=false → 浮层不弹。
+  //    （值会被 StorageUtil 做 Base64 存储，所以这里给**明文** 'true'，
+  //      由注入脚本的 presetStorage 负责编码。）
+  const pre = [
+    leoId ? '<script>window.__PK_LEO_ID=' + JSON.stringify(leoId) + ';</script>' : '',
+    '<script>window.__PK_STORAGE_PRESET={"oral-pk-guide":"true"};</script>',
+  ].join('');
 
   // 1) 把 CDN 上的 H5 目录换成本机 /pk-h5 前缀
   //    例：https://leo.fbcontent.cn/bh5/leo-web-oral-pk/assets/x.js → /pk-h5/assets/x.js
