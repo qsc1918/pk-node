@@ -479,15 +479,70 @@ const H5_INJECT = `(function () {
       }
       if (!obj) return { args: {}, cbName: null, rawObj: null };
       var h = (obj.arguments && obj.arguments[0]) || obj.params || {};
-      var cb = h.trigger || obj.callback || (typeof obj.callback === 'string' ? obj.callback : null);
+      var cb = h.trigger || (typeof obj.callback === 'string' ? obj.callback : null);
       if (typeof cb !== 'string' || !cb) cb = null;
-      return { args: h, cbName: cb, rawObj: obj };
+      // 回执回调与 trigger 是**两个不同**的回调（见 reply / NO_TRIGGER_METHODS 的说明）。
+      var rc = typeof obj.callback === 'string' ? obj.callback : null;
+      return { args: h, cbName: cb, receiptName: rc, rawObj: obj };
     }
 
-    /** 把结果按 H5 的协议回给页面：window[cbName](base64([err, ...data]))。 */
+    /**
+     * ★★ 不能回调 trigger 的桥方法（setter 语义）—— 2026-09-30 的关键真 bug。
+     *
+     * ## 为什么（排行榜「打开又自己退回」的根因）
+     *
+     * H5 的 trigger 字段有**两种语义**：
+     *
+     *  1. **查询类**（getUserInfo / getWebViewInfo / requestConfig …）
+     *     trigger 是「回执回调」：页面注册 window[trigger]，
+     *     我们必须 unshift 结果把 Promise resolve 掉。
+     *
+     *  2. **setter 类**（setLeftButton / setOnVisibilityChange / refreshStateView …）
+     *     trigger 是**事件处理器**，页面把它**登记**进原生侧，
+     *     等用户**真正按下**时才回调。我们若在登记时立刻回调，
+     *     等于**替用户按下了这个键**！
+     *
+     * 实测证据（motivation-honor-roll 荣誉榜，2026-09-30）：
+     *
+     *     // 页面代码
+     *     f = () => {
+     *       m.postMessage({eventName:'exercise_motivation_back_pk', ...});
+     *       s();                      // s() = closeWebView()
+     *     };
+     *     setLeftButton({ trigger: () => { f() } });   // 返回键处理器
+     *
+     *     // 我们的日志（间隔 2ms，页面加载 4ms 后）
+     *     341994 setLeftButton    cb=setLeftButton_..._24
+     *     341996 sendEventToNative exercise_motivation_back_pk   ← 「返回键被按下」
+     *     341996 closeWebView      → 'OK'
+     *
+     * → 页面一打开就自己关闭，用户看到的就是「排行榜打开又退回 PK 主页」。
+     *
+     * 所以这些方法**只回复执、不动 trigger**。
+     */
+    var NO_TRIGGER_METHODS = {
+      setLeftButton: 1,
+      setOnVisibilityChange: 1,
+      refreshStateView: 1,
+      setForceBounceEnable: 1,
+      observeTabChange: 1,
+      ShowPracticeDialogIfNeeded: 1,
+    };
+
+    /** 把结果按 H5 的协议回给页面：window[cbName](base64([err, ...data]))。
+     *
+     *  - p.cbName 为空 → 无事可做（有些方法 H5 不传回调）。
+     *  - p.skipTrigger 为真 → **只回复执**（obj.callback），
+     *    绝不触碰 trigger（见 NO_TRIGGER_METHODS 的说明）。
+     */
     function reply(p, out) {
-      if (!p.cbName) return;
       var s = b64encode(JSON.stringify(out));
+      // ① 回执回调：H5 用 payload.callback 指定（有才回）
+      if (p.receiptName && typeof window[p.receiptName] === 'function') {
+        try { window[p.receiptName](s); } catch (e) { /* ignore */ }
+      }
+      // ② trigger 回调：setter 类方法**跳过**（否则等于替用户按键）
+      if (p.skipTrigger || !p.cbName) return;
       var f = window[p.cbName];
       if (typeof f === 'function') {
         try { f(s); diag('bridge-reply', { cb: p.cbName, out: JSON.stringify(out).slice(0, 160) }); }
@@ -692,6 +747,10 @@ const H5_INJECT = `(function () {
       var p = parsePayload(raw);
       // ★ 每个桥调用都回传 —— 点击链路的「最后一米」就是这里。
       diag('bridge-call', { module: module, method: method, cb: p.cbName, args: JSON.stringify(p.args).slice(0, 240) });
+
+      // setter 类方法：trigger 是**事件处理器**而不是回执，
+      // 立刻回调等于替用户按键（历史 bug：排行榜打开即被「返回键」关闭）。
+      if (NO_TRIGGER_METHODS[method]) p.skipTrigger = true;
 
       var fn = HANDLERS[method];
       var out;
@@ -926,7 +985,9 @@ const H5_INJECT = `(function () {
               if (typeof x === 'string') return x;
               try { return JSON.stringify(x); } catch (e) { return String(x); }
             }).join(' ').slice(0, 300);
-            diag('console', { lv: tag, msg: a });
+            // 带上页面文件名，便于区分是哪个 H5 页在打印（多页共存时很关键）。
+            var pg = String(location.pathname || '').split('/').pop() || '';
+            diag('console', { lv: tag, msg: a, pg: pg });
           } catch (e) { /* ignore */ }
           return orig.apply(console, arguments);
         };
@@ -996,6 +1057,22 @@ const H5_INJECT = `(function () {
       return _o.apply(this, arguments);
     };
   })();
+
+  /* ---- System 模块探针（2026-09-30）----
+   *
+   * 排行榜页的登录态来自它自己的 useUserInfo（d = 用户对象，
+   * isLogin = d.userId !== -1），而不是 window.__PK_USER。
+   * 它跑在 SystemJS 里，所以直接把已加载的模块表回传，
+   * 这样就能读到它到底拿到了什么 userId。
+   */
+  setTimeout(function () {
+    try {
+      if (!window.System || !System.entries) return;
+      var names = [];
+      System.entries().forEach(function (m) { names.push(String(m[0])); });
+      diag('sys-modules', { n: names.length, list: names.slice(-25).join(' | ') });
+    } catch (e) { /* ignore */ }
+  }, 6000);
 
   window.__pkH5Hook = { version: 2, local: LOCAL, hosts: TARGET_HOSTS };
 })();`;
