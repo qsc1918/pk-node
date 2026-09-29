@@ -721,6 +721,39 @@ const H5_INJECT = `(function () {
        *
        * 之前没实现这个桥 → bridge-miss → Promise 永久挂起 → 界面永远「匹配中」。
        */
+      /* ★★ 手写识别（MathExercise.recognize）—— 2026-09-30：「写完不识别」的真因
+       *
+       * 契约（useRecognizeBoard-legacy）：
+       *   f('recognize', { strokes, keypointId, expectedResult, startTime, trigger }, 'MathExercise')
+       *   trigger(err, result) → err ? reject : resolve(result)
+       *   rt(result) → { recognizeResult: result, pathPoints, answer: dt(result) }
+       *   dt = t => answers.includes(t) ? 1 : 0
+       *
+       * 即：桥要回一个**识别出的答案字符串**，H5 再拿它跟期望答案比对。
+       * 我们本地没有手写 OCR，所以直接回 expectedResult 的首项 ——
+       * H5 的 includes 必然命中，判定为答对，继续往下走。
+       *
+       * 注：真实 App 里这一步是原生识别（离线模型），我们无法复现；
+       * 返回期望答案可以让流程跑通（本项目的目标就是自动作答）。
+       */
+      recognize: function (a) {
+        var exp = (a && a.expectedResult) || [];
+        var ans = Array.isArray(exp) ? (exp[0] || '') : String(exp || '');
+        diag('recognize', {
+          strokes: (a && a.strokes && a.strokes.length) || 0,
+          expected: JSON.stringify(exp).slice(0, 80),
+          out: String(ans).slice(0, 40),
+        });
+        return String(ans);
+      },
+      // 其余曾报 bridge-miss 的方法（不阻塞主流程，给合理缺省值）
+      getUserRights: function () {
+        return { isVip: false, isSVip: false, isStudyGroup: false, studyGroupRightType: 0 };
+      },
+      getVipRightInfo: function () { return {}; },
+      sendEventToNative: function () { return 'OK'; },     // 埋点上报
+      addMergeableKlog: function () { return 'OK'; },      // 客户端日志
+      addFunctionRecord: function () { return 'OK'; },
       dataDecrypt: function (a) {
         var b64 = (a && a.base64) || '';
         return nodeDecrypt(b64).then(function (plainB64) {
@@ -1079,6 +1112,48 @@ const H5_INJECT = `(function () {
    * 正解：实现 dataDecrypt 桥（密文 → /api/pk/h5/decrypt → 明文）。
    */
 
+  /* ---- 登录态失效提示（2026-09-30）----
+   *
+   * 背景：某账号 cookie 过期时，接口会成片 401，H5 拿不到主页数据，
+   * 详情卡全不渲染 → **整页白屏**（实测账号 12）。用户看到白屏完全
+   * 无从判断，还以为是代码坏了。
+   *
+   * 这里在 XHR 层统一盯 401：首次出现就弹一个不依赖 H5 的提示条，
+   * 明确告诉用户「这个账号的登录态已失效」。
+   */
+  (function authWatch() {
+    var shown = false;
+    function showTip() {
+      if (shown) return; shown = true;
+      try {
+        var d = document.createElement('div');
+        d.id = 'pk-auth-expired';
+        d.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:2147483647;' +
+          'background:#c62828;color:#fff;font:13px/1.6 sans-serif;padding:8px 12px;text-align:center';
+        d.textContent = '此账号登录态已失效（接口 401）—— 请在 pk-node 里重新登录/导入该账号';
+        (document.body || document.documentElement).appendChild(d);
+      } catch (e) { /* ignore */ }
+      diag('auth-expired', { at: Date.now() });
+    }
+    var _o = XMLHttpRequest.prototype.open;
+    var _s = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, u) {
+      this.__pkUrl = String(u || '');
+      return _o.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function () {
+      var self = this;
+      try {
+        if (self.__pkUrl && self.__pkUrl.indexOf('/api/pk/h5/api') >= 0) {
+          self.addEventListener('load', function () {
+            try { if (self.status === 401) showTip(); } catch (e) { /* ignore */ }
+          });
+        }
+      } catch (e) { /* ignore */ }
+      return _s.apply(this, arguments);
+    };
+  })();
+
   window.__pkH5Hook = { version: 2, local: LOCAL, hosts: TARGET_HOSTS };
 })();`;
 
@@ -1355,6 +1430,72 @@ function decodeEncrypted(buf) {
  *
  * @param {object} ctx { jar, rawBody }
  */
+/* ------------------------------ 加密接口判定 ------------------------------ */
+/**
+ * 是否为「响应加密（arraybuffer + dataDecrypt）」的接口。
+ *
+ * 2026-09-30：只有这些接口的响应才是 keystream 密文，必须 rawBody 逐字节透传；
+ * 其余普通接口是真 gzip，要交给 http.js 正常解压。
+ *
+ * 依据：H5 源码里 responseType:"arraybuffer" 的接口（exercise-legacy）：
+ *   /math/pk/match/v2          出题
+ *   /math/pk/multi/match/v2    多人 PK
+ *   /math/pk/match/props/v2    道具赛
+ *   /...getFinallPkExerciseQuestionV2 / english...V2 / submit ...
+ */
+function isEncryptedPath(pathOnly) {
+  const p = String(pathOnly || '');
+  if (p.indexOf('/v2') >= 0) return true;                 // 各种 v2 加密接口
+  if (p.indexOf('pk/submit') >= 0) return true;           // 提交（加密 body/响应）
+  return false;
+}
+
+/* ------------------------------ 出站节流 ------------------------------ */
+/**
+ * H5 请求节流器：避免「同秒几十个并发」被服务端当异常流量。
+ *
+ * ## 为什么必须加（2026-09-30，白屏真因）
+ *
+ * 实测（账号 12，pknode33）：
+ *
+ *   GET /leo-activity/api/backpack?...&sign=ed497340504a…   → 401
+ *   GET /leo-activity/api/backpack?...&sign=ed497340504a…   → 200   （311ms 后）
+ *
+ * **同一 URL、同一 sign、同一 cookie**，一次 401 一次 200 —— 说明不是鉴权/
+ * 签名问题，而是**服务端对突发并发限流**（401 unauthorized 是它的拒绝姿态）。
+ *
+ * H5 首页一加载会并发十几个接口（pk/home、poetry/pk/home、backpack、
+ * daily/award、props/home…），全打到同一域；限流命中后首页数据缺失，
+ * H5 的卡片全不渲染 → **整页白屏**（且所有账号都会出现）。
+ *
+ * 所以这里做一个简单的**串行化 + 最小间隔**：
+ *   - 同一 host 同时最多 1 个在飞（保守，但首页请求量不大）；
+ *   - 两次出站之间至少间隔 GAP ms；
+ *   - 串行不可避免会慢一点，但比整页白屏好得多。
+ *
+ * 另外对 401/429 自动重试一次（间隔加倍），因为限流通常是瞬时的。
+ */
+const PK_THROTTLE_GAP_MS = Number(process.env.PK_THROTTLE_GAP_MS || 120);
+const pkThrottle = {};   // host -> Promise（串行链尾）
+const pkLastAt = {};     // host -> 上次出站时间
+
+function sleepMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+/** 串行化 + 最小间隔地执行一次出站请求。 */
+function pkThrottleRun(host, fn) {
+  const prev = pkThrottle[host] || Promise.resolve();
+  const next = prev.then(async () => {
+    const now = Date.now();
+    const wait = PK_THROTTLE_GAP_MS - (now - (pkLastAt[host] || 0));
+    if (wait > 0) await sleepMs(wait);
+    try { return await fn(); }
+    finally { pkLastAt[host] = Date.now(); }
+  });
+  // 链尾不因为单次失败而断掉
+  pkThrottle[host] = next.then(() => {}, () => {});
+  return next;
+}
+
 async function proxyApi(req, res, u, ctx) {
   const targetHost = u.searchParams.get('__t') || '';
   const rawPath = req.headers['x-pk-path'] || req.headers['X-PK-Path'] || '';
@@ -1486,14 +1627,39 @@ async function proxyApi(req, res, u, ctx) {
     //  而且密文必须**逐字节透传**：H5 的 response 拦截器要把它 btoa 后
     //  交给 dataDecrypt 桥解密（见 exercise-legacy 的 u/l 函数）。
     //  这里若做任何 utf8 转换都会破坏二进制，解密必然失败。
-    const r = await request({
-      url: realUrl,
-      method: method,
-      jar: ctx.jar,
-      body: bodyBuf && bodyBuf.length ? bodyBuf : undefined,
-      headers: headers,
-      rawBody: true,
-    });
+    // ★ 出站节流 + 401 重试（2026-09-30，白屏真因）。
+    //
+    //  实测同一 URL/同一 sign 会一次 401、一次 200 —— 说明服务端在**突发并发**
+    //  下限流（401 unauthorized 是它的拒绝姿态）。H5 一加载就并发十几个接口，
+    //  不节流就会成片被拒 → 首页数据缺失 → 整页白屏。
+    //
+    //  所以：同 host 串行 + 最小间隔；401/429 再给一次机会（退避重试）。
+    async function once() {
+      return request({
+        url: realUrl,
+        method: method,
+        jar: ctx.jar,
+        body: bodyBuf && bodyBuf.length ? bodyBuf : undefined,
+        headers: headers,
+        // ★ rawBody 只对**加密接口**开（2026-09-30 重要修正）。
+        //
+        //  rawBody 的语义是「不解压 gzip」—— 因为加密接口的响应是
+        //  「keystream XOR(gzip(json))」的密文，必须逐字节透传给 H5 的
+        //  dataDecrypt 桥去解（http.js 若当成 gzip 去 gunzip 会失败）。
+        //
+        //  但对**普通**接口（pk/home、props/home、backpack…）它们是**真 gzip**，
+        //  必须正常解压！我一开始把所有请求都设成 rawBody:true，
+        //  结果 H5 拿到一堆 gzip 字节当 JSON 解析 → 抛错 → 渲染中断 → 白屏。
+        rawBody: isEncryptedPath(pathOnly),
+      });
+    }
+    let r = await pkThrottleRun(host, once);
+    if (r.status === 401 || r.status === 429) {
+      diagLog('retry', pathOnly + ' ' + r.status + ' → 退避重试');
+      await sleepMs(400);
+      r = await pkThrottleRun(host, once);
+      diagLog('retry', pathOnly + ' 重试后 ' + r.status);
+    }
 
     // 把响应原样回给 H5（H5 自己解析业务码）
     const outHeaders = {
