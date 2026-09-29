@@ -1269,6 +1269,33 @@ const H5_INJECT = `(function () {
     return null;
   }
 
+  /** 回传当前界面结构（供无头环境判断「该点什么」）。 */
+  function pkBotDumpDom(tag) {
+    try {
+      var cvs = document.querySelectorAll('canvas');
+      var info = [];
+      for (var i = 0; i < cvs.length && i < 3; i++) {
+        var b = cvs[i].getBoundingClientRect();
+        info.push('canvas[' + i + '] ' + Math.round(b.width) + 'x' + Math.round(b.height));
+      }
+      var texts = [];
+      var all = document.querySelectorAll('div,button,span,a,p');
+      for (var j = 0; j < all.length && texts.length < 40; j++) {
+        if (all[j].children.length) continue;
+        var t = (all[j].textContent || '').trim();
+        if (!t || t.length > 16) continue;
+        var r = all[j].getBoundingClientRect();
+        if (r.width < 4 || r.height < 4) continue;
+        texts.push(t + '@' + Math.round(r.left) + ',' + Math.round(r.top));
+      }
+      diag('bot-dom', {
+        tag: tag,
+        canvases: info.join(' | '),
+        texts: texts.join(' / '),
+        url: location.pathname,
+      });
+    } catch (e) { diag('bot-dom', { err: String(e && e.message) }); }
+  }
   /* ---- 面板 UI ---- */
   function pkBotPanel() {
     try {
@@ -1308,32 +1335,6 @@ const H5_INJECT = `(function () {
         setTimeout(function () { var n = pkBotFindNext(); if (n) n.click(); }, 350);
       };
       wrap.appendChild(btn);
-  /** 回传当前界面结构（供无头环境判断「该点什么」）。 */
-  function pkBotDumpDom(tag) {
-    try {
-      var cvs = document.querySelectorAll('canvas');
-      var info = [];
-      for (var i = 0; i < cvs.length && i < 3; i++) {
-        var b = cvs[i].getBoundingClientRect();
-        info.push('canvas[' + i + '] ' + Math.round(b.width) + 'x' + Math.round(b.height));
-      }
-      var texts = [];
-      var all = document.querySelectorAll('div,button,span,a,p');
-      for (var j = 0; j < all.length && texts.length < 40; j++) {
-        if (all[j].children.length) continue;
-        var t = (all[j].textContent || '').trim();
-        if (!t || t.length > 16) continue;
-        var r = all[j].getBoundingClientRect();
-        if (r.width < 4 || r.height < 4) continue;
-        texts.push(t + '@' + Math.round(r.left) + ',' + Math.round(r.top));
-      }
-      diag('bot-dom', pumpTag(tag, info, all, texts));
-    } catch (e) { diag('bot-dom', { err: String(e && e.message) }); }
-  }
-  function pumpTag(tag, info, all, texts) {
-    return { tag: tag, canvases: info.join(' | '), texts: texts.join(' / '), url: location.pathname };
-  }
-
       var dbg = document.createElement('div');
       dbg.textContent = 'dump DOM';
       dbg.style.cssText = 'margin-top:4px;text-align:center;background:#444;' +
@@ -1509,6 +1510,34 @@ let dumpCount = 0;
 function rewriteAssetJs(buf) {
   let s = buf.toString('utf8');
   // 已改写就跳过（幂等）
+
+  // ★★ 2026-09-30：PKReadyGo 倒计时 watcher 缺 immediate →「答对 N 题」遮罩卡死
+  //
+  //  组件 PKReadyGo（index-legacy.Blmv9pEj.js）：
+  //    watch(() => props.start, e => { if (e) { ...3.5s...; emit('readyGoEnd') } })
+  //  **没写 immediate**。父组件在匹配动画约 4.5s 后才把 start 置 true，
+  //  而 PKReadyGo 是 v-if="数据就绪" 才挂载。真机 match/v2 快 → 先就绪后开赛 →
+  //  watch 能触发；我们走代理+桥解密更慢 → 开赛(start=true)先于就绪 → 组件挂载时
+  //  start 已是 true → watch 永不触发 → readyGoEnd 永不 emit → 计时器/答题流程
+  //  不启动 → 永远卡在「答对 N 题」遮罩。
+  //
+  //  改写：在 watch 的 options 位置插入 {immediate:!0}（幂等，带标记）。
+  {
+    var RG_HEAD = '(()=>i.start,e=>{e&&setTimeout(';
+    var RG_TAIL = '},2e3)}),(t,n)=>';
+    var iH = s.indexOf(RG_HEAD);
+    if (iH >= 0 && s.indexOf('__pkReadyGoImm') < 0) {
+      var iT = s.indexOf(RG_TAIL, iH);
+      if (iT > iH) {
+        // TAIL 偏移 7 是 p(...) 的收尾 ')'，把 options 插在它之后
+        var at = iT + 7;
+        if (s.charAt(at) === ')') {
+          s = s.slice(0, at + 1) + ',/*__pkReadyGoImm*/{immediate:!0}' + s.slice(at + 1);
+          console.log('[pk-h5] 已给 PKReadyGo 倒计时 watcher 补 immediate');
+        }
+      }
+    }
+  }
   if (s.indexOf('__pkNotLocalHost') >= 0) return Buffer.from(s, 'utf8');
 
   // 目标片段（在压缩后的资产里是连续的一段）
