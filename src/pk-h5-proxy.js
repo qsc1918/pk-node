@@ -738,6 +738,8 @@ const H5_INJECT = `(function () {
        */
       recognize: function (a) {
         var exp = (a && a.expectedResult) || [];
+        // 受面板「视为正确答案」开关控制（关掉就回空，等于不自动作答）。
+        if (!pkBotCfg().answer) { diag('recognize', { off: true }); return ''; }
         var ans = Array.isArray(exp) ? (exp[0] || '') : String(exp || '');
         diag('recognize', {
           strokes: (a && a.strokes && a.strokes.length) || 0,
@@ -1153,6 +1155,179 @@ const H5_INJECT = `(function () {
       return _s.apply(this, arguments);
     };
   })();
+
+  /* ---- PK 自动助手面板（2026-09-30）----
+   *
+   * 用户需求：把「以前答案视为正确答案 / 自动提交画笔 / 自动下一局」做成按钮。
+   *
+   * 设计：
+   *   - 一个悬浮小面板（右下角），三个开关，配置存 localStorage（跨页保持）；
+   *   - 「视为正确答案」作用于 recognize 桥：开=回 expectedResult 首项（必对），
+   *     关=回空串（交由真机识别，我们本地没有）；
+   *   - 「自动提交画笔」定时在画板上模拟一次抬手（pointerdown→move→up），
+   *     触发 H5 的 onHandUp → 识别 → 判对 → 自动进下一题；
+   *   - 「自动下一局」：结算页出现「继续 PK / 再来一局」时自动点击。
+   *
+   * 注意：本段整体在 Node 模板字符串里 —— **不得出现反引号与正则字面量**。
+   */
+  var PK_BOT_KEY = 'pk-bot-cfg';
+  function pkBotCfg() {
+    try {
+      var raw = localStorage.getItem(PK_BOT_KEY);
+      var o = raw ? JSON.parse(raw) : null;
+      if (o && typeof o === 'object') {
+        return { answer: !!o.answer, autoStroke: !!o.autoStroke, autoNext: !!o.autoNext };
+      }
+    } catch (e) { /* ignore */ }
+    // 默认：视为正确答案 = 开（当前已验证可用）
+    return { answer: true, autoStroke: false, autoNext: false };
+  }
+  function pkBotSet(patch) {
+    var c = pkBotCfg();
+    for (var k in patch) { if (Object.prototype.hasOwnProperty.call(patch, k)) c[k] = patch[k]; }
+    try { localStorage.setItem(PK_BOT_KEY, JSON.stringify(c)); } catch (e) { /* ignore */ }
+    return c;
+  }
+  window.__pkBotCfg = pkBotCfg;
+  window.__pkBotSet = pkBotSet;
+
+  /** 在画板上模拟一次「写一笔后抬手」。 */
+  function pkBotStroke() {
+    try {
+      var el = document.querySelector('canvas')
+        || document.querySelector('.write-pad, .writing-pad, [class*=write], [class*=pad]')
+        || document.querySelector('[class*=oral-pk]');
+      if (!el) { diag('bot-stroke', { ok: false, why: 'no-canvas' }); return false; }
+      var r = el.getBoundingClientRect();
+      if (!r || r.width < 10) { diag('bot-stroke', { ok: false, why: 'zero-size' }); return false; }
+      var cx = r.left + r.width / 2;
+      var cy = r.top + r.height / 2;
+      function fire(type, x, y) {
+        var ev = new PointerEvent(type, {
+          bubbles: true, cancelable: true, composed: true,
+          clientX: x, clientY: y, pointerId: 1, pointerType: 'touch', isPrimary: true, buttons: 1,
+        });
+        el.dispatchEvent(ev);
+      }
+      fire('pointerdown', cx, cy);
+      fire('pointermove', cx + 4, cy + 4);
+      fire('pointermove', cx + 8, cy);
+      fire('pointerup', cx + 8, cy);
+      diag('bot-stroke', { ok: true, tag: el.tagName, cls: String(el.className).slice(0, 60) });
+      return true;
+    } catch (e) {
+      diag('bot-stroke', { ok: false, why: String(e && e.message) });
+      return false;
+    }
+  }
+
+  /** 找「继续 PK / 下一局」类按钮。 */
+  function pkBotFindNext() {
+    try {
+      var all = document.querySelectorAll('div,button,span,a');
+      for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        if (el.children.length > 0) continue;
+        var t = (el.textContent || '').trim();
+        if (!t || t.length > 12) continue;
+        if (t.indexOf('继续') === 0 || t.indexOf('再来') === 0 ||
+            t === '下一局' || t === '返回首页' || t === '继续 PK') return el;
+      }
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+
+  /* ---- 面板 UI ---- */
+  function pkBotPanel() {
+    try {
+      if (document.getElementById('pk-bot-panel')) return;
+      if (!document.body) return;
+      var wrap = document.createElement('div');
+      wrap.id = 'pk-bot-panel';
+      wrap.style.cssText = 'position:fixed;right:8px;bottom:96px;z-index:2147483646;' +
+        'background:rgba(20,20,20,.86);color:#fff;font:12px/1.5 sans-serif;' +
+        'border-radius:10px;padding:8px 10px;box-shadow:0 2px 10px rgba(0,0,0,.3)';
+      var c = pkBotCfg();
+      function row(key, label) {
+        var lab = document.createElement('label');
+        lab.style.cssText = 'display:block;cursor:pointer;white-space:nowrap;margin:1px 0';
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = !!(c && c[key]);
+        cb.style.cssText = 'vertical-align:-1px;margin-right:4px';
+        cb.onchange = function () {
+          var nc = {}; nc[key] = cb.checked;
+          pkBotSet(nc);
+          diag('bot-cfg', pkBotSet({}));
+        };
+        lab.appendChild(cb);
+        lab.appendChild(document.createTextNode(label));
+        return lab;
+      }
+      wrap.appendChild(row('answer', '视为正确答案'));
+      wrap.appendChild(row('autoStroke', '自动提交画笔'));
+      wrap.appendChild(row('autoNext', '自动下一局'));
+      var btn = document.createElement('div');
+      btn.textContent = '立即交一笔';
+      btn.style.cssText = 'margin-top:5px;text-align:center;background:#3b6ef6;' +
+        'border-radius:6px;padding:3px 6px;cursor:pointer';
+      btn.onclick = function () {
+        pkBotStroke();
+        setTimeout(function () { var n = pkBotFindNext(); if (n) n.click(); }, 350);
+      };
+      wrap.appendChild(btn);
+      var dbg = document.createElement('div');
+      dbg.textContent = 'dump DOM';
+      dbg.style.cssText = 'margin-top:4px;text-align:center;background:#444;' +
+        'border-radius:6px;padding:3px 6px;cursor:pointer';
+      dbg.onclick = function () {
+        try {
+          var cvs = document.querySelectorAll('canvas');
+          var info = [];
+          for (var i = 0; i < cvs.length; i++) {
+            var b = cvs[i].getBoundingClientRect();
+            info.push('canvas[' + i + '] ' + Math.round(b.width) + 'x' + Math.round(b.height) +
+               ' cls=' + String(cvs[i].className).slice(0, 40));
+          }
+          var btns = [];
+          var all = document.querySelectorAll('div,button,span');
+          for (var j = 0; j < all.length && btns.length < 30; j++) {
+            if (all[j].children.length) continue;
+            var t = (all[j].textContent || '').trim();
+            if (t && t.length <= 8) btns.push(t);
+          }
+          diag('bot-dom', { canvases: info.join(' | '), texts: btns.join(' / '), url: location.pathname });
+        } catch (e) { diag('bot-dom', { err: String(e && e.message) }); }
+      };
+      wrap.appendChild(dbg);
+      document.body.appendChild(wrap);
+      diag('bot-panel', pkBotCfg());
+    } catch (e) { /* ignore */ }
+  }
+
+  /* ---- 定时器：自动交笔 / 自动下一局 ---- */
+  var pkBotStrokeBusy = false;
+  setInterval(function () {
+    try {
+      var c = pkBotCfg();
+      if (c.autoNext) {
+        var n = pkBotFindNext();
+        if (n) { diag('bot-next', { text: (n.textContent || '').trim().slice(0, 12) }); n.click(); }
+      }
+      if (c.autoStroke && !pkBotStrokeBusy) {
+        // 只在「有画板」的页面自动交笔（对局页）
+        var cv = document.querySelector('canvas');
+        if (cv) {
+          pkBotStrokeBusy = true;
+          pkBotStroke();
+          setTimeout(function () { pkBotStrokeBusy = false; }, 2500);
+        }
+      }
+    } catch (e) { /* ignore */ }
+  }, 1500);
+
+  setTimeout(pkBotPanel, 800);
+  setTimeout(pkBotPanel, 3000);
 
   window.__pkH5Hook = { version: 2, local: LOCAL, hosts: TARGET_HOSTS };
 })();`;

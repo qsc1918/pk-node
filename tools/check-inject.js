@@ -73,7 +73,22 @@ const sandbox = {
   location: { href: 'http://127.0.0.1:8791/pk-h5/pk.html' },
   XMLHttpRequest: function () {},
   console: { log() {}, warn() {}, error() {} },
-  JSON, URL, setTimeout, Date, Object, Array, String, Math, Error,
+  JSON, URL, setTimeout, clearInterval, clearTimeout,
+  // setInterval 用 stub：真实现会保持事件循环，导致本脚本不退出
+  setInterval: () => 0,
+  Date, Object, Array, String, Math, Error, Promise, Map, Set, RegExp,
+  // 面板/自动化相关的最小桩（注入脚本会自动建面板与定时器）
+  localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+  document: {
+    getElementById: () => null,
+    createElement: () => ({ style: {}, setAttribute() {}, appendChild() {}, addEventListener() {}, children: [] }),
+    createTextNode: () => ({}),
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    body: null, head: { appendChild() {} },
+  },
+  PointerEvent: function () {},
+  requestAnimationFrame: (fn) => setTimeout(fn, 0),
 };
 sandbox.window = sandbox;
 sandbox.XMLHttpRequest.prototype = {
@@ -120,7 +135,21 @@ try {
     console: sandbox.console,
     btoa: (s) => Buffer.from(s, 'binary').toString('base64'),
     atob: (s) => Buffer.from(s, 'base64').toString('binary'),
-    JSON, URL, setTimeout, Date, Object, Array, String, Math, Error,
+    JSON, URL, setTimeout, clearTimeout, clearInterval,
+    // setInterval 用 stub：真实现会保持事件循环，导致本脚本不退出
+    setInterval: () => 0,
+    Date, Object, Array, String, Math, Error, Promise, Map, Set, RegExp,
+    localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+    document: {
+      getElementById: () => null,
+      createElement: () => ({ style: {}, setAttribute() {}, appendChild() {}, addEventListener() {}, children: [] }),
+      createTextNode: () => ({}),
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      body: null, head: { appendChild() {} },
+    },
+    PointerEvent: function () {},
+    requestAnimationFrame: (fn) => setTimeout(fn, 0),
     addEventListener: () => {},
     __PK_LEO_ID: '22',
   });
