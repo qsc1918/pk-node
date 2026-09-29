@@ -205,6 +205,123 @@ const H5_INJECT = `(function () {
     });
   });
 
+  /* ==================== 原生桥模拟（关键！） ====================
+   *
+   * ## 为什么必须有这一段（2026-09-29「点 PK 没反应」的真因）
+   *
+   * PK H5 的**所有跳转**都不是页面内跳转，而是让原生开新 WebView：
+   *
+   *   useNavigation-legacy.js:
+   *     gotoPkExercisePage / gotoSchoolSeasonMatchPage / gotoPkResultPage …
+   *     -> n({ schemas: ['native://openWebView?url=...&keepScreenOn=true...'] })
+   *
+   * 这个 n 就是桥调用器（index-legacy.CHYoHfC0.js 里的 Lt），它的检测链：
+   *
+   *   const St = window;
+   *   const g = (module ? 首字母大写(module) : '') + 'WebView';  // common -> CommonWebView
+   *   if (St[g] && St[g][method])  -> St[g][method](json)         // App 里走这条
+   *   else if (St.LeoWebView && St.LeoWebView.callNative) -> callNative(...)
+   *   else -> 用隐藏 iframe 发 async:<module>_<method>:<json>    // 浏览器落到这里，无人接收
+   *
+   * 浏览器里 CommonWebView / LeoWebView 都不存在 -> 走 iframe 兜底 -> 没有原生
+   * 去处理 -> **点了完全没反应**。
+   *
+   * 所以这里把桥补上，并把 native://openWebView 转成**真实跳转**：
+   * H5 的每张页面都是独立 html（exercise.html / result.html / …），
+   * 所以「开新 WebView」在本机等价于**iframe 内导航到该 url**。
+   */
+  /* ==================== 原生桥模拟（关键） ==================== */
+  (function installBridge() {
+    function parseArgs(json) {
+      try { return typeof json === 'string' ? JSON.parse(json) : (json || {}); } catch (e) { return {}; }
+    }
+
+    /** 处理 openSchema：从 schemas 里挑第一个能认的。 */
+    function handleOpenSchema(args) {
+      var list = (args && args.schemas) || [];
+      for (var i = 0; i < list.length; i++) {
+        var s = String(list[i] || '');
+        // 注意：本段代码整体位于 Node 的模板字符串里，所以**不能用正则字面量**
+        // （斜杠与反斜杠都会被外层处理）。改用字符串拆分，零转义负担。
+        if (s.indexOf('native://openWebView?') === 0) {
+          var q = s.slice('native://openWebView?'.length);
+          var target = '';
+          var parts = q.split('&');
+          for (var j = 0; j < parts.length; j++) {
+            if (parts[j].indexOf('url=') === 0) {
+              target = decodeURIComponent(parts[j].slice(4));
+              break;
+            }
+          }
+          if (target) {
+            diag('openWebView', { url: target.slice(0, 300) });
+            // 本机把「开新 WebView」实现为 iframe 内导航（H5 每页都是独立 html）
+            location.href = target;
+            return 'OK';
+          }
+        }
+        if (s.indexOf('native://') === 0) {
+          diag('schema-other', { schema: s.slice(0, 200) });
+          return 'OK';   // 其它原生 schema（closeWebView 等）当作已处理
+        }
+      }
+      return 'OK';
+    }
+
+    var HANDLERS = {
+      openSchema: handleOpenSchema,
+      closeWebView: function () { history.back(); return 'OK'; },
+      // ⚠️ 必须提供：H5 的桥能力探测函数（qt）在 Android UA 下会检查
+      // window.CommonWebview.getWebViewInfo 是否存在；不存在就判定
+      // 「桥不支持」→ openSchema 直接被拒（点了没反应）。
+      // 版本给高值，确保通过 H5 的版本下限校验。
+      getWebViewInfo: function () { return { version: '9.9.9' }; },
+      setTitle: function () { return 'OK'; },
+      toast: function () { return 'OK'; },
+      loading: function () { return 'OK'; },
+      setOnVisibilityChange: function () { return 'OK'; },
+      jsLoadComplete: function () { return 'OK'; },
+      getImmerseStatusBarHeight: function () { return 0; },
+      login: function () { return 'OK'; },
+    };
+
+    /** 统一入口：按 method 分派，回调以 JSON 字符串形式回。 */
+    function dispatch(module, method, json, cb) {
+      var fn = HANDLERS[method];
+      var out;
+      if (!fn) {
+        diag('bridge-miss', { module: module, method: method, args: String(json).slice(0, 200) });
+        out = ['METHOD_NOT_SUPPORT'];
+      } else {
+        try { out = [null, fn(parseArgs(json))]; }
+        catch (e) { out = ['CALL_FAILED']; }
+      }
+      if (typeof cb === 'function') { try { cb(JSON.stringify(out)); } catch (e) {} }
+      return true;
+    }
+
+    /** 造一个「方法名 → 处理器」的桥对象，对齐 H5 的查找方式。 */
+    function makeBridge() {
+      var b = {
+        callNative: function (module, method, json, cb) { return dispatch(module, method, json, cb); },
+        openSchema: function (json, cb) { return dispatch('common', 'openSchema', json, cb); },
+      };
+      // H5 会先查 window[首字母大写(module)+'WebView'][method]
+      Object.keys(HANDLERS).forEach(function (m) {
+        b[m] = function (json, cb) { return dispatch('common', m, json, cb); };
+      });
+      return b;
+    }
+
+    var bridge = makeBridge();
+    // 四个名字都挂上：H5 按 module 前缀选对象名（common_ / leo_ / LeoSecure_ / 无前缀）
+    ['WebView', 'CommonWebView', 'LeoWebView', 'LeoSecureWebView', 'SolarWebViewV2',
+     'CommonWebview', 'LeoWebview'].forEach(function (name) {
+      if (!window[name]) window[name] = bridge;
+    });
+    diag('bridge-ready', { names: Object.keys(window).filter(function (k) { return /Web[vV]iew$/.test(k); }) });
+  })();
+
   function pickHost(url) {
     var low = String(url).toLowerCase();
     for (var i = 0; i < TARGET_HOSTS.length; i++) {
