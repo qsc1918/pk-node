@@ -200,7 +200,10 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
     const tMatch = Date.now();
     let tries = 0;
     for (;;) {
-      m = await leo.pkMatch(jar, cfg.pointId, anySignal({}));
+      // ★ 2026-09-30：改用 v2（原版 App 在用的接口）。
+      //   旧版 `match`（明文）风控极严；v2 返回加密响应，
+      //   由 leo.pkMatchV2 内部用 keystream 解开（与真机行为一致）。
+      m = await leo.pkMatchV2(jar, cfg.pointId, anySignal({}));
       tries++;
       if (m.status === 200 && m.json) break;
 

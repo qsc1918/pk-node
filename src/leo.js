@@ -16,6 +16,8 @@ const { URL, URLSearchParams } = require('node:url');
 const { config, PK } = require('./config');
 const { request, CookieJar } = require('./http');
 const nativeLib = require('./native');
+const zlib = require('node:zlib');
+const keystream = require('./keystream');
 
 /** 默认公共参数（顺序固定，便于比对真机抓包）。 */
 /** 主域（leo-gateway / leo-profile / leo-auth / leo-star / leo-math）用的公共参数。
@@ -191,7 +193,10 @@ function pkOpts(extra = {}) {
  */
 async function pkMatch(jar, pointId, opts) {
   const path = '/leo-game-pk/android/math/pk/match';
-  const url = buildUrl(path, { pointId: String(pointId) }, pkOpts());
+  // ★ version 必须是**主域协议版**（3.140.1）。
+  //   /leo-game-pk 不在 MAIN_DOMAIN_PREFIXES 里，buildUrl 会用 COMMON_QUERY 的
+  //   App 版 3.141.1 → solar-encoder 直接 417（2026-09-30 A/B 实测）。
+  const url = buildUrl(path, { pointId: String(pointId), version: PK.exercise.version }, pkOpts());
   const r = await request({
     url,
     method: 'POST',
@@ -206,6 +211,77 @@ async function pkMatch(jar, pointId, opts) {
     ),
   });
   return { status: r.status, json: safeJson(r.text), text: r.text, headers: r.headers };
+}
+
+/**
+ * 出题 v2：`POST /leo-game-pk/android/math/pk/match/v2?pointId=N`（**加密响应**）。
+ *
+ * ## 为什么要改成 v2（2026-09-30）
+ *
+ * 旧版 `match`（明文）风控极严、且容易被判异常；v2 是原版 App 正在用的接口，
+ * 服务端返回 `keystream XOR(gzip(json))`。真机由原生 dataDecrypt 解，
+ * 我们这里用 keystream 纯 JS 解（见 src/keystream.js，已与真机逐字节对齐）。
+ *
+ * ## 请求要点（逐行读 H5 的 exercise-legacy.C5DFMay0.js 得出）
+ *
+ *       a.post(url, null, { responseType: 'arraybuffer' })
+ *                     ^^^^ body 必须是**空**，传 {} 会被服务端判 400。
+ *
+ * ## 解密链路
+ *
+ *       body(密文) --keystream XOR--> gzip 字节 --gunzip--> 明文 JSON
+ *
+ * @returns {Promise<{status:number, json:object|null, text:string, headers:object}>}
+ */
+async function pkMatchV2(jar, pointId, opts) {
+  const path = '/leo-game-pk/android/math/pk/match/v2';
+  // ★ 同理：version 必须覆盖成协议版，否则 417。
+  const url = buildUrl(path, { pointId: String(pointId), version: PK.exercise.version }, pkOpts());
+  const r = await request({
+    url,
+    method: 'POST',
+    jar,
+    signal: opts && opts.signal,
+    rawBody: true,                       // 加密字节，别当 gzip 解码
+    headers: Object.assign(
+      {
+        'Content-Type': 'application/json',
+        Referer: config.leoBase + '/bh5/leo-web-oral-pk/exercise.html',
+      },
+      riskHeaders(),
+    ),
+  });
+  const out = decodeEncryptedResponse(r.body);
+  return {
+    status: r.status,
+    json: out ? safeJson(out.toString('utf8')) : safeJson(r.text),
+    text: out ? out.toString('utf8') : r.text,
+    headers: r.headers,
+    encrypted: r.body,
+  };
+}
+
+/**
+ * 解密「加密响应」：密文 -> keystream XOR -> gunzip -> JSON 字节。
+ *
+ * 与 pk-h5-proxy 的 decodeEncrypted 同一套逻辑（那边服务 H5，这边服务刷局引擎）。
+ * 保持两份是因为模块职责不同；若改动务必同步。
+ *
+ * @param {Buffer} buf
+ * @returns {Buffer|null} 明文；不是密文时返回 null
+ */
+function decodeEncryptedResponse(buf) {
+  if (!buf || buf.length < 2) return null;
+  if (buf[0] === 0x7b || buf[0] === 0x5b) return null;   // 已是 JSON
+  if (buf[0] === 0x1f && buf[1] === 0x8b) return null;   // 真 gzip
+  if (!keystream.available()) return null;
+  let dec;
+  try { dec = keystream.xorEncode(buf); } catch (e) { return null; }
+  if (dec[0] === 0x1f && dec[1] === 0x8b) {
+    try { return zlib.gunzipSync(dec); } catch (e) { return null; }
+  }
+  if (dec[0] === 0x7b) return dec;
+  return null;
 }
 
 /**
@@ -462,6 +538,8 @@ module.exports = {
   sw8Header,
   randomTraceId,
   pkMatch,
+  pkMatchV2,
+  decodeEncryptedResponse,
   pkSubmitRaw,
   pkSubmit,
   pkHistoryDetail,

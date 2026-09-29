@@ -31,10 +31,14 @@
 // 本机路径统一为 `/pk-h5/assets/xxx.js`；其它 CDN 目录（`leo-common-bundle`）
 // 走 `/pk-h5/<相对路径>`。
 
+const fs = require('node:fs');
+const path = require('node:path');
 const https = require('node:https');
 const http = require('node:http');
 const { URL } = require('node:url');
 
+const zlib = require('node:zlib');
+const keystream = require('./keystream');
 const { config, PK } = require('./config');
 const leo = require('./leo');
 const { request } = require('./http');
@@ -846,6 +850,8 @@ const H5_INJECT = `(function () {
     // 首屏 + 稍后各抓一次（H5 是异步渲染）
     setTimeout(function () { dump('t2.5s'); }, 2500);
     setTimeout(function () { dump('t7s'); }, 7000);
+    setTimeout(function () { dump('t15s'); }, 15000);
+    setTimeout(function () { dump('t25s'); }, 25000);
   })();
 
   window.__pkH5Hook = { version: 2, local: LOCAL, hosts: TARGET_HOSTS };
@@ -935,6 +941,9 @@ function rewriteHtml(html, opts) {
 let fetchUserInfo = null;
 function setUserInfoProvider(fn) { fetchUserInfo = fn; }
 
+/** 调试用：match/v2 原始响应只 dump 一次。 */
+let dumpCount = 0;
+
 /**
  * 处理 `/pk-h5/*` 与 `/pk-h5-cdn/*`：把 CDN 资产（含 HTML）透传给浏览器。
  *
@@ -998,6 +1007,51 @@ async function serve(req, res, u) {
   });
   res.end(body);
   return true;
+}
+
+/** 服务端日志小工具（解密/代理的可观测性）。 */
+function diagLog(tag, msg) { console.log('[pk-h5:' + tag + '] ' + msg); }
+
+/* ------------------------------ 响应解密 ------------------------------ */
+
+/**
+ * 解密主域的「加密响应」（arraybuffer 接口专用）。
+ *
+ * ## 链路（2026-09-30 用 MT MCP + H5 源码 + 真机密文三方确证）
+ *
+ *   密文 --keystream XOR--> gzip 字节 --gunzip--> 明文 JSON
+ *
+ * 证据：
+ *  1. H5 侧（exercise-legacy.C5DFMay0.js）：
+ *       getPkExerciseQuestionV2: a.post(url, null, { responseType: "arraybuffer" })
+ *     -> 响应是二进制密文，需解密。
+ *  2. MT MCP 反汇编 libContentEncoder.so 的 imports：
+ *       只有 rand/malloc/memcpy/memset/memcmp… **没有任何密码学原语**（无 AES/SHA）
+ *     -> 只可能是「固定密钥流 XOR」。
+ *  3. 真机密文实测（659B）：XOR 后首字节 1f 8b 08（gzip magic），
+ *     gunzip 得 6103B 明文 JSON（含 pkIdStr / otherUser / examVO.questions）。
+ *
+ * 所以代理侧不再把密文转给 H5，而是自己解开回明文 JSON。
+ *
+ * @param {Buffer} buf 响应原始字节
+ * @returns {Buffer|null} 明文 JSON 字节；不像密文时返回 null（调用方原样转发）
+ */
+function decodeEncrypted(buf) {
+  if (!buf || buf.length < 2) return null;
+  // 已经是明文 JSON/数组 -> 不动
+  if (buf[0] === 0x7b || buf[0] === 0x5b) return null;
+  // 真 gzip（服务端普通压缩）-> 交给 http 层处理，不在这里解
+  if (buf[0] === 0x1f && buf[1] === 0x8b) return null;
+  if (!keystream.available()) return null;
+  let dec;
+  try { dec = keystream.xorEncode(buf); } catch (e) { return null; }
+  // XOR 后应是 gzip
+  if (dec[0] === 0x1f && dec[1] === 0x8b) {
+    try { return zlib.gunzipSync(dec); } catch (e) { return null; }
+  }
+  // 少数接口 XOR 后直接是 JSON（无 gzip）
+  if (dec[0] === 0x7b) return dec;
+  return null;
 }
 
 /* ------------------------------ API 代理 ------------------------------ */
@@ -1076,6 +1130,19 @@ async function proxyApi(req, res, u, ctx) {
     //   —— 用 131 会被判为另一个产品线。`leo.buildUrl` 里业务参数优先级最高，
     //   不覆盖就会被 H5 的 131 冲掉。这里显式覆盖。
     if (isPk) {
+      // ★★ 必须**同时**覆盖 H5 自己拼上去的 `_appId=601`（2026-09-30 实测）
+      //
+      //  H5 因为 UA 是「小猿口算 App」，走了 App 分支：
+      //    productId = 611（App）→ appId = 601（App 端）
+      //  于是它发出 `?pointId=…&_productId=631&_appId=601&version=3.141.1`。
+      //
+      //  后果很隐蔽：服务端**返回 200，但响应体被加密**（683 字节乱码）。
+      //  这是因为 App 端的响应会走 content-encoder，客户端（原生）负责解密；
+      //  而我们是浏览器/Node，没有解密能力 → H5 拿到密文解析失败 →
+      //  界面永远卡在「匹配中」（快照里 matching 浮层 t7s/t15s/t25s 一直在）。
+      //
+      //  改成 `_appId=6`（H5 网页端）后，服务端按明文的普通 HTTP 响应返回。
+      //  这跟 `_productId=631` 是同一个道理：把 H5 的 App 分支参数纠正成网页分支。
       query._productId = '631';
       query._appId = '6';
     }
@@ -1086,6 +1153,15 @@ async function proxyApi(req, res, u, ctx) {
     //     version=3.140.1（主域协议版本）          → 200 正常返回 banner
     //   与 pk-node 早先在练习/主域上踩到的是**同一个坑**：solar-encoder 认的是
     //   协议版本，不是 App 版本。H5 不知道这件事，所以必须在代理侧纠正。
+    // ★★ 强制覆盖（2026-09-30 实测确认这是「现场太火爆 / 请求过于频繁」的诱因之一）
+    //
+    //  H5 因为 UA 走了 App 分支，会拼出 `_productId=631&_appId=601&version=3.141.1`。
+    //  而 `_appId=601` 让服务端按**App 端**处理（响应加密 + 更严的风控），
+    //  `version=3.141.1` 也不是主域协议版。两者都必须纠正。
+    //
+    //  ⚠️ 注意 buildUrl 的语义：**业务参数（params）最后设置、优先级最高**，
+    //  所以只改 query 再交给 buildUrl 是**无效的**（会被 params 冲掉）。
+    //  这里必须同时改 query（给 buildUrl 用）与 opts，才能真覆盖。
     query.version = PK.exercise.version;
     realUrl = leo.buildUrl(pathOnly, query, {
       // PK 路由用 631 + _appId=6；其余（含 solar）走默认 611。
@@ -1113,6 +1189,9 @@ async function proxyApi(req, res, u, ctx) {
   }
 
   try {
+    // 审计用：把最终 query 打出来（排查参数是否被正确覆盖）
+    let finalQuery = '';
+    try { finalQuery = String(realUrl).split('?')[1] || ''; } catch (e) { /* ignore */ }
     const r = await request({
       url: realUrl,
       method: method,
@@ -1127,14 +1206,50 @@ async function proxyApi(req, res, u, ctx) {
       'Cache-Control': 'no-store',
       'Access-Control-Allow-Origin': '*',
     };
-    const outBody = Buffer.from(r.text || '', 'utf8');
+    // ★ 二进制安全 + 自动解密（2026-09-30 实测通过）。
+    //
+    //  match/v2 这类 `responseType: arraybuffer` 接口，服务端返回的是
+    //  「keystream XOR(gzip(json))」的密文。真机由原生 dataDecrypt 解；
+    //  我们在代理侧用 keystream 直接解开，回给 H5 **明文 JSON**，
+    //  H5 的 axios 仍按 arraybuffer 收，但内容是 JSON 文本，能正常 parse。
+    const rawBody = (r.body && r.body.length) ? r.body : Buffer.from(r.text || '', 'utf8');
+    const decrypted = decodeEncrypted(rawBody);
+    if (decrypted) {
+      diagLog('decrypt', pathOnly + ' ' + rawBody.length + 'B → ' + decrypted.length + 'B');
+    }
+    const outBody = decrypted || rawBody;
     outHeaders['Content-Length'] = outBody.length;
     res.writeHead(r.status, outHeaders);
     res.end(outBody);
 
-    // 审计：把「H5 打了什么、真实 URL 是什么、结果如何」记下来，便于定位 417
-    console.log('[pk-h5] ' + method + ' ' + host + pathOnly +
-      ' → HTTP ' + r.status + (r.status !== 200 ? ' body=' + String(r.text || '').slice(0, 200) : ''));
+    // ★ 调试：把 match/v2 这类「响应可能是加密的」原始字节 dump 到文件，
+    //   便于离线分析（keystream XOR 是否可解、是否有长度头/gzip）。
+    //   只在 PK_H5_DUMP_DIR 指定时做，且只 dump 一次（避免刷爆磁盘）。
+    if (process.env.PK_H5_DUMP_DIR && /match|v2|submit/.test(pathOnly) && dumpCount < 5) {
+      try {
+        const raw = r.rawBody;                // http.js 在 rawBody=true 时保留的未解压字节
+        const buf = raw && raw.length ? raw : outBody;
+        fs.mkdirSync(process.env.PK_H5_DUMP_DIR, { recursive: true });
+        const f = path.join(process.env.PK_H5_DUMP_DIR,
+          'v2_' + Date.now() + '_' + pathOnly.replace(/[^a-z0-9]/gi, '_') + '.bin');
+        fs.writeFileSync(f, buf);
+        dumpCount++;
+        console.log('[pk-h5] dump → ' + f + ' (' + buf.length + 'B) hex=' + buf.slice(0, 48).toString('hex'));
+      } catch (e) { console.log('[pk-h5] dump 失败：' + e.message); }
+    }
+
+    // 审计：把「H5 打了什么、真实 URL 是什么、结果如何」记下来，便于定位 417。
+    //
+    // 2026-09-30：以前只在非 200 时记 body，导致「200 但内容不对」这类问题
+    // 完全看不到（例如 match/v2 返回 200 却没有对局信息 → H5 一直「匹配中」）。
+    // 现在 **200 也记 body 摘要**，需要时还能开 PK_H5_LOG_FULL_BODY 记全量。
+    const bodyLog = String(r.text || '');
+    const showBody = r.status !== 200
+      ? bodyLog.slice(0, 300)
+      : (process.env.PK_H5_LOG_FULL_BODY === '1' ? bodyLog.slice(0, 1200) : bodyLog.slice(0, 300));
+    console.log('[pk-h5] ' + method + ' ' + host + pathOnly + ' ?' + finalQuery +
+      ' → HTTP ' + r.status + ' len=' + bodyLog.length +
+      ' body=' + showBody.replace(/\n/g, ' '));
   } catch (e) {
     res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ ok: false, message: '代理失败：' + e.message }));
