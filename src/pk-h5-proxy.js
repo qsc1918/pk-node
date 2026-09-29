@@ -196,6 +196,36 @@ const H5_INJECT = `(function () {
     } catch (e) { diag('storage-preset-err', { msg: String(e && e.message) }); }
   })();
 
+  /* ---- 点击链路诊断：定位「点了有反馈但不跳转」到底断在哪一环 ---- */
+  //
+  // 2026-09-29：用户报「点按钮有反馈但不跳转」。已知 API 全 200、桥已挂载，
+  // 但日志里**没有 openWebView / schema-other** → 断点在「点击 → 桥调用」之间。
+  //
+  // 这里在 document 上用**捕获阶段**监听全部 click（这样能先于 Vue 的处理跑），
+  // 把命中的元素文案/class 回传；同时监听 hashchange（H5 是 SPA，跳转必然是 hash）。
+  (function installClickDiag() {
+    try {
+      document.addEventListener('click', function (ev) {
+        try {
+          var el = ev.target;
+          var chain = [];
+          for (var i = 0; el && i < 5; i++, el = el.parentElement) {
+            chain.push((el.tagName || '?') + '.' + (el.className || ''));
+          }
+          diag('click', {
+            x: ev.clientX, y: ev.clientY,
+            chain: chain.join(' < '),
+            text: (ev.target && ev.target.textContent || '').slice(0, 40)
+          });
+        } catch (e) {}
+      }, true);
+
+      window.addEventListener('hashchange', function () {
+        diag('hash', { hash: location.hash });
+      });
+    } catch (e) { diag('click-diag-err', { msg: String(e && e.message) }); }
+  })();
+
   /* ---- 诊断上报：把页面里的异常与请求结果回传本机，便于无头排查 ---- */
   function diag(kind, data) {
     try {
@@ -262,8 +292,68 @@ const H5_INJECT = `(function () {
    */
   /* ==================== 原生桥模拟（关键） ==================== */
   (function installBridge() {
-    function parseArgs(json) {
-      try { return typeof json === 'string' ? JSON.parse(json) : (json || {}); } catch (e) { return {}; }
+    /* ---- H5 桥协议（逐行读 index-legacy.CHYoHfC0.js 得出，2026-09-29）----
+     *
+     * 调用（两条路径，payload 都是 base64）：
+     *   A) window.CommonWebView.<method>(payloadB64)
+     *   B) window.LeoWebView.callNative(payloadB64)      payload = {method:'common_xxx', params:{...}}
+     *
+     *   payload 解开后形如：
+     *     { arguments: [ { trigger: 'getWebViewInfo_<ts>_<n>', ...业务参数 } ],
+     *       callback:  '<method>_callback_<ts>_<n>' }
+     *
+     *   —— H5 传 trigger 时**不会**注册 callback（源码里 d = !(i||a) && u），
+     *      所以必须用 trigger 当回调方法名。
+     *
+     * 回调（关键，之前就是这里写错了）：
+     *     window[<trigger 或 callback>]( base64( JSON.stringify([err, ...data]) ) )
+     *     err === null 表示成功。
+     *
+     *   源码依据：
+     *     Nt = window
+     *     Nt[t] = function (t) { e.apply(null, t ? JSON.parse(pt(t)) : [null]) }
+     *     pt = t => new Buffer(t, 'base64').toString()
+     *
+     *   ★ 旧实现直接 cb(JSON.stringify(out)) —— 既没走 window[trigger]、
+     *     也不是 base64，所以 Promise 永不 resolve → 点击静默无反应。
+     */
+    function b64decode(s) {
+      var t = String(s).replace(/-/g, '+').replace(/_/g, '/').replace(/[^A-Za-z0-9+/=]/g, '');
+      try { return decodeURIComponent(escape(atob(t))); }
+      catch (e) { try { return atob(t); } catch (e2) { return ''; } }
+    }
+    function b64encode(s) {
+      try { return btoa(unescape(encodeURIComponent(String(s)))); } catch (e) { return ''; }
+    }
+
+    /** 解析 payload，取出业务参数与回调方法名。 */
+    function parsePayload(raw) {
+      var obj = null;
+      if (typeof raw === 'string') {
+        var txt = b64decode(raw);
+        try { obj = JSON.parse(txt); } catch (e) { obj = null; }
+        if (!obj) { try { obj = JSON.parse(raw); } catch (e2) { obj = null; } }  // 兼容裸 JSON
+      } else if (raw && typeof raw === 'object') {
+        obj = raw;
+      }
+      if (!obj) return { args: {}, cbName: null, rawObj: null };
+      var h = (obj.arguments && obj.arguments[0]) || obj.params || {};
+      var cb = h.trigger || obj.callback || (typeof obj.callback === 'string' ? obj.callback : null);
+      if (typeof cb !== 'string' || !cb) cb = null;
+      return { args: h, cbName: cb, rawObj: obj };
+    }
+
+    /** 把结果按 H5 的协议回给页面：window[cbName](base64([err, ...data]))。 */
+    function reply(p, out) {
+      if (!p.cbName) return;
+      var s = b64encode(JSON.stringify(out));
+      var f = window[p.cbName];
+      if (typeof f === 'function') {
+        try { f(s); diag('bridge-reply', { cb: p.cbName, out: JSON.stringify(out).slice(0, 160) }); }
+        catch (e) { diag('bridge-reply-err', { cb: p.cbName, msg: String(e && e.message) }); }
+      } else {
+        diag('bridge-reply-miss', { cb: p.cbName });
+      }
     }
 
     /** 处理 openSchema：从 schemas 里挑第一个能认的。 */
@@ -300,54 +390,93 @@ const H5_INJECT = `(function () {
 
     var HANDLERS = {
       openSchema: handleOpenSchema,
+      // H5 的跳转既可能发 openSchema（schemas 数组），也可能直接发 openWebView。
+      // 两条都接住，避免漏一种写法。
+      openWebView: function (args) { return handleOpenSchema({ schemas: ['native://openWebView?' + (args && args.url ? 'url=' + encodeURIComponent(args.url) : '')] }); },
       closeWebView: function () { history.back(); return 'OK'; },
-      // ⚠️ 必须提供：H5 的桥能力探测函数（qt）在 Android UA 下会检查
-      // window.CommonWebview.getWebViewInfo 是否存在；不存在就判定
-      // 「桥不支持」→ openSchema 直接被拒（点了没反应）。
-      // 版本给高值，确保通过 H5 的版本下限校验。
-      getWebViewInfo: function () { return { version: '9.9.9' }; },
+      getWebViewInfo: function () { return { version: BRIDGE_VERSION, platform: 'android' }; },
       setTitle: function () { return 'OK'; },
       toast: function () { return 'OK'; },
       loading: function () { return 'OK'; },
       setOnVisibilityChange: function () { return 'OK'; },
       jsLoadComplete: function () { return 'OK'; },
       getImmerseStatusBarHeight: function () { return 0; },
+      getDeviceInfo: function () { return { platform: 'android', appVersion: BRIDGE_VERSION }; },
+      // H5 头像 / 胜场 / 昵称的**首选来源**就是这里。
+      // 不实现的话 H5 只能等服务端接口兜底 —— 表现就是
+      // 「头像要切换年级后才显示、胜场显示 0」。数据由 Node 侧注入 window.__PK_USER。
+      getUserInfo: function () { return window.__PK_USER || {}; },
       login: function () { return 'OK'; },
-      // octopus 埋点 SDK 的配置读取；不存在会打印 bridge-miss（不阻塞业务，
-      // 但会把日志搞脏）。返回空配置即可。
+      // octopus 埋点 SDK 的配置读取。必须回，否则日志被 bridge-miss 刷屏。
       leo_getOrionConfig: function () { return {}; },
     };
 
-    /** 统一入口：按 method 分派，回调以 JSON 字符串形式回。 */
-    function dispatch(module, method, json, cb) {
+    /** 缺省处理器：不认识的桥方法统一回「不支持」，并按协议回 trigger。
+     *  —— 关键是**一定要回调**，否则 H5 侧 Promise 永久挂起，整条链路卡死。 */
+    var MSG_METHOD_NOT_SUPPORT = 'METHOD_NOT_SUPPORT';
+
+    /** 统一入口：按 method 分派，并按 H5 协议回调。 */
+    function dispatch(module, method, raw) {
+      var p = parsePayload(raw);
+      // ★ 每个桥调用都回传 —— 点击链路的「最后一米」就是这里。
+      diag('bridge-call', { module: module, method: method, cb: p.cbName, args: JSON.stringify(p.args).slice(0, 240) });
+
       var fn = HANDLERS[method];
       var out;
       if (!fn) {
-        diag('bridge-miss', { module: module, method: method, args: String(json).slice(0, 200) });
-        out = ['METHOD_NOT_SUPPORT'];
+        diag('bridge-miss', { module: module, method: method });
+        out = [MSG_METHOD_NOT_SUPPORT];
       } else {
-        try { out = [null, fn(parseArgs(json))]; }
-        catch (e) { out = ['CALL_FAILED']; }
+        // 业务参数 = arguments[0]（去掉 trigger/shareTrigger/callback 这些控制字段）
+        var a = {};
+        Object.keys(p.args || {}).forEach(function (k) {
+          if (k !== 'trigger' && k !== 'shareTrigger' && k !== 'callback') a[k] = p.args[k];
+        });
+        try { out = [null, fn(a, p)]; }
+        catch (e) { out = ['CALL_FAILED', String(e && e.message)]; }
       }
-      if (typeof cb === 'function') { try { cb(JSON.stringify(out)); } catch (e) {} }
+      reply(p, out);
       return true;
     }
 
-    /** 造一个「方法名 → 处理器」的桥对象，对齐 H5 的查找方式。 */
+    /** 造一个「方法名 → 处理器」的桥对象，对齐 H5 的查找方式。
+     *
+     *  H5 的 Lt 会先试 window[首字母大写(module)+'WebView'][method](payload)，
+     *  再试 window.LeoWebView.callNative(payload)；两种入参都只有**一个** base64 串。
+     */
     function makeBridge() {
+      function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
+      function moduleOf(payload) {
+        var p = parsePayload(payload);
+        var m = (p.rawObj && p.rawObj.method) || '';
+        var i = m.indexOf('_');
+        return i > 0 ? m.slice(0, i) : '';
+      }
       var b = {
-        callNative: function (module, method, json, cb) { return dispatch(module, method, json, cb); },
-        openSchema: function (json, cb) { return dispatch('common', 'openSchema', json, cb); },
+        // 路径 B：payload = { method: 'common_openWebView', params: {...} }
+        callNative: function (payload) {
+          var p = parsePayload(payload);
+          var m = (p.rawObj && p.rawObj.method) || '';
+          var i = m.indexOf('_');
+          var mod = i > 0 ? m.slice(0, i) : '';
+          var met = i > 0 ? m.slice(i + 1) : m;
+          return dispatch(mod, met, payload);
+        },
       };
-      // H5 会先查 window[首字母大写(module)+'WebView'][method]
+      // 路径 A：window.CommonWebView[method](payload) —— method 名即 key
       Object.keys(HANDLERS).forEach(function (m) {
-        b[m] = function (json, cb) { return dispatch('common', m, json, cb); };
+        b[m] = function (payload) { return dispatch(moduleOf(payload) || 'common', m, payload); };
       });
       return b;
     }
 
+    // ★ getWebViewInfo 的版本必须过 H5 的版本下限（源码 X(l, n) < 0 则判不支持）。
+    //   H5 取的 exceptedVersion（Gt）来自 UA 里的 App 版本；我们 UA 没后缀，
+    //   所以给一个足够高的值即可。
+    var BRIDGE_VERSION = '9.9.9';
+
     var bridge = makeBridge();
-    // 四个名字都挂上：H5 按 module 前缀选对象名（common_ / leo_ / LeoSecure_ / 无前缀）
+    // 名字都挂上：H5 按 module 前缀选对象名（common→CommonWebView / leo→LeoWebView …）
     ['WebView', 'CommonWebView', 'LeoWebView', 'LeoSecureWebView', 'SolarWebViewV2',
      'CommonWebview', 'LeoWebview'].forEach(function (name) {
       if (!window[name]) window[name] = bridge;
