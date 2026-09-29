@@ -202,6 +202,21 @@ try {
   }
   console.log('✓ 外部 H5 折回同源:', captured.href.slice(0, 80));
 
+  // (c2) ★ requestConfig：H5 在 App UA 下靠它替换 {client}（2026-09-30 真 bug）
+  //      走 LeoSecure 模块。回 { wrappedUrl } 才行，回 METHOD_NOT_SUPPORT
+  //      会让 H5 用**原样 URL**（含 %7Bclient%7D）→ 所有接口 404。
+  let rcOut = null;
+  ctx.requestConfig_11_12 = (b64Result) => { rcOut = JSON.parse(unb64(b64Result)); };
+  ctx.LeoSecureWebView.callNative(b64(JSON.stringify({
+    method: 'LeoSecure_requestConfig',
+    params: { path: '/leo-game-pk/{client}/math/pk/home', trigger: 'requestConfig_11_12' },
+  })));
+  if (!rcOut || rcOut[0] !== null || !rcOut[1] || rcOut[1].wrappedUrl !== '/leo-game-pk/api/math/pk/home') {
+    console.error('✗ requestConfig 未替换 {client}，得到:', JSON.stringify(rcOut));
+    process.exit(1);
+  }
+  console.log('✓ requestConfig 替换 {client} →', rcOut[1].wrappedUrl);
+
   // (c) 未知方法也必须回调（否则 Promise 挂起，整条链路卡死）。
   //     注意：H5 的路径 A 是 `St[g] && St[g][method]` —— 方法不在对象上时它会
   //     fallback 到 LeoWebView.callNative，所以未知方法走的是路径 B。

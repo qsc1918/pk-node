@@ -165,6 +165,8 @@ function normalizeContentType(ct, pathname) {
 const H5_INJECT = `(function () {
   var TARGET_HOSTS = ['xyks.yuanfudao.com', 'xyst.yuanfudao.com', 'ape-api.yuanfudao.com', 'oapi.yuanfudao.com', 'ytk.yuanfudao.com'];
   var LOCAL = '/api/pk/h5/api';
+  // 稳定的伪设备 id：同一会话内必须一致，否则 H5 会反复重渲染（表现是界面抖/闪）。
+  var DEVICE_ID = 'pknode-' + Math.random().toString(36).slice(2, 10);
 
   /* ---- 伪装成小猿 App 的 WebView UA（2026-09-30）----
    *
@@ -587,6 +589,54 @@ const H5_INJECT = `(function () {
       getOrionConfig: function () { return {}; },
       leo_getOrionConfig: function () { return {}; },
       leoGetOrionConfig: function () { return {}; },
+
+      // ★★ requestConfig（LeoSecure 模块）—— 2026-09-30 的又一个真 bug
+      //
+      // H5 的 URL 模板替换器（request-legacy 里的 L）：
+      //   if (isAppUA && version>=3.42.0 && url 含 {client}/{device})
+      //     h("requestConfig", { path: url, trigger: (n, r) => t(n && 0!==n ? url : r.wrappedUrl) }, "LeoSecure");
+      //   else if (url 含 {client}) t(url.replace("{client}","api"));   // 浏览器兜底
+      //
+      // 我们为了显示「8人PK」加了 UA patch（UA 现在含 YuanSouTiKouSuan）→
+      // isAppUA 变真 → H5 **改走原生桥**，而当时桥里没有 requestConfig →
+      // 回 METHOD_NOT_SUPPORT → n 非 0 → 返回**原样 URL**（含 %7Bclient%7D）
+      // → 所有接口 404（日志里一批 /leo-game-pk/%7Bclient%7D/... ）。
+      //
+      // 正确实现：把 {client}/{device} 替换成 "api"，回 { wrappedUrl }。
+      requestConfig: function (a) {
+        var u = (a && a.path) || '';
+        var w = u.split('{device}').join('api').split('{client}').join('api');
+        diag('requestConfig', { in: u.slice(0, 160), out: w.slice(0, 160) });
+        return { wrappedUrl: w };
+      },
+
+      /* ---- 其余「有返回值」的桥方法 ----
+       *
+       * 2026-09-30 用 bridge-miss 统计驱动补齐（数字为实测调用次数）：
+       *   leo/addFrog 145 · LeoSecure/requestConfig 87 · leo/getFeatureConfig 21
+       *   leo/getDeviceId 12 · refreshStateView 12 · common/setLeftButton 11
+       *   leo/setForceBounceEnable 11 · leo/getFireworkConfig 11
+       *   leo/ShowPracticeDialogIfNeeded 11 · PKArena/observeTabChange 11
+       *
+       * 这些**不阻塞主流程**，但返回值不对会让 H5 走异常分支或反复重试，
+       * 副作用就是「页面抖/闪」。给合理的缺省值即可。
+       */
+
+      // 埋点上报（H5 用它记 request 日志）。无返回值，回 'OK'。
+      addFrog: function () { return 'OK'; },
+      // 配置中心（走后端接口，见 feature-legacy）。返回空配置。
+      getFeatureConfig: function () { return null; },
+      // 设备标识：给一个稳定的伪 id（同一会话内一致，避免反复变化触发重渲染）。
+      getDeviceId: function () { return { deviceId: DEVICE_ID }; },
+      // 状态栏/导航栏：返回空对象即可（我们不用原生壳）。
+      refreshStateView: function () { return 'OK'; },
+      setLeftButton: function () { return 'OK'; },
+      setForceBounceEnable: function () { return 'OK'; },
+      getFireworkConfig: function () { return null; },
+      ShowPracticeDialogIfNeeded: function () { return 'OK'; },
+      observeTabChange: function () { return 'OK'; },
+      // 抗沉迷查询（H5 用它决定要不要弹限制）。返回「无限制」。
+      queryAntiAddiction: function () { return { status: 0 }; },
     };
 
     /** 缺省处理器：不认识的桥方法统一回「不支持」，并按协议回 trigger。
