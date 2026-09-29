@@ -787,6 +787,14 @@ function safeParse(s) {
 /* ------------------------------ 服务器 ------------------------------ */
 
 const server = http.createServer(async (req, res) => {
+  // ★ 全量访问日志（2026-09-30）：定位「浏览器没到服务端」类问题。
+  // 只打印非静态资源的关键路径，避免刷屏。
+  try {
+    const _p = String(req.url || '');
+    if (_p.indexOf('/pk-h5') === 0 || _p.indexOf('/pk-h5-cdn') === 0 || _p.indexOf('/api/pk') === 0) {
+      console.log('[http] ' + req.method + ' ' + _p.slice(0, 200));
+    }
+  } catch (e) { /* ignore */ }
   let u;
   try {
     u = new URL(req.url, 'http://' + (req.headers.host || '127.0.0.1'));

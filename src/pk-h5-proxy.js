@@ -759,8 +759,14 @@ const H5_INJECT = `(function () {
   function pickHost(url) {
     var low = String(url).toLowerCase();
     // 通配：抓出 URL 里的 host 再判断（不再依赖硬编码列表）
-    var m = low.match(/^https?:\/\/([^\/]+)/);
-    if (m && pkIsAllowedHost(m[1].split(':')[0])) return m[1].split(':')[0];
+    // 注意：本段在 Node 模板字符串里，**绝不能用正则字面量**（斜杠会被外层吞掉；
+    // 曾经造成 /^https?://([^/]+)/ 提前闭合 → 整段 hook 语法错误、页面无任何上报）。
+    // 改用字符串拆分，零转义负担。
+    var mHost = '';
+    if (low.indexOf('http://') === 0) mHost = low.slice(7);
+    else if (low.indexOf('https://') === 0) mHost = low.slice(8);
+    if (mHost) mHost = mHost.split('/')[0].split('?')[0];
+    if (mHost && pkIsAllowedHost(mHost.split(':')[0])) return mHost.split(':')[0];
     // 兜底：命中列表里的任意一项也算（相对路径场景）
     for (var i = 0; i < TARGET_HOSTS.length; i++) {
       if (low.indexOf(TARGET_HOSTS[i]) >= 0) return TARGET_HOSTS[i];
@@ -898,6 +904,43 @@ const H5_INJECT = `(function () {
     setTimeout(function () { dump('t7s'); }, 7000);
     setTimeout(function () { dump('t15s'); }, 15000);
     setTimeout(function () { dump('t25s'); }, 25000);
+  })();
+
+  /* ---- console / 错误回传（console-hook）----
+   *
+   * 背景（2026-09-30）：H5 的登录态是
+   *   const r = await $t('getUserInfo')
+   *   isLogin = true; userId = r[0].userId
+   * 而 H5 里有现成的调试输出：
+   *   console.log('>>>>>>>>>最终结果', err, extData)
+   * 但我们看不到浏览器控制台，所以把 console.log / 未捕获错误
+   * 一并回传到 /api/pk/h5/diag —— 这样 H5 的内部状态就可见了。
+   */
+  (function consoleHook() {
+    try {
+      var _log = console.log, _err = console.error, _warn = console.warn;
+      function wrap(orig, tag) {
+        return function () {
+          try {
+            var a = Array.prototype.slice.call(arguments).map(function (x) {
+              if (typeof x === 'string') return x;
+              try { return JSON.stringify(x); } catch (e) { return String(x); }
+            }).join(' ').slice(0, 300);
+            diag('console', { lv: tag, msg: a });
+          } catch (e) { /* ignore */ }
+          return orig.apply(console, arguments);
+        };
+      }
+      console.log = wrap(_log, 'log');
+      console.error = wrap(_err, 'error');
+      console.warn = wrap(_warn, 'warn');
+      window.addEventListener('error', function (ev) {
+        try { diag('js-error', { msg: String(ev && ev.message).slice(0, 220), src: String(ev && ev.filename).slice(0, 120) }); } catch (e) {}
+      });
+      window.addEventListener('unhandledrejection', function (ev) {
+        try { var r = ev && ev.reason; diag('js-rejection', { msg: String(r && (r.message || r)).slice(0, 220) }); } catch (e) {}
+      });
+    } catch (e) { /* ignore */ }
   })();
 
   /* ---- ArrayBuffer 响应 → 解析成对象（2026-09-30 关键补丁）----
@@ -1113,7 +1156,12 @@ async function serve(req, res, u) {
     'Content-Type': contentType + (contentType.indexOf('text/') === 0 || contentType.indexOf('javascript') >= 0 || contentType.indexOf('json') >= 0 ? '; charset=utf-8' : ''),
     'Content-Length': body.length,
     // HTML 不缓存（便于跟随上游升级）；资产短缓存
-    'Cache-Control': cdnUrl.endsWith('.html') ? 'no-store' : 'public, max-age=600',
+    // ★ 全部禁缓存（2026-09-30）：H5 的 HTML 里内联了我们的 hook，
+    // 一旦浏览器吃缓存就会加载到「没有 hook 的旧页面」——
+    // 表现是页面退回最初模样、且服务端看不到任何 diag 上报。
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
+    Pragma: 'no-cache',
+    Expires: '0',
     'Access-Control-Allow-Origin': '*',
   });
   res.end(body);

@@ -236,4 +236,41 @@ try {
   process.exit(1);
 }
 
+// --- 6) ★ 模板渲染检查（2026-09-30 新增，这次事故的直接产物）---
+//
+// ## 为什么必须做（血的教训）
+//
+// 上面第 3 步的 `new vm.Script(code)` 检查的是**源码文本**。而 `code` 是
+// 模板字符串里的字面内容 —— 在源码里写 `\/` 是**合法**的 JS，
+// 但模板字符串求值时 `\/` 会变成 `/`，**服务端真正吐给浏览器的 JS 就坏了**：
+//
+//     var m = low.match(/^https?:\/\/([^\/]+)/);   ← 源码（合法）
+//     var m = low.match(/^https?://([^/]+)/);      ← 实际输出（语法错误！）
+//
+// 结果是**整段 hook 在浏览器里一行都不执行**：没有桥、没有 XHR 改写、
+// 没有 diag 上报 —— 现象就是「页面变回最初的模样、且服务端看不到任何日志」，
+// 极难从表象定位。
+//
+// 所以这一步直接**跑真实的模板求值**，再对结果做语法检查。
+// ---
+try {
+  const tplStart = start + 'const H5_INJECT = '.length;   // 含反引号
+  const render = new Function('return ' + src.slice(tplStart, end + 1) + ';');
+  const rendered = render();
+  new vm.Script(rendered, { filename: 'H5_INJECT.rendered.js' });
+  console.log('✓ 模板渲染后语法通过（' + rendered.length + ' 字节）');
+
+  // 顺手断言：输出里不应再残留 `\/`（说明有人又写了正则字面量转义）
+  if (rendered.indexOf('\\/') >= 0) {
+    const at = rendered.indexOf('\\/');
+    console.error('✗ 渲染结果里残留 \\/ —— 可能有正则字面量被外层模板破坏：');
+    console.error('   …' + rendered.slice(Math.max(0, at - 60), at + 60) + '…');
+    process.exit(1);
+  }
+  console.log('✓ 渲染结果无残留 \\/');
+} catch (e) {
+  console.error('✗ 模板渲染后语法错误（浏览器里整段 hook 会失效！）:', e.message);
+  process.exit(1);
+}
+
 console.log('\n全部通过 ✅');
