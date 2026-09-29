@@ -761,6 +761,11 @@ const H5_INJECT = `(function () {
         return nodeDecrypt(b64).then(function (plainB64) {
           if (!plainB64) return { __pkOut: ['DECRYPT_FAILED'] };
           diag('dataDecrypt', { inB64: b64.length, outB64: plainB64.length });
+          // 顺手把 pkIdStr 记下（结算页要用）
+          try {
+            var j = JSON.parse(atob(plainB64));
+            if (j && j.pkIdStr) window.__pkBotSetPkId(j.pkIdStr);
+          } catch (e) { /* ignore */ }
           // 真机桥回的是 { result: <base64 明文> }（H5 读 res.result 再 Base64.decode）
           return { __pkOut: [null, { result: plainB64 }] };
         });
@@ -1170,6 +1175,11 @@ const H5_INJECT = `(function () {
    *
    * 注意：本段整体在 Node 模板字符串里 —— **不得出现反引号与正则字面量**。
    */
+  /** 最近一次拿到的 pkIdStr（结算页要用；由 dataDecrypt 解密出的 JSON 里取）。 */
+  var pkBotLastPkId = '';
+  /** 供 dataDecrypt 回填 pkIdStr（该函数位置更靠前，故用挂到 window 的方式）。 */
+  function pkBotSetPkId(id) { pkBotLastPkId = String(id || ''); }
+  window.__pkBotSetPkId = pkBotSetPkId;
   var PK_BOT_KEY = 'pk-bot-cfg';
   function pkBotCfg() {
     try {
@@ -1221,6 +1231,28 @@ const H5_INJECT = `(function () {
     }
   }
 
+  /** 拼结算页地址（真机链路：result.html?pkIdStr=X）。
+   *
+   * 依据历史取证（memory: PK「下一局」真机链路 v1.0.1，2026-09-27）：
+   *   结算页 = /bh5/leo-web-oral-pk/result.html?pkIdStr=<pkIdStr>
+   * 提交成功后 H5 用 submit 响应里的 pkIdStr 拼出该地址并跳转。
+   */
+  function pkBotResultUrl(pkIdStr) {
+    var id = String(pkIdStr || '');
+    if (!id) return '';
+    return location.origin + '/pk-h5/result.html?pkIdStr=' + encodeURIComponent(id) + '#/';
+  }
+
+  /** pkBotLastPkId 定义见文件前部（PK_BOT_KEY 附近）—— 因为 dataDecrypt 会提前用到。 */
+
+  /** 自动去结算页（若已知 pkIdStr）。 */
+  function pkBotGotoResult() {
+    var u = pkBotResultUrl(pkBotLastPkId);
+    if (!u) return false;
+    diag('bot-goto-result', { pkId: pkBotLastPkId, url: u });
+    location.href = u;
+    return true;
+  }
   /** 找「继续 PK / 下一局」类按钮。 */
   function pkBotFindNext() {
     try {
@@ -1276,29 +1308,37 @@ const H5_INJECT = `(function () {
         setTimeout(function () { var n = pkBotFindNext(); if (n) n.click(); }, 350);
       };
       wrap.appendChild(btn);
+  /** 回传当前界面结构（供无头环境判断「该点什么」）。 */
+  function pkBotDumpDom(tag) {
+    try {
+      var cvs = document.querySelectorAll('canvas');
+      var info = [];
+      for (var i = 0; i < cvs.length && i < 3; i++) {
+        var b = cvs[i].getBoundingClientRect();
+        info.push('canvas[' + i + '] ' + Math.round(b.width) + 'x' + Math.round(b.height));
+      }
+      var texts = [];
+      var all = document.querySelectorAll('div,button,span,a,p');
+      for (var j = 0; j < all.length && texts.length < 40; j++) {
+        if (all[j].children.length) continue;
+        var t = (all[j].textContent || '').trim();
+        if (!t || t.length > 16) continue;
+        var r = all[j].getBoundingClientRect();
+        if (r.width < 4 || r.height < 4) continue;
+        texts.push(t + '@' + Math.round(r.left) + ',' + Math.round(r.top));
+      }
+      diag('bot-dom', pumpTag(tag, info, all, texts));
+    } catch (e) { diag('bot-dom', { err: String(e && e.message) }); }
+  }
+  function pumpTag(tag, info, all, texts) {
+    return { tag: tag, canvases: info.join(' | '), texts: texts.join(' / '), url: location.pathname };
+  }
+
       var dbg = document.createElement('div');
       dbg.textContent = 'dump DOM';
       dbg.style.cssText = 'margin-top:4px;text-align:center;background:#444;' +
         'border-radius:6px;padding:3px 6px;cursor:pointer';
-      dbg.onclick = function () {
-        try {
-          var cvs = document.querySelectorAll('canvas');
-          var info = [];
-          for (var i = 0; i < cvs.length; i++) {
-            var b = cvs[i].getBoundingClientRect();
-            info.push('canvas[' + i + '] ' + Math.round(b.width) + 'x' + Math.round(b.height) +
-               ' cls=' + String(cvs[i].className).slice(0, 40));
-          }
-          var btns = [];
-          var all = document.querySelectorAll('div,button,span');
-          for (var j = 0; j < all.length && btns.length < 30; j++) {
-            if (all[j].children.length) continue;
-            var t = (all[j].textContent || '').trim();
-            if (t && t.length <= 8) btns.push(t);
-          }
-          diag('bot-dom', { canvases: info.join(' | '), texts: btns.join(' / '), url: location.pathname });
-        } catch (e) { diag('bot-dom', { err: String(e && e.message) }); }
-      };
+      dbg.onclick = function () { pkBotDumpDom('manual'); };
       wrap.appendChild(dbg);
       document.body.appendChild(wrap);
       diag('bot-panel', pkBotCfg());
@@ -1311,8 +1351,18 @@ const H5_INJECT = `(function () {
     try {
       var c = pkBotCfg();
       if (c.autoNext) {
+        // ① 先尝试页面上的「继续/结算」按钮
         var n = pkBotFindNext();
         if (n) { diag('bot-next', { text: (n.textContent || '').trim().slice(0, 12) }); n.click(); }
+        // ② 卡在「答对 N 题」结束浮层（赛事结束但没跳转）→ 自己去结算页
+        else {
+          var ended = false;
+          try {
+            var txt = (document.body && document.body.innerText) || '';
+            ended = txt.indexOf('答对') >= 0 && txt.indexOf('题') >= 0;
+          } catch (e) { /* ignore */ }
+          if (ended) pkBotGotoResult();
+        }
       }
       if (c.autoStroke && !pkBotStrokeBusy) {
         // 只在「有画板」的页面自动交笔（对局页）
@@ -1325,6 +1375,10 @@ const H5_INJECT = `(function () {
       }
     } catch (e) { /* ignore */ }
   }, 1500);
+
+  // ★ 自动 DOM 快照（2026-09-30）：每 5s 回传一次界面结构。
+  //  用于定位「卡在某个浮层」类问题 —— 直接看到有哪些可点文本与画板尺寸。
+  setInterval(function () { pkBotDumpDom('bot-auto-dom'); }, 5000);
 
   setTimeout(pkBotPanel, 800);
   setTimeout(pkBotPanel, 3000);
