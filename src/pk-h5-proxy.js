@@ -196,6 +196,58 @@ const H5_INJECT = `(function () {
     } catch (e) { diag('storage-preset-err', { msg: String(e && e.message) }); }
   })();
 
+  /* ---- 最小 Buffer polyfill（关键，2026-09-30）----
+   *
+   * H5 自己的**回调解析器**是 Node 风格写法：
+   *     pt = t => new Buffer(t, 'base64').toString()
+   * 真机 WebView 里有 Buffer polyfill，浏览器里**没有** →
+   *     bridge-reply-err: "Buffer is not defined"
+   * → 桥回调直接抛错 → H5 侧 Promise 永远不 resolve → 下级页面完全哑掉
+   *   （日志里 getWebViewInfo 的回调就报这个错）。
+   *
+   * 这里只实现 H5 实际用到的部分：base64 解码 + toString()。
+   * 只在全局缺失时定义，不覆盖 H5 自己可能加载的 polyfill。
+   */
+  (function installBuffer() {
+    if (typeof window.Buffer !== 'undefined') { diag('buffer-ready', { existed: true }); return; }
+    function mk(bytes) {
+      var u8 = new Uint8Array(bytes);
+      u8.toString = function (enc) {
+        if (enc === 'base64') {
+          var s = '';
+          for (var j = 0; j < this.length; j++) s += String.fromCharCode(this[j]);
+          return btoa(s);
+        }
+        try { return new TextDecoder('utf-8').decode(this); }
+        catch (e) { return String.fromCharCode.apply(null, this); }
+      };
+      return u8;
+    }
+    function Buf(data, enc) {
+      if (typeof data === 'string') {
+        var bin = data;
+        if (enc === 'base64' || enc === 'base64url') {
+          var t = data.replace(/-/g, '+').replace(/_/g, '/');
+          try { bin = atob(t); } catch (e) { bin = ''; }
+        }
+        var arr = [];
+        for (var i = 0; i < bin.length; i++) arr.push(bin.charCodeAt(i) & 0xff);
+        return mk(arr);
+      }
+      if (data && data.length != null) {
+        var a2 = [];
+        for (var k = 0; k < data.length; k++) a2.push(data[k] & 0xff);
+        return mk(a2);
+      }
+      return mk([]);
+    }
+    Buf.from = function (d, e) { return Buf(d, e); };
+    Buf.isBuffer = function () { return false; };
+    Buf.byteLength = function (s) { return String(s).length; };
+    window.Buffer = Buf;
+    diag('buffer-ready', { existed: false });
+  })();
+
   /* ---- 点击链路诊断：定位「点了有反馈但不跳转」到底断在哪一环 ---- */
   //
   // 2026-09-29：用户报「点按钮有反馈但不跳转」。已知 API 全 200、桥已挂载，
@@ -374,9 +426,10 @@ const H5_INJECT = `(function () {
             }
           }
           if (target) {
-            diag('openWebView', { url: target.slice(0, 300) });
+            var local = toLocalH5(target);
+            diag('openWebView', { url: target.slice(0, 300), local: local.slice(0, 300) });
             // 本机把「开新 WebView」实现为 iframe 内导航（H5 每页都是独立 html）
-            location.href = target;
+            location.href = local;
             return 'OK';
           }
         }
@@ -386,6 +439,41 @@ const H5_INJECT = `(function () {
         }
       }
       return 'OK';
+    }
+
+    /** 把任意外部 H5 地址折成本机同源地址（否则下级页面没有 hook 与桥）。
+     *
+     *  ★ 2026-09-30：这是「进入下级页面后没反应」的根因。
+     *    H5 的跳转目标是 https://xyks.yuanfudao.com/bh5/leo-web-oral-pk/exercise.html
+     *    —— 直接跳过去就脱离了本机代理，那边没有注入 → 整页哑掉。
+     *
+     *  规则（与 rewriteHtml 的同源化保持一致）：
+     *    <任意源>/bh5/<目录>/<页面>            -> /pk-h5-cdn/<目录>/<页面>
+     *    https://leo.fbcontent.cn/bh5/leo-web-oral-pk/<x> -> /pk-h5/<x>
+     *    同源地址（已是本机）                    -> 原样
+     *    data:/blob:/javascript:                -> 原样
+     */
+    function toLocalH5(url) {
+      var u = String(url || '');
+      if (!u) return u;
+      var low = u.toLowerCase();
+      if (low.indexOf('data:') === 0 || low.indexOf('blob:') === 0 ||
+          low.indexOf('javascript:') === 0) return u;
+      // 已经是本机同源
+      if (u.indexOf(location.origin) === 0) return u;
+
+      var BHP = '/bh5/';
+      var i = u.indexOf(BHP);
+      if (i < 0) return u;                       // 不是 bh5 资源，交给浏览器原样处理
+      var rest = u.slice(i + BHP.length);        // 例如 leo-web-oral-pk/exercise.html?x=1
+      var head = u.slice(0, i);                  // 主机部分
+
+      // CDN 主目录走更短的 /pk-h5/ 前缀（与 HTML 改写保持一致）
+      var CDN_ORAL = 'leo.fbcontent.cn' + BHP + 'leo-web-oral-pk/';
+      var k = u.indexOf(CDN_ORAL);
+      if (k >= 0) return location.origin + '/pk-h5/' + u.slice(k + CDN_ORAL.length);
+
+      return location.origin + '/pk-h5-cdn/' + rest;
     }
 
     var HANDLERS = {
@@ -407,8 +495,13 @@ const H5_INJECT = `(function () {
       // 「头像要切换年级后才显示、胜场显示 0」。数据由 Node 侧注入 window.__PK_USER。
       getUserInfo: function () { return window.__PK_USER || {}; },
       login: function () { return 'OK'; },
-      // octopus 埋点 SDK 的配置读取。必须回，否则日志被 bridge-miss 刷屏。
+      // octopus 埋点 SDK 的配置读取。
+      // ★ 键名必须是 method 本身：日志实测 H5 调的是 module=leo / method=getOrionConfig
+      //   （payload.method = "leo_getOrionConfig"，由 callNative 拆成 module + method）。
+      //   之前误写成 leo_getOrionConfig，导致 18 条 bridge-miss。
+      getOrionConfig: function () { return {}; },
       leo_getOrionConfig: function () { return {}; },
+      leoGetOrionConfig: function () { return {}; },
     };
 
     /** 缺省处理器：不认识的桥方法统一回「不支持」，并按协议回 trigger。
@@ -657,6 +750,23 @@ function rewriteHtml(html, opts) {
   s = s.split(CDN_HOST + '/bh5/').join(LOCAL_PREFIX + '-cdn/');
   s = s.split(CDN_HOST + '/').join(LOCAL_PREFIX + '-cdn/');
 
+  // 2.5) ★ 其它源上的同构 H5（2026-09-30）
+  //
+  //  H5 的跳转目标不限于 CDN，还有业务域上的 H5 目录，例如：
+  //    https://xyks.yuanfudao.com/bh5/leo-web-oral-pk/exercise.html
+  //    https://xyks.yuanfudao.com/bh5/leo-web-study-group/motivation-honor-roll.html
+  //  实测这些页面与 leo.fbcontent.cn/bh5/* **内容完全一致**（同一套构建产物）。
+  //
+  //  不做这一步的后果：点「开始PK」后跳到真实域名 → 那边没有我们的
+  //  hook 与桥 → **下级页面完全哑掉**。
+  //
+  //  所以把所有 `<协议>://<任意主机>/bh5/<目录>/<页面>` 统一折成本机的
+  //  /pk-h5-cdn/<目录>/<页面>（由 serve() 从 CDN 取同名文件）。
+  //  `/bh5/` 是协议级路径，各业务域都只是同一个静态托管，故可互换。
+  //
+  //  注意：本段位于 Node 模板字符串之外（是普通 JS），可以用正则。
+  s = s.replace(/https?:\/\/[A-Za-z0-9.-]+\/bh5\//g, LOCAL_PREFIX + '-cdn/');
+
   // 3) 注入 hook：插在 <head> 后、任何 script 之前
   const inject = pre + '<script>' + H5_INJECT + '</script>';
   const headIdx = s.indexOf('<head>');
@@ -676,6 +786,14 @@ function rewriteHtml(html, opts) {
  *
  * HTML 会被改写（URL 同源化 + 注入 hook）；其余资产原样透传。
  *
+ * ## 为什么 `-cdn` 要支持**任意目录**（2026-09-30）
+ *
+ * PK 的跳转目标不止 `leo-web-oral-pk`，还有别的 H5 应用，例如：
+ *     https://xyks.yuanfudao.com/bh5/leo-web-study-group/motivation-honor-roll.html
+ * 这些页面同样需要「同源 + 注入 hook + 桥」，否则点过去就哑了。
+ * 实测 `xyks.yuanfudao.com/bh5/*` 与 `leo.fbcontent.cn/bh5/*` 内容一致，
+ * 所以统一从 CDN 取。
+ *
  * @returns {Promise<boolean>} true = 已处理（响应已写）
  */
 async function serve(req, res, u) {
@@ -685,8 +803,10 @@ async function serve(req, res, u) {
   if (path === '/pk-h5' || path === '/pk-h5/' || path === '/pk-h5/pk.html') {
     cdnUrl = CDN_HOST + H5_BASE_PATH + '/pk.html';
   } else if (path.startsWith(LOCAL_PREFIX + '/')) {
+    // /pk-h5/assets/x.js → CDN 的 leo-web-oral-pk/assets/x.js
     cdnUrl = CDN_HOST + H5_BASE_PATH + path.slice(LOCAL_PREFIX.length);
   } else if (path.startsWith(LOCAL_PREFIX + '-cdn/')) {
+    // /pk-h5-cdn/<任意目录>/x.js → CDN 的 bh5/<任意目录>/x.js
     cdnUrl = CDN_HOST + '/bh5/' + path.slice((LOCAL_PREFIX + '-cdn/').length);
   }
 

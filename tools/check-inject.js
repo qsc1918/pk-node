@@ -127,7 +127,13 @@ try {
   ctx.window = ctx;
   Object.defineProperty(ctx, 'location', {
     configurable: true,
-    get() { return { get href() { return captured.href; }, set href(v) { captured.href = v; } }; },
+    get() {
+      return {
+        origin: 'http://127.0.0.1:8791',
+        get href() { return captured.href; },
+        set href(v) { captured.href = v; },
+      };
+    },
     set() {},
   });
   vm.runInContext(code, ctx);
@@ -147,6 +153,27 @@ try {
   }
   console.log('✓ getWebViewInfo 回调正确:', JSON.stringify(infoOut[1]));
 
+  // (a2) Buffer polyfill：H5 的回调解析器用的是 new Buffer(t,'base64') ——
+  //      注入脚本装完 polyfill 之后，ctx 上应该已经有 Buffer 了。
+  //      这里直接用「H5 的写法」解析一次，验证 polyfill 真的可用。
+  if (typeof ctx.Buffer !== 'function') {
+    console.error('✗ Buffer polyfill 未安装');
+    process.exit(1);
+  }
+  const rawCb = {};
+  ctx.getWebViewInfo_7_8 = (b64Result) => {
+    // 完全模拟 H5 的 pt()：new Buffer(t,'base64').toString()
+    rawCb.parsed = JSON.parse(new ctx.Buffer(b64Result, 'base64').toString());
+  };
+  ctx.CommonWebView.getWebViewInfo(b64(JSON.stringify({
+    arguments: [{ trigger: 'getWebViewInfo_7_8' }],
+  })));
+  if (!rawCb.parsed || rawCb.parsed[0] !== null) {
+    console.error('✗ Buffer polyfill 未生效（H5 回调会炸 "Buffer is not defined"）');
+    process.exit(1);
+  }
+  console.log('✓ Buffer polyfill 生效（H5 的 new Buffer(b64,"base64") 可用）');
+
   // (b) openSchema：必须触发跳转
   const target = 'http://127.0.0.1:8791/pk-h5/exercise.html?pointId=1';
   const schema = 'native://openWebView?url=' + encodeURIComponent(target) + '&hideNavigation=true';
@@ -159,6 +186,21 @@ try {
     process.exit(1);
   }
   console.log('✓ openSchema 跳转正确:', captured.href.slice(0, 80));
+
+  // (b2) ★ 外部 H5 地址必须被折回本机同源（2026-09-30 的真 bug）
+  //      否则跳过去脱离代理 → 没有 hook 与桥 → 下级页面完全哑掉。
+  //      下面这条 URL 就是日志里实测到的。
+  captured.href = '';
+  const ext = 'https://xyks.yuanfudao.com/bh5/leo-web-oral-pk/exercise.html?pointId=22&jumpTime=1';
+  ctx.openSchema_9_10 = () => {};
+  ctx.CommonWebView.openSchema(b64(JSON.stringify({
+    arguments: [{ trigger: 'openSchema_9_10', schemas: ['native://openWebView?url=' + encodeURIComponent(ext)] }],
+  })));
+  if (captured.href.indexOf('127.0.0.1:8791/pk-h5-cdn/leo-web-oral-pk/exercise.html') < 0) {
+    console.error('✗ 外部 H5 未折回同源（下级页面会哑），实际:', JSON.stringify(captured.href));
+    process.exit(1);
+  }
+  console.log('✓ 外部 H5 折回同源:', captured.href.slice(0, 80));
 
   // (c) 未知方法也必须回调（否则 Promise 挂起，整条链路卡死）。
   //     注意：H5 的路径 A 是 `St[g] && St[g][method]` —— 方法不在对象上时它会
