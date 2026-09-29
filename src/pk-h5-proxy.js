@@ -552,6 +552,8 @@ const H5_INJECT = `(function () {
       }
     }
 
+    /** 最近一次 openWebView 的时间戳（用于 closeWebView 的语义判断）。 */
+    var pkJustOpenedWebView = 0;
     /** 处理 openSchema：从 schemas 里挑第一个能认的。 */
     function handleOpenSchema(args) {
       var list = (args && args.schemas) || [];
@@ -572,7 +574,14 @@ const H5_INJECT = `(function () {
           if (target) {
             var local = addLeoId(toLocalH5(target));
             diag('openWebView', { url: target.slice(0, 300), local: local.slice(0, 300) });
-            // 本机把「开新 WebView」实现为 iframe 内导航（H5 每页都是独立 html）
+            // 本机把「开新 WebView」实现为同窗口导航（H5 每页都是独立 html）。
+            //
+            // ★ 2026-09-30：置「刚开过 WebView」标记。
+            //   真机上 openWebView 打开新页后，调用方常紧接着 closeWebView 关掉**自己**
+            //   （即用新页替换旧页）。但我们这里是同窗口导航 —— 一导航旧页就没了，
+            //   再来一个 closeWebView 的 history.back() 会把**刚打开的页面顶掉**
+            //   （用户看到的「答完题直接返回主界面」）。故此处标记，供 closeWebView 判断。
+            pkJustOpenedWebView = Date.now();
             location.href = local;
             return 'OK';
           }
@@ -676,7 +685,25 @@ const H5_INJECT = `(function () {
       // H5 的跳转既可能发 openSchema（schemas 数组），也可能直接发 openWebView。
       // 两条都接住，避免漏一种写法。
       openWebView: function (args) { return handleOpenSchema({ schemas: ['native://openWebView?' + (args && args.url ? 'url=' + encodeURIComponent(args.url) : '')] }); },
-      closeWebView: function () { history.back(); return 'OK'; },
+      closeWebView: function () {
+        // ★ 2026-09-30：「答完题直接返回主界面」的真凶。
+        //
+        //  真机语义：openWebView 打开新 WebView 后，调用方常紧接着 closeWebView
+        //  关掉**调用方自己**（即「用新页替换旧页」，新页仍在）。
+        //
+        //  我们这里是**同窗口导航**：openWebView 已经用 location.href 顶掉了旧页，
+        //  旧页的 closeWebView 属于「已被替换者发来的迟到消息 → 本该丢弃」。
+        //  以前一律 history.back() → 把**刚打开的结算页顶掉** → 退到主 PK 页。
+        //
+        //  规则：若 3 秒内刚 openWebView（导航）过，则忽略本页的 closeWebView。
+        if (Date.now() - pkJustOpenedWebView < 3000) {
+          diag('closeWebView-ignored', { sinceOpenMs: Date.now() - pkJustOpenedWebView });
+          return 'OK';
+        }
+        diag('closeWebView-back', {});
+        history.back();
+        return 'OK';
+      },
       getWebViewInfo: function () { return { version: BRIDGE_VERSION, platform: 'android' }; },
       setTitle: function () { return 'OK'; },
       toast: function () { return 'OK'; },
