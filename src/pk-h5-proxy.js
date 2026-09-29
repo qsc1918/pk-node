@@ -72,6 +72,34 @@ const API_HOSTS = [
   'ytk.yuanfudao.com',
 ];
 
+/**
+ * 是否允许代理该 host。
+ *
+ * ## 为什么要通配（2026-09-30）
+ *
+ * 起初用的是**硬编码白名单**（xyks/xyst/ape-api/oapi/ytk）。但原版 H5 的各
+ * 子页面会打**不同**的业务域，实测遇到过的有：
+ *
+ *   - `leo-homework/*`      → PK 榜（daily-practice/rank/info）
+ *   - `leo-activity/*`      → 道具 / 背包
+ *   - `leo-alchemy-account/*` → 好友 / 头像挂件
+ *   - `leo-star/*`          → 胜率 / 任务
+ *   - `leo-reward/*`        → 积分兑换
+ *
+ * 漏一个域 → 那个页面的数据请求**根本不走代理**（既没带 sign/公共参数，
+ * 也不会被记进诊断日志）→ 页面「渲染出来但内容空白」。
+ *
+ * 所以改成通配：只要是 `*.yuanfudao.com`（含 .biz 测试域）就允许。
+ * 安全性：代理只转发到这些自有域，且 host 由**我们注入的 hook** 写入，
+ * 页面脚本无法借它访问任意第三方。
+ */
+function isAllowedHost(host) {
+  const h = String(host || '').toLowerCase();
+  if (!h) return false;
+  if (API_HOSTS.indexOf(h) >= 0) return true;
+  return /\.yuanfudao\.(com|biz)$/.test(h);
+}
+
 /* ------------------------------ 资产缓存 ------------------------------ */
 
 /** url → { body:Buffer, contentType:string, at:number } */
@@ -168,6 +196,18 @@ function normalizeContentType(ct, pathname) {
  */
 const H5_INJECT = `(function () {
   var TARGET_HOSTS = ['xyks.yuanfudao.com', 'xyst.yuanfudao.com', 'ape-api.yuanfudao.com', 'oapi.yuanfudao.com', 'ytk.yuanfudao.com'];
+  /* 允许代理的 host 判定（与 Node 侧 isAllowedHost 保持一致）。
+   *
+   * 原先是硬编码白名单，会漏掉各子页面的业务域（leo-homework / leo-activity
+   * / leo-alchemy-account / leo-star / leo-reward 等）→ 那些请求根本不走代理，
+   * 页面「渲染出来但内容空白」（PK 榜就是典型）。改成通配 *.yuanfudao.com。
+   */
+  function pkIsAllowedHost(h) {
+    var x = String(h || '').toLowerCase();
+    if (!x) return false;
+    if (TARGET_HOSTS.indexOf(x) >= 0) return true;
+    return /\.yuanfudao\.(com|biz)$/.test(x);
+  }
   var LOCAL = '/api/pk/h5/api';
   // 稳定的伪设备 id：同一会话内必须一致，否则 H5 会反复重渲染（表现是界面抖/闪）。
   var DEVICE_ID = 'pknode-' + Math.random().toString(36).slice(2, 10);
@@ -718,6 +758,10 @@ const H5_INJECT = `(function () {
 
   function pickHost(url) {
     var low = String(url).toLowerCase();
+    // 通配：抓出 URL 里的 host 再判断（不再依赖硬编码列表）
+    var m = low.match(/^https?:\/\/([^\/]+)/);
+    if (m && pkIsAllowedHost(m[1].split(':')[0])) return m[1].split(':')[0];
+    // 兜底：命中列表里的任意一项也算（相对路径场景）
     for (var i = 0; i < TARGET_HOSTS.length; i++) {
       if (low.indexOf(TARGET_HOSTS[i]) >= 0) return TARGET_HOSTS[i];
     }
@@ -731,6 +775,8 @@ const H5_INJECT = `(function () {
   XMLHttpRequest.prototype.open = function (method, url) {
     var rest = Array.prototype.slice.call(arguments, 2);
     this.__pkMethod = method;
+    // ★ 全量请求记录（不管是否被代理）—— 定位「页面不发请求」类问题用。
+    diag('req', { m: method, u: String(url).slice(0, 220) });
     var host = pickHost(url);
     if (host) {
       try {
@@ -854,6 +900,60 @@ const H5_INJECT = `(function () {
     setTimeout(function () { dump('t25s'); }, 25000);
   })();
 
+  /* ---- ArrayBuffer 响应 → 解析成对象（2026-09-30 关键补丁）----
+   *
+   * H5 的部分接口（match/v2、props/v2 等）用：
+   *     a.post(url, null, { responseType: "arraybuffer" })
+   * 而调用方**直接当对象用**：
+   *     f = await getPkExerciseQuestionV2(...)
+   *     d(f.examVO.questions || [])        // 读 f.examVO
+   *
+   * 但 axios 对 arraybuffer **不做 JSON.parse**，H5 自己也没有解密/解析步骤
+   * （源码里没有任何 dataDecrypt 调用）—— 那一层是**真机原生 WebView** 干的。
+   *
+   * 现象：f 是 ArrayBuffer → f.examVO === undefined → 题目为空 →
+   *      界面永远停在「匹配中」。
+   *
+   * 我们在 XHR 层补上这一步：若 responseType 是 arraybuffer，
+   * 且响应体是 JSON 文本，就把 response 改写成**解析后的对象**。
+   */
+  (function patchArrayBufferResponse() {
+    function install(xhr) {
+      if (!xhr || xhr.__pkAbPatched) return;
+      xhr.__pkAbPatched = true;
+      var real = null;
+      try {
+        Object.defineProperty(xhr, "response", {
+          configurable: true,
+          get: function () {
+            if (real == null) return real;
+            // 只处理 ArrayBuffer / TypedArray；其它原样返回
+            var buf = null;
+            if (typeof ArrayBuffer !== "undefined" && real instanceof ArrayBuffer) buf = real;
+            else if (real && real.buffer instanceof ArrayBuffer) buf = real.buffer;
+            if (!buf) return real;
+            try {
+              var u8 = new Uint8Array(buf);
+              // 只对「看起来是 JSON」的内容解析（首字符 { 或 [）
+              var c0 = u8[0];
+              if (c0 !== 0x7b && c0 !== 0x5b) return real;
+              var txt = new TextDecoder("utf-8").decode(u8);
+              var obj = JSON.parse(txt);
+              diag('ab-parse', { len: u8.length, keys: Object.keys(obj).slice(0, 8).join(',') });
+              return obj;
+            } catch (e) { return real; }
+          },
+          set: function (v) { real = v; },
+        });
+      } catch (e) { /* 某些实现不可重定义，忽略 */ }
+    }
+    var _o = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function () {
+      try { install(this); } catch (e) {}
+      return _o.apply(this, arguments);
+    };
+  })();
+
   window.__pkH5Hook = { version: 2, local: LOCAL, hosts: TARGET_HOSTS };
 })();`;
 
@@ -939,6 +1039,14 @@ function rewriteHtml(html, opts) {
  * @param {(leoAccountId:number)=>Promise<object|null>} fn
  */
 let fetchUserInfo = null;
+/** 最近一次进入 PK 页面时用的账号 id。
+ *
+ * 为什么要它（2026-09-30）：window.__PK_USER 只在 URL **带 leoAccountId** 时注入，
+ * 而用户从各种入口（后退、历史记录、直接刷新）进来时 URL 常常没有这个参数
+ * → isLogin=false → 界面显示「未登录」（实测症状）。
+ * 所以记住最后一个用过的账号，缺参数时兜底。
+ */
+let lastLeoAccountId = null;
 function setUserInfoProvider(fn) { fetchUserInfo = fn; }
 
 /** 调试用：match/v2 原始响应只 dump 一次。 */
@@ -989,7 +1097,10 @@ async function serve(req, res, u) {
     //   完全依赖它（缺了会 location.reload() 死循环）。取不到就传 null，
     //   页面会走「未登录」分支（至少不会崩）。
     let user = null;
-    const leoId = u.searchParams.get('leoAccountId');
+    let leoId = u.searchParams.get('leoAccountId');
+    if (leoId) lastLeoAccountId = leoId;
+    // 兜底：URL 没带账号时用最近一次的（否则 window.__PK_USER 不注入 → 显示未登录）
+    else if (lastLeoAccountId) { leoId = lastLeoAccountId; }
     if (leoId && fetchUserInfo) {
       try { user = await fetchUserInfo(Number(leoId)); }
       catch (e) { console.log('[pk-h5] fetchUserInfo 失败：' + e.message); }
@@ -1085,7 +1196,7 @@ async function proxyApi(req, res, u, ctx) {
   const host = slash > 0 ? rawPath.slice(0, slash) : (targetHost || API_HOSTS[0]);
   const pathAndQuery = slash > 0 ? rawPath.slice(slash) : rawPath;
 
-  if (API_HOSTS.indexOf(host) < 0) {
+  if (!isAllowedHost(host)) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: false, message: '不允许的代理目标：' + host }));
     return;
