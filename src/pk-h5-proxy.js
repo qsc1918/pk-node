@@ -1352,17 +1352,19 @@ const H5_INJECT = `(function () {
     try {
       var c = pkBotCfg();
       if (c.autoNext) {
-        // ① 先尝试页面上的「继续/结算」按钮
-        var n = pkBotFindNext();
-        if (n) { diag('bot-next', { text: (n.textContent || '').trim().slice(0, 12) }); n.click(); }
-        // ② 卡在「答对 N 题」结束浮层（赛事结束但没跳转）→ 自己去结算页
-        else {
-          var ended = false;
-          try {
-            var txt = (document.body && document.body.innerText) || '';
-            ended = txt.indexOf('答对') >= 0 && txt.indexOf('题') >= 0;
-          } catch (e) { /* ignore */ }
-          if (ended) pkBotGotoResult();
+        // ★★ 2026-09-30 事故修正：**绝不在对局页强行跳结算页**！
+        //
+        //  「答对 N 题」是 PKReadyGo 的**开赛屏**（显示本局题数 count=questionCnt），
+        //  不是结算屏。我曾据此判断「游戏结束」并直接 location.href 到 result.html，
+        //  结果「一进对局就进结算页、答案都没提交」。
+        //
+        //  真正的结算跳转由 H5 自己完成：
+        //    Oral-legacy 的 It()：答完 → gotoPkResultPage(pkIdStr, ...) → result.html
+        //
+        //  所以 autoNext 只在**结算页**点「继续PK」开新一局（循环刷局）。
+        if (location.pathname.indexOf('result') >= 0) {
+          var n = pkBotFindNext();
+          if (n) { diag('bot-next', { text: (n.textContent || '').trim().slice(0, 12) }); n.click(); }
         }
       }
       if (c.autoStroke && !pkBotStrokeBusy) {
