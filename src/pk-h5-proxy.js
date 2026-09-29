@@ -1096,6 +1096,46 @@ function setUserInfoProvider(fn) { fetchUserInfo = fn; }
 let dumpCount = 0;
 
 /**
+ * 改写代理过来的 **JS 资产**（不是 HTML）。
+ *
+ * ## 为什么要做资产级改写（2026-09-30，排行榜问题的真因）
+ *
+ * 原版 H5 的新版 Bridge 框架（`index-legacy.UF8C8ODn.js`）里有一段门禁：
+ *
+ * ```js
+ * tA = function () {
+ *   var t = window.location.hostname;
+ *   return 'local.yuanfudao.biz' === t || '127.0.0.1' === t || 'localhost' === t;
+ * };
+ * NativeBridgeProvider.prototype.has = function () { return !tA(); };
+ * ```
+ *
+ * 即：**本地调试环境一律禁用原生桥**（has 返回 false）。而我们为了同源代理，
+ * 必须跑在 127.0.0.1 上 —— 于是 tA() 恒为 true、has() 恒为 false：
+ *
+ *     [Bridge] 没有 Provider 可以处理 "getWebViewInfo"   ×14
+ *
+ * → 桥初始化失败 → 榜单等页面**一个数据请求都不发**（表现：页面渲染出来但空白）。
+ *
+ * 修法：把 `tA()` 恒真改写为恒假 —— 让 H5 以为自己在真机里。
+ * 只动这一处，语义最小。
+ */
+function rewriteAssetJs(buf) {
+  let s = buf.toString('utf8');
+  // 已改写就跳过（幂等）
+  if (s.indexOf('__pkNotLocalHost') >= 0) return Buffer.from(s, 'utf8');
+
+  // 目标片段（在压缩后的资产里是连续的一段）
+  const old = 'return"local.yuanfudao.biz"===t||"127.0.0.1"===t||"localhost"===t';
+  const neu = 'return false/*__pkNotLocalHost*/';
+  if (s.indexOf(old) >= 0) {
+    s = s.split(old).join(neu);
+    console.log('[pk-h5] 已改写本地环境门禁（rank 页可用原生桥）');
+  }
+  return Buffer.from(s, 'utf8');
+}
+
+/**
  * 处理 `/pk-h5/*` 与 `/pk-h5-cdn/*`：把 CDN 资产（含 HTML）透传给浏览器。
  *
  * HTML 会被改写（URL 同源化 + 注入 hook）；其余资产原样透传。
@@ -1150,6 +1190,9 @@ async function serve(req, res, u) {
     }
     body = rewriteHtml(body, { leoAccountId: leoId, user });
     contentType = 'text/html';
+  } else if (cdnUrl.endsWith('.js') || contentType.indexOf('javascript') >= 0) {
+    // ★ 资产级改写：破解「本地调试环境禁用原生桥」的门禁（2026-09-30）
+    body = rewriteAssetJs(body);
   }
 
   res.writeHead(200, {
