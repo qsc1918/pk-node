@@ -573,6 +573,21 @@ const H5_INJECT = `(function () {
           }
           if (target) {
             var local = addLeoId(toLocalH5(target));
+            // ★ 2026-09-30：「结算页没数据（0NaN年NaN月NaN日）」的真因。
+            //
+            //  Result-legacy 取数前先判断 ve() = B.search().isFromHistory：
+            //    isFromHistory → j.getPkExerciseResult(pkIdStr)  → GET history/detail ✅
+            //    否则          → J.getItem(_t) 读 localStorage（上一个 exercise 页存的）
+            //  我们拼的 result.html?pkIdStr=X 没带 isFromHistory，又没走真机的
+            //  saveLocalResult 顺序 → localStorage 空 → 结算数据为空 → 点「继续PK」无效。
+            //  真机「查看历史战绩」用的正是 isFromHistory=true，这里对齐它。
+            if (local.indexOf('result.html') >= 0 && local.indexOf('isFromHistory') < 0) {
+              var hI = local.indexOf('#');
+              var qPart = hI >= 0 ? local.slice(0, hI) : local;
+              var hPart = hI >= 0 ? local.slice(hI) : '';
+              qPart += (qPart.indexOf('?') >= 0 ? '&' : '?') + 'isFromHistory=true';
+              local = qPart + hPart;
+            }
             diag('openWebView', { url: target.slice(0, 300), local: local.slice(0, 300) });
             // 本机把「开新 WebView」实现为同窗口导航（H5 每页都是独立 html）。
             //
@@ -1375,6 +1390,7 @@ const H5_INJECT = `(function () {
 
   /* ---- 定时器：自动交笔 / 自动下一局 ---- */
   var pkBotStrokeBusy = false;
+  var pkBotLastNextAt = 0;
   setInterval(function () {
     try {
       var c = pkBotCfg();
@@ -1389,9 +1405,18 @@ const H5_INJECT = `(function () {
         //    Oral-legacy 的 It()：答完 → gotoPkResultPage(pkIdStr, ...) → result.html
         //
         //  所以 autoNext 只在**结算页**点「继续PK」开新一局（循环刷局）。
+        //
+        //  ★ 点击冷却：结算页初次可达时数据可能还没就绪（ee() 里 S.value 为空会静默
+        //    什么都不做），所以要在 data-ready 后重试；但也要节流，避免连点几十次。
         if (location.pathname.indexOf('result') >= 0) {
-          var n = pkBotFindNext();
-          if (n) { diag('bot-next', { text: (n.textContent || '').trim().slice(0, 12) }); n.click(); }
+          if (Date.now() - pkBotLastNextAt > 3000) {
+            var n = pkBotFindNext();
+            if (n) {
+              pkBotLastNextAt = Date.now();
+              diag('bot-next', { text: (n.textContent || '').trim().slice(0, 12) });
+              n.click();
+            }
+          }
         }
       }
       if (c.autoStroke && !pkBotStrokeBusy) {
