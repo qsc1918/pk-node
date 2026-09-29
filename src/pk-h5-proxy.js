@@ -1476,12 +1476,23 @@ async function proxyApi(req, res, u, ctx) {
     // 审计用：把最终 query 打出来（排查参数是否被正确覆盖）
     let finalQuery = '';
     try { finalQuery = String(realUrl).split('?')[1] || ''; } catch (e) { /* ignore */ }
+    // ★ rawBody: true —— **保留未解压的原始字节**（2026-09-30）。
+    //
+    //  为什么关键：`match/v2` 的响应是「keystream XOR(gzip(json))」的密文。
+    //  keystream XOR 后出来的才是 gzip；若不带 rawBody，http.js 会因为
+    //  `Content-Encoding: gzip` 尝试 gunzip **密文**（必然失败）——
+    //  运气好保持原样，运气差就把原始字节搞乱。
+    //
+    //  而且密文必须**逐字节透传**：H5 的 response 拦截器要把它 btoa 后
+    //  交给 dataDecrypt 桥解密（见 exercise-legacy 的 u/l 函数）。
+    //  这里若做任何 utf8 转换都会破坏二进制，解密必然失败。
     const r = await request({
       url: realUrl,
       method: method,
       jar: ctx.jar,
       body: bodyBuf && bodyBuf.length ? bodyBuf : undefined,
       headers: headers,
+      rawBody: true,
     });
 
     // 把响应原样回给 H5（H5 自己解析业务码）
@@ -1490,18 +1501,18 @@ async function proxyApi(req, res, u, ctx) {
       'Cache-Control': 'no-store',
       'Access-Control-Allow-Origin': '*',
     };
-    // ★ 二进制安全 + 自动解密（2026-09-30 实测通过）。
+    // ★ 二进制安全透传，**不在代理侧解密**（2026-09-30 重大修正）。
     //
-    //  match/v2 这类 `responseType: arraybuffer` 接口，服务端返回的是
-    //  「keystream XOR(gzip(json))」的密文。真机由原生 dataDecrypt 解；
-    //  我们在代理侧用 keystream 直接解开，回给 H5 **明文 JSON**，
-    //  H5 的 axios 仍按 arraybuffer 收，但内容是 JSON 文本，能正常 parse。
-    const rawBody = (r.body && r.body.length) ? r.body : Buffer.from(r.text || '', 'utf8');
-    const decrypted = decodeEncrypted(rawBody);
-    if (decrypted) {
-      diagLog('decrypt', pathOnly + ' ' + rawBody.length + 'B → ' + decrypted.length + 'B');
-    }
-    const outBody = decrypted || rawBody;
+    //  这里曾经用 keystream 把 match/v2 的密文解开再回给 H5，以为 H5 不会解。
+    //  实际上 **H5 自己会解密**：它的响应拦截器（exercise-legacy 的 u/l）
+    //  把 arraybuffer 转 base64 后调原生桥 LeoSecure.dataDecrypt。
+    //
+    //  代理侧先解 → H5 拿到的已是明文 → 又 btoa 去调 dataDecrypt →
+    //  双重解密 → 桥报 DECRYPT_FAILED → r.result undefined → 界面永远「匹配中」。
+    //
+    //  正解：代理侧**只做透传**（保持字节不变、二进制安全），
+    //  解密统一由 dataDecrypt 桥委托 /api/pk/h5/decrypt 完成。
+    const outBody = (r.body && r.body.length) ? r.body : Buffer.from(r.text || '', 'utf8');
     outHeaders['Content-Length'] = outBody.length;
     res.writeHead(r.status, outHeaders);
     res.end(outBody);
