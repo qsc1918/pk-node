@@ -166,6 +166,49 @@ const H5_INJECT = `(function () {
   var TARGET_HOSTS = ['xyks.yuanfudao.com', 'xyst.yuanfudao.com', 'ape-api.yuanfudao.com', 'oapi.yuanfudao.com', 'ytk.yuanfudao.com'];
   var LOCAL = '/api/pk/h5/api';
 
+  /* ---- 伪装成小猿 App 的 WebView UA（2026-09-30）----
+   *
+   * H5 用 UA 判断「是不是在 App 里」，而这个判断决定了**大量入口是否渲染**：
+   *
+   *   Utils-legacy:
+   *     ct = () => UA 含 "YuanSouTiKouSuan"
+   *     st = () => UA 含 "YuanSouTi"
+   *   pk-legacy（8 人 PK 按钮）:
+   *     O = isLogin && (ct() || st())        // ← 不满足则整个按钮不渲染
+   *   pk-legacy（巅峰赛入口）:
+   *     D = isLogin && ct() && ...
+   *   useHomeModel:
+   *     v() = isAppUA → 影响大量 App-only 分支
+   *
+   * 真机 WebView 的 UA 末尾会追加 App 标识，例如：
+   *     ... Safari/537.36 YuanSouTiKouSuan/3.141.1
+   * 我们跑在普通浏览器里没有这个后缀 → 「8人PK」「巅峰赛」等入口全都不出现。
+   *
+   * 这里在 H5 脚本执行**之前**改写 navigator.userAgent（追加后缀）。
+   * 只追加、不替换，保留原有 Android/Chrome 信息，避免其它 UA 检测失效。
+   *
+   * ⚠️ 副作用：productId 计算会从兜底 131 变成 611，但我们已在代理侧强制
+   *    _productId=631（pk-node 的 PK 端点硬要求），所以不受影响。
+   */
+  (function patchUserAgent() {
+    try {
+      var SUFFIX = ' YuanSouTiKouSuan/3.141.1';
+      var orig = navigator.userAgent || '';
+      if (orig.indexOf('YuanSouTiKouSuan') >= 0) { diag('ua-patch', { skipped: true }); return; }
+      var patched = orig + SUFFIX;
+      var ok = false;
+      try {
+        Object.defineProperty(navigator, 'userAgent', {
+          get: function () { return patched; },
+          configurable: true,
+        });
+        ok = navigator.userAgent === patched;
+      } catch (e) { ok = false; }
+      if (!ok) { try { navigator.userAgent = patched; ok = true; } catch (e2) {} }
+      diag('ua-patch', { ok: ok, tail: patched.slice(-46) });
+    } catch (e) { diag('ua-patch-err', { msg: String(e && e.message) }); }
+  })();
+
   /* ---- 预置 H5 的 localStorage 标记：跳过「新手引导」遮罩 ---- */
   //
   // ## 为什么必须做（2026-09-29 由页面快照诊断确证）
@@ -426,7 +469,7 @@ const H5_INJECT = `(function () {
             }
           }
           if (target) {
-            var local = toLocalH5(target);
+            var local = addLeoId(toLocalH5(target));
             diag('openWebView', { url: target.slice(0, 300), local: local.slice(0, 300) });
             // 本机把「开新 WebView」实现为 iframe 内导航（H5 每页都是独立 html）
             location.href = local;
@@ -439,6 +482,27 @@ const H5_INJECT = `(function () {
         }
       }
       return 'OK';
+    }
+
+    /** 给同源地址补上 leoAccountId（下级页靠它找账号，缺了就 404「账号不存在」）。
+     *
+     *  ★ 2026-09-30：这是「下级页匹配不了」的根因。
+     *    H5 自己拼的跳转 URL 只带业务参数：
+     *      /bh5/leo-web-oral-pk/exercise.html?pointId=22&isFromInvite=undefined&jumpTime=...
+     *    我们自己注入的 leoAccountId 只存在于**上一页**的 URL 上，跳转就丢了 → 下级页
+     *    所有 API 都 404「账号不存在」（日志里 match/v2 重试了 380 次）。
+     *
+     *    所以跳转前把账号补回去（放在 ? 之后、# 之前，避免破坏 hash 路由）。
+     */
+    function addLeoId(u) {
+      var id = window.__PK_LEO_ID || '';
+      if (!id || !u) return u;
+      if (u.indexOf('leoAccountId=') >= 0) return u;
+      var hashIdx = u.indexOf('#');
+      var hash = hashIdx >= 0 ? u.slice(hashIdx) : '';
+      var base = hashIdx >= 0 ? u.slice(0, hashIdx) : u;
+      var sep = base.indexOf('?') >= 0 ? '&' : '?';
+      return base + sep + 'leoAccountId=' + encodeURIComponent(id) + hash;
     }
 
     /** 把任意外部 H5 地址折成本机同源地址（否则下级页面没有 hook 与桥）。
