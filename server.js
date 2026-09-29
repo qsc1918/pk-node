@@ -20,6 +20,7 @@ const nativeLib = require('./src/native');
 const signLib = require('./src/sign');
 const strokes = require('./src/strokes');
 const exercise = require('./src/exercise');
+const pkH5 = require('./src/pk-h5-proxy');
 
 const PUBLIC_DIR = path.join(config.root, 'public');
 
@@ -105,6 +106,9 @@ function serveStatic(res, urlPath) {
 /** 需要登录的路径前缀。 */
 function needAuth(pathname) {
   if (pathname === '/api/auth/login' || pathname === '/api/auth/register' || pathname === '/api/auth/me') return false;
+  // PK H5 诊断回传：页面本身不需要登录（登录态在 Node 侧注入），
+  // 所以这条也免鉴权，否则 hook 的诊断会被 401 挡掉。
+  if (pathname === '/api/pk/h5/diag') return false;
   if (pathname.startsWith('/api/')) return true;
   return false;
 }
@@ -317,6 +321,44 @@ async function handleApi(req, res, u, user) {
     db.deleteLeoAccount(id);
     db.audit(user.id, 'leo_delete', 'id=' + id, clientIp(req));
     return sendJson(res, 200, { ok: true });
+  }
+
+  /* -------------------------- PK H5 诊断（浏览器回传） -------------------------- */
+  //
+  // H5 页面里注入的 hook 会把「JS 报错 / 未捕获 rejection / 每个被代理请求的结果」
+  // 用 sendBeacon 回传到这里，落到服务端日志。这样「点击没反应」这类
+  // 纯前端问题也能在无头环境里看到真相，不用开 F12。
+  if (p === '/api/pk/h5/diag') {
+    const txt = await new Promise((resolve) => {
+      const chunks = [];
+      let size = 0;
+      req.on('data', (d) => {
+        size += d.length;
+        if (size > 256 * 1024) { req.destroy(); return; }
+        chunks.push(d);
+      });
+      req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      req.on('error', () => resolve(''));
+    });
+    const leoId = u.searchParams.get('leoAccountId') || '';
+    console.log('[pk-h5-diag] leo=' + leoId + ' ' + txt.slice(0, 1500));
+    res.writeHead(204, { 'Access-Control-Allow-Origin': '*' });
+    res.end();
+    return;
+  }
+
+  /* -------------------------- PK H5 页面（真·PK 容器） -------------------------- */
+  //
+  // 把原版 PK H5（`leo.fbcontent.cn/bh5/leo-web-oral-pk/pk.html`）整套代理到本机：
+  // assets 与页面本身走 `/pk-h5/*`（无需登录，见 server 里 serveStatic 之后的
+  // 静态分支），H5 发往 xyks/xyst 的 API 请求被注入的 XHR hook 改写到
+  // `/api/pk/h5/api` —— 这里就是那个终点，用**该小猿账号**的 jar 补
+  // sign/风控头后转发。
+  if (p === '/api/pk/h5/api') {
+    const leoId = Number(u.searchParams.get('leoAccountId') || 0);
+    const acc = db.getLeoAccount(leoId);
+    if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '账号不存在' });
+    return pkH5.proxyApi(req, res, u, { jar: jobs.jarOf(acc) });
   }
 
   /* -------------------------- PK 探测 -------------------------- */
@@ -707,6 +749,19 @@ const server = http.createServer(async (req, res) => {
 
   // 静态资源
   if (!u.pathname.startsWith('/api/')) {
+    // PK H5 容器（真·PK 页面）：把原版 H5 整套从 CDN 代理到本机同源。
+    // 必须在 serveStatic 之前 —— 它不属于 public/ 目录，是 CDN 透传。
+    // 无需登录：页面本身不含凭据，登录态由 H5 的 API 请求（走 /api/pk/h5/api）
+    // 在 Node 侧注入。
+    if (u.pathname === '/pk-h5' || u.pathname.startsWith('/pk-h5/') ||
+        u.pathname.startsWith('/pk-h5-cdn/')) {
+      try {
+        const handled = await pkH5.serve(req, res, u);
+        if (handled) return;
+      } catch (e) {
+        return sendText(res, 502, 'PK H5 代理异常：' + e.message);
+      }
+    }
     return serveStatic(res, u.pathname);
   }
 

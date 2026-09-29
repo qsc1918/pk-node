@@ -124,10 +124,11 @@ $('btn-logout').addEventListener('click', async () => {
 document.querySelectorAll('.nav-btn').forEach((btn) => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.nav-btn').forEach((b) => b.classList.toggle('active', b === btn));
-    ['grind', 'practice', 'accounts', 'jobs', 'tunnel', 'admin'].forEach((t) => {
+    ['grind', 'pkpage', 'practice', 'accounts', 'jobs', 'tunnel', 'admin'].forEach((t) => {
       $('tab-' + t).classList.toggle('hidden', t !== btn.dataset.tab);
     });
     const t = btn.dataset.tab;
+    if (t === 'pkpage') { loadPkPage(); }
     if (t === 'practice') { loadPractice(); }
     if (t === 'accounts') { loadDeviceChains(); }
     if (t === 'accounts') { loadLeoAccounts(); }
@@ -136,6 +137,75 @@ document.querySelectorAll('.nav-btn').forEach((btn) => {
     if (t === 'admin') { loadAdmin(); }
   });
 });
+
+/* ------------------------- PK 页面（H5 容器） ------------------------- */
+
+/**
+ * 填充 PK 页的账号/子账号下拉。
+ *
+ * 复用 [state.leoAccounts]（bootstrapAfterLogin 已拉过），避免重复请求。
+ */
+async function loadPkPage() {
+  if (!state.leoAccounts || state.leoAccounts.length === 0) {
+    try {
+      const r = await api('/api/leo/accounts');
+      state.leoAccounts = r.accounts || [];
+    } catch (e) { /* 忽略 */ }
+  }
+  const sel = $('pkpage-leo');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  const list = state.leoAccounts || [];
+  if (list.length === 0) {
+    const o = document.createElement('option');
+    o.value = '';
+    o.textContent = '（尚未导入小猿账号）';
+    sel.appendChild(o);
+    $('pkpage-hint').textContent = '先去「小猿账号」页导入一个账号（短信 / 密码 / 粘贴 cookie 都行）。';
+    return;
+  }
+  for (const a of list) {
+    const o = document.createElement('option');
+    o.value = String(a.id);
+    o.textContent = a.name + '（uid ' + (a.yfdU || '?') + '）';
+    sel.appendChild(o);
+  }
+  if (prev && list.some((a) => String(a.id) === prev)) sel.value = prev;
+
+  await loadPkPageSubs();
+  $('pkpage-hint').textContent = '点「打开 PK 页面」加载原版 H5。若页面空白，先看浏览器控制台的 __pkH5Hook。';
+}
+
+/** 拉 PK 页的子账号下拉。 */
+async function loadPkPageSubs() {
+  const id = Number($('pkpage-leo').value);
+  const sel = $('pkpage-sub');
+  sel.innerHTML = '<option value="">（当前身份）</option>';
+  if (!id) return;
+  try {
+    const r = await api('/api/leo/accounts/' + id + '/sub-accounts');
+    for (const s of (r.subs || [])) {
+      const o = document.createElement('option');
+      o.value = String(s.userId);
+      o.textContent = (s.nickname || ('账号 ' + s.userId)) + (s.isPrimary ? '（主）' : '');
+      sel.appendChild(o);
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+/** 打开（或重新加载）PK H5 容器。 */
+function openPkPage() {
+  const id = $('pkpage-leo').value;
+  if (!id) return toast('先导入小猿账号', 'err');
+  const frame = $('pkpage-frame');
+  // 带上 leoAccountId：hook 会把它拼进 API 代理 URL，Node 用它选账号 jar
+  frame.src = '/pk-h5/pk.html?leoAccountId=' + encodeURIComponent(id) + '&t=' + Date.now();
+  $('pkpage-hint').textContent = '正在加载原版 PK H5…（账号 id=' + id + '）';
+}
+
+$('pkpage-leo').addEventListener('change', loadPkPageSubs);
+$('pkpage-open').addEventListener('click', openPkPage);
+$('pkpage-reload').addEventListener('click', openPkPage);
 
 /* ---------------------------- 刷局页 ---------------------------- */
 

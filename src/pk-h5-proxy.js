@@ -1,0 +1,537 @@
+'use strict';
+// 真·PK 页面（H5）服务端代理。
+//
+// ## 为什么要在 Node 里代理 H5，而不是直接用原版页面
+//
+// PK 的交互全在原版 H5 里（`leo.fbcontent.cn/bh5/leo-web-oral-pk/pk.html`）。
+// 但把它原样嵌进来有**两个跨域死结**：
+//
+//  1. **API 请求跨域**：H5 的 axios `baseURL = https://xyks.yuanfudao.com/`，
+//     从我们的页面发出去就是跨域 → 浏览器 CORS 直接拦掉。而正确请求还必须
+//     带 `sign` + 风控头（`x-shepherd-did` / `leo-client-trace-id` /
+//     `default-namespace-sw8`）+ `_productId=631&_appId=6` —— 这些是
+//     [leo.buildUrl] / [leo.riskHeaders] 的活，H5 自己不会加。
+//
+//  2. **无法注入 hook**：跨域 iframe 的 contentDocument 取不到，没法在
+//     H5 启动前改写它的请求层。
+//
+// 解法：**把 H5 整套（HTML + 它引用的资产）都代理到本机**，让 H5 与我们的
+// 页面**同源**。同源之后两件事都成立了：
+//  - 注入一段 `XMLHttpRequest` hook（见 [H5_INJECT]），把发往
+//    `xyks` / `xyst` 的请求**改写到本机 `/api/pk/h5/api`**；
+//  - Node 侧拿到改写后的请求，复用 [leo] 的签名/风控头/公共参数，用**该账号的
+//    cookie** 发真请求，再把响应（含 Set-Cookie 吸收）回给 H5。
+//
+// ## 资产来源与缓存
+//
+// 资产从 CDN（`leo.fbcontent.cn`）按需拉取并**内存缓存**，所以 H5 版本升级
+// 会自动跟随上游（我们只改写 HTML 里的 URL，不改写资产内容）。
+//
+// 资产 URL 形如 `https://leo.fbcontent.cn/bh5/leo-web-oral-pk/assets/xxx.js`，
+// 本机路径统一为 `/pk-h5/assets/xxx.js`；其它 CDN 目录（`leo-common-bundle`）
+// 走 `/pk-h5/<相对路径>`。
+
+const https = require('node:https');
+const http = require('node:http');
+const { URL } = require('node:url');
+
+const { config, PK } = require('./config');
+const leo = require('./leo');
+const { request } = require('./http');
+
+/** H5 的 CDN 主机（资产与页面都在这里）。 */
+const CDN_HOST = 'https://leo.fbcontent.cn';
+/** PK H5 在 CDN 上的根目录。 */
+const H5_BASE_PATH = '/bh5/leo-web-oral-pk';
+/** 我方同源前缀 —— HTML 里所有 CDN URL 都会被改写成它。 */
+const LOCAL_PREFIX = '/pk-h5';
+
+/** 允许被代理的 API host（H5 会打这两个域）。 */
+const API_HOSTS = ['xyks.yuanfudao.com', 'xyst.yuanfudao.com', 'ape-api.yuanfudao.com'];
+
+/* ------------------------------ 资产缓存 ------------------------------ */
+
+/** url → { body:Buffer, contentType:string, at:number } */
+const assetCache = new Map();
+const ASSET_TTL_MS = 30 * 60 * 1000;
+
+/** 拉取 CDN 资产（带缓存）。失败返回 null。 */
+function fetchAsset(url) {
+  const hit = assetCache.get(url);
+  if (hit && Date.now() - hit.at < ASSET_TTL_MS) return Promise.resolve(hit);
+
+  return new Promise((resolve) => {
+    const u = new URL(url);
+    const req = https.request(
+      {
+        host: u.host,
+        path: u.pathname + u.search,
+        method: 'GET',
+        headers: { 'User-Agent': 'Mozilla/5.0', Accept: '*/*' },
+        timeout: 20000,
+      },
+      (res) => {
+        // 跟随一次重定向（CDN 偶发 302）
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume();
+          return resolve(fetchAsset(new URL(res.headers.location, url).toString()));
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return resolve(null);
+        }
+        const chunks = [];
+        res.on('data', (d) => chunks.push(d));
+        res.on('end', () => {
+          const body = Buffer.concat(chunks);
+          const item = {
+            body,
+            contentType: normalizeContentType(res.headers['content-type'], u.pathname),
+            at: Date.now(),
+          };
+          assetCache.set(url, item);
+          resolve(item);
+        });
+      },
+    );
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+    req.end();
+  });
+}
+
+/** 按扩展名兜底推断 Content-Type（CDN 有时不给）。 */
+function normalizeContentType(ct, pathname) {
+  if (ct && ct !== 'application/octet-stream') return String(ct).split(';')[0];
+  const ext = String(pathname).split('.').pop().toLowerCase();
+  const map = {
+    js: 'application/javascript',
+    mjs: 'application/javascript',
+    css: 'text/css',
+    html: 'text/html',
+    json: 'application/json',
+    svg: 'image/svg+xml',
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    webp: 'image/webp',
+    woff: 'font/woff',
+    woff2: 'font/woff2',
+    ttf: 'font/ttf',
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
+/* ------------------------------ HTML 改写 ------------------------------ */
+
+/**
+ * 要在 H5 之前注入的 hook 脚本。
+ *
+ * ## 它做什么
+ *
+ * H5 用 axios（基于 XMLHttpRequest）。这里在**所有脚本执行之前**包一层 XHR：
+ *   - 只要请求的绝对/相对地址落在 `xyks.yuanfudao.com` / `xyst.yuanfudao.com` /
+ *     `ape-api.yuanfudao.com`，就把 host 换成**本机同源**的 `/api/pk/h5/api`；
+ *   - 原始目标 host 放进 `X-PK-Target` 头，Node 侧据此还原真实 URL；
+ *   - `withCredentials` 打开时 cookie 同源自动带（我们自己就是同源）。
+ *
+ * 于是 H5 完全无感：它以为在发跨域请求，实际打到了本机代理，由 Node 补上
+ * sign / 风控头 / 公共参数后转发。
+ *
+ * ## 为什么包 XHR 而不是 fetch
+ *
+ * H5 的 axios 适配器用的是 `XMLHttpRequest`（见 request-legacy 里的
+ * `"adapter"` 函数体），不是 fetch。包 fetch 无效。
+ */
+const H5_INJECT = `(function () {
+  var TARGET_HOSTS = ['xyks.yuanfudao.com', 'xyst.yuanfudao.com', 'ape-api.yuanfudao.com', 'oapi.yuanfudao.com'];
+  var LOCAL = '/api/pk/h5/api';
+
+  /* ---- 诊断上报：把页面里的异常与请求结果回传本机，便于无头排查 ---- */
+  function diag(kind, data) {
+    try {
+      var payload = JSON.stringify({
+        kind: kind,
+        at: Date.now(),
+        url: String(location.href),
+        data: data,
+      });
+      // 用 sendBeacon/同步 XHR，避免页面跳转丢日志
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon('/api/pk/h5/diag?leoAccountId=' + (window.__PK_LEO_ID || ''), payload);
+      } else {
+        var x = new XMLHttpRequest();
+        x.open('POST', '/api/pk/h5/diag?leoAccountId=' + (window.__PK_LEO_ID || ''), true);
+        x.setRequestHeader('Content-Type', 'application/json');
+        x.send(payload);
+      }
+    } catch (e) { /* 诊断本身不能影响页面 */ }
+  }
+
+  window.__pkDiag = diag;
+  window.addEventListener('error', function (ev) {
+    diag('error', {
+      message: ev.message,
+      source: ev.filename,
+      line: ev.lineno,
+      col: ev.colno,
+      stack: ev.error && ev.error.stack ? String(ev.error.stack).slice(0, 1200) : null,
+    });
+  });
+  window.addEventListener('unhandledrejection', function (ev) {
+    var r = ev.reason;
+    diag('rejection', {
+      message: r && r.message ? r.message : String(r),
+      stack: r && r.stack ? String(r.stack).slice(0, 1200) : null,
+    });
+  });
+
+  function pickHost(url) {
+    var low = String(url).toLowerCase();
+    for (var i = 0; i < TARGET_HOSTS.length; i++) {
+      if (low.indexOf(TARGET_HOSTS[i]) >= 0) return TARGET_HOSTS[i];
+    }
+    return null;
+  }
+
+  var _open = XMLHttpRequest.prototype.open;
+  var _send = XMLHttpRequest.prototype.send;
+  var _setHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+  XMLHttpRequest.prototype.open = function (method, url) {
+    var rest = Array.prototype.slice.call(arguments, 2);
+    this.__pkMethod = method;
+    var host = pickHost(url);
+    if (host) {
+      try {
+        var abs = new URL(String(url), location.href);
+        this.__pkTarget = host + abs.pathname + abs.search;
+        var leo = window.__PK_LEO_ID ? '&leoAccountId=' + encodeURIComponent(window.__PK_LEO_ID) : '';
+        url = LOCAL + '?__t=' + encodeURIComponent(host) + leo;
+      } catch (e) { /* 解析失败就原样放行 */ }
+    } else if (String(url).indexOf('/api/pk/h5/') < 0 && String(url).indexOf('fbcontent') < 0) {
+      // 记录了「没被代理、也不是自身诊断」的请求，便于发现漏掉的域
+      diag('xhr-other', { method: method, url: String(url).slice(0, 300) });
+    }
+    return _open.apply(this, [method, url].concat(rest));
+  };
+
+  XMLHttpRequest.prototype.setRequestHeader = function (k, v) {
+    try {
+      this.__pkHeaders = this.__pkHeaders || {};
+      this.__pkHeaders[k] = v;
+    } catch (e) { /* ignore */ }
+    return _setHeader.apply(this, arguments);
+  };
+
+  XMLHttpRequest.prototype.send = function (body) {
+    var self = this;
+    try {
+      if (self.__pkTarget) {
+        _setHeader.call(self, 'X-PK-Path', self.__pkTarget);
+        _setHeader.call(self, 'X-PK-Headers', JSON.stringify(self.__pkHeaders || {}));
+      }
+    } catch (e) { /* ignore */ }
+
+    // 记录每个被代理请求的结果 —— 「点击没反应」时这是最直接的证据
+    if (self.__pkTarget && !self.__pkDiagBound) {
+      self.__pkDiagBound = true;
+      self.addEventListener('loadend', function () {
+        var body = '';
+        try { body = String(self.responseText || '').slice(0, 400); } catch (e) { body = '(读不到)'; }
+        diag('api-result', {
+          method: self.__pkMethod,
+          target: self.__pkTarget,
+          status: self.status,
+          body: body,
+        });
+      });
+    }
+    return _send.apply(self, arguments);
+  };
+
+  // fetch 也包一层（H5 主要用 XHR，但保险）
+  var _fetch = window.fetch;
+  if (_fetch) {
+    window.fetch = function (input, init) {
+      var url = typeof input === 'string' ? input : (input && input.url) || '';
+      var host = pickHost(url);
+      if (host) {
+        try {
+          var abs = new URL(String(url), location.href);
+          var leo = window.__PK_LEO_ID ? '&leoAccountId=' + encodeURIComponent(window.__PK_LEO_ID) : '';
+          var newUrl = LOCAL + '?__t=' + encodeURIComponent(host) + leo;
+          init = init || {};
+          init.headers = Object.assign({}, init.headers || {}, {
+            'X-PK-Path': host + abs.pathname + abs.search,
+            'X-PK-Headers': JSON.stringify(init.headers || {}),
+          });
+          return _fetch.call(this, newUrl, init).then(function (r) {
+            r.clone().text().then(function (t) { diag('fetch-result', { target: host + abs.pathname, status: r.status, body: String(t).slice(0, 400) }); }).catch(function () {});
+            return r;
+          });
+        } catch (e) { /* fallthrough */ }
+      }
+      return _fetch.apply(this, arguments);
+    };
+  }
+
+  diag('hook-ready', { ver: 2, leoId: window.__PK_LEO_ID || null, ua: navigator.userAgent.slice(0, 200) });
+
+  window.__pkH5Hook = { version: 2, local: LOCAL, hosts: TARGET_HOSTS };
+})();`;
+
+/**
+ * 改写 H5 的 HTML：把 CDN 的绝对 URL 全部换成本机同源路径，并注入 hook。
+ *
+ * 注入必须放在 `<head>` 的**第一个** script 之前 —— H5 的 request 模块在
+ * 模块加载时就定义好了 axios，晚注入就拦不到。
+ *
+ * @param {Buffer} html 原始 HTML
+ * @returns {Buffer} 改写后的 HTML
+ */
+function rewriteHtml(html, opts) {
+  let s = html.toString('utf8');
+  const leoId = opts && opts.leoAccountId != null ? String(opts.leoAccountId) : '';
+
+  // 0) 把 leoAccountId 提前注入：hook 脚本要用它拼 API 代理 URL。
+  //    必须在 hook **之前**执行，所以直接拼进注入片段最前面。
+  const pre = leoId
+    ? '<script>window.__PK_LEO_ID=' + JSON.stringify(leoId) + ';</script>'
+    : '';
+
+  // 1) 把 CDN 上的 H5 目录换成本机 /pk-h5 前缀
+  //    例：https://leo.fbcontent.cn/bh5/leo-web-oral-pk/assets/x.js → /pk-h5/assets/x.js
+  s = s.split(CDN_HOST + H5_BASE_PATH + '/').join(LOCAL_PREFIX + '/');
+  //    H5 页面本身的引用（不带 assets），如 .../pages/xxx.html
+  s = s.split(CDN_HOST + H5_BASE_PATH).join(LOCAL_PREFIX);
+  // 2) 其余 CDN 目录（leo-common-bundle 等）→ /pk-h5-cdn/<path>
+  s = s.split(CDN_HOST + '/bh5/').join(LOCAL_PREFIX + '-cdn/');
+  s = s.split(CDN_HOST + '/').join(LOCAL_PREFIX + '-cdn/');
+
+  // 3) 注入 hook：插在 <head> 后、任何 script 之前
+  const inject = pre + '<script>' + H5_INJECT + '</script>';
+  const headIdx = s.indexOf('<head>');
+  if (headIdx >= 0) {
+    s = s.slice(0, headIdx + 6) + inject + s.slice(headIdx + 6);
+  } else {
+    s = inject + s; // 没有 head 就放最前
+  }
+
+  return Buffer.from(s, 'utf8');
+}
+
+/* ------------------------------ 入口处理 ------------------------------ */
+
+/**
+ * 处理 `/pk-h5/*` 与 `/pk-h5-cdn/*`：把 CDN 资产（含 HTML）透传给浏览器。
+ *
+ * HTML 会被改写（URL 同源化 + 注入 hook）；其余资产原样透传。
+ *
+ * @returns {Promise<boolean>} true = 已处理（响应已写）
+ */
+async function serve(req, res, u) {
+  let cdnUrl = null;
+  const path = u.pathname;
+
+  if (path === '/pk-h5' || path === '/pk-h5/' || path === '/pk-h5/pk.html') {
+    cdnUrl = CDN_HOST + H5_BASE_PATH + '/pk.html';
+  } else if (path.startsWith(LOCAL_PREFIX + '/')) {
+    cdnUrl = CDN_HOST + H5_BASE_PATH + path.slice(LOCAL_PREFIX.length);
+  } else if (path.startsWith(LOCAL_PREFIX + '-cdn/')) {
+    cdnUrl = CDN_HOST + '/bh5/' + path.slice((LOCAL_PREFIX + '-cdn/').length);
+  }
+
+  if (!cdnUrl) return false;
+
+  const asset = await fetchAsset(cdnUrl);
+  if (!asset) {
+    res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('H5 资源拉取失败：' + cdnUrl);
+    return true;
+  }
+
+  let body = asset.body;
+  let contentType = asset.contentType;
+  if (contentType.indexOf('text/html') >= 0 || cdnUrl.endsWith('.html')) {
+    body = rewriteHtml(body, { leoAccountId: u.searchParams.get('leoAccountId') });
+    contentType = 'text/html';
+  }
+
+  res.writeHead(200, {
+    'Content-Type': contentType + (contentType.indexOf('text/') === 0 || contentType.indexOf('javascript') >= 0 || contentType.indexOf('json') >= 0 ? '; charset=utf-8' : ''),
+    'Content-Length': body.length,
+    // HTML 不缓存（便于跟随上游升级）；资产短缓存
+    'Cache-Control': cdnUrl.endsWith('.html') ? 'no-store' : 'public, max-age=600',
+    'Access-Control-Allow-Origin': '*',
+  });
+  res.end(body);
+  return true;
+}
+
+/* ------------------------------ API 代理 ------------------------------ */
+
+/**
+ * 处理 `/api/pk/h5/api?__t=<host>`：把 H5 的请求转发到真实主域。
+ *
+ * 关键点：
+ *  1. **还原真实 URL**：H5 被 hook 改写后只剩 `?__t=host`，真实路径在
+ *     `X-PK-Path` 头里（hook 写的）。
+ *  2. **补公共参数与 sign**：用 [leo.buildUrl] 重新组装 —— 它会补
+ *     `_productId` / `_appId` / `version` / `platform` 等，并按需加 `sign`。
+ *     H5 自己已经带了 `_productId` 的话会**原样保留**（buildUrl 里业务参数
+ *     优先级最高）。
+ *  3. **风控头**：`leo-game-pk` 走 [leo.riskHeaders]；`xyst` 域（solar）也带上。
+ *  4. **Cookie**：用**该小猿账号**的 jar（H5 里没有登录态，登录态在 Node）。
+ *
+ * @param {object} ctx { jar, rawBody }
+ */
+async function proxyApi(req, res, u, ctx) {
+  const targetHost = u.searchParams.get('__t') || '';
+  const rawPath = req.headers['x-pk-path'] || req.headers['X-PK-Path'] || '';
+  if (!rawPath) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, message: '缺少 X-PK-Path（H5 hook 未生效？）' }));
+    return;
+  }
+
+  // X-PK-Path 形如 `xyks.yuanfudao.com/leo-game-pk/android/math/pk/home?grade=2`
+  const slash = rawPath.indexOf('/');
+  const host = slash > 0 ? rawPath.slice(0, slash) : (targetHost || API_HOSTS[0]);
+  const pathAndQuery = slash > 0 ? rawPath.slice(slash) : rawPath;
+
+  if (API_HOSTS.indexOf(host) < 0) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, message: '不允许的代理目标：' + host }));
+    return;
+  }
+
+  const qi = pathAndQuery.indexOf('?');
+  const pathOnly = qi >= 0 ? pathAndQuery.slice(0, qi) : pathAndQuery;
+  const query = {};
+  if (qi >= 0) {
+    new URLSearchParams(pathAndQuery.slice(qi + 1)).forEach((v, k) => { query[k] = v; });
+  }
+
+  const method = req.method.toUpperCase();
+
+  // H5 原标题（hook 收集的），挑几个需要透传的
+  let h5Headers = {};
+  try { h5Headers = JSON.parse(req.headers['x-pk-headers'] || '{}'); } catch (e) { /* ignore */ }
+  const passContentType = h5Headers['Content-Type'] || h5Headers['content-type'] || 'application/json';
+
+  const isHostLeo = host === 'xyks.yuanfudao.com';
+  const isHostSolar = host === 'xyst.yuanfudao.com';
+
+  // 组装真实 URL：xyks / xyst 都走 buildUrl（补公共参数 + sign）。
+  //
+  // ## 为什么 xyst 也要（2026-09-29 实测）
+  //
+  // `xyst.yuanfudao.com/solar-activity/*` 同样被 `solar-encoder` 保护 ——
+  // 只带 H5 自己那套参数（无 sign）会 417 `No message available`；
+  // 与主域同源，需要 sign + 主域公共参数。H5 自己不算 sign（那是原生
+  // `LeoSecure.calculateSign` 的活），所以必须在代理侧补。
+  let realUrl;
+  if (isHostLeo || isHostSolar) {
+    const isPk = pathOnly.indexOf('/leo-game-pk') === 0;
+    // ★ 强制 PK 的 `_productId=631` / `_appId=6`（**覆盖** H5 传来的值）。
+    //
+    //   2026-09-29：H5 在**浏览器**里跑时 `isAppUA=false`（UA 不含
+    //   `YuanSouTiKouSuan`，那是 WebView 才追加的后缀），于是它按
+    //   `location.hostname` 分支算出 `_productId=131`（127.0.0.1 不匹配任何
+    //   已知域 → 兜底 131），并把 131 拼进 URL 发出来。
+    //
+    //   而 PK 端点（`leo-game-pk`）在 `SolarAuthFilter` 上**硬要求 631 + _appId=6**
+    //   —— 用 131 会被判为另一个产品线。`leo.buildUrl` 里业务参数优先级最高，
+    //   不覆盖就会被 H5 的 131 冲掉。这里显式覆盖。
+    if (isPk) {
+      query._productId = '631';
+      query._appId = '6';
+    }
+    // ★ 把 H5 传的 `version` 换成**主域协议版本**（3.140.1）。
+    //
+    //   2026-09-29 实测（xyst solar-activity）：
+    //     version=3.141.1（H5 从 UA 取的 App 版本） → 417 No message available
+    //     version=3.140.1（主域协议版本）          → 200 正常返回 banner
+    //   与 pk-node 早先在练习/主域上踩到的是**同一个坑**：solar-encoder 认的是
+    //   协议版本，不是 App 版本。H5 不知道这件事，所以必须在代理侧纠正。
+    query.version = PK.exercise.version;
+    realUrl = leo.buildUrl(pathOnly, query, {
+      // PK 路由用 631 + _appId=6；其余（含 solar）走默认 611。
+      // query 里已有 _productId 时 buildUrl 会保留它（业务参数优先）。
+      productId: isPk ? '631' : undefined,
+      appId: isPk ? '6' : undefined,
+      // solar 域的 host 与主域不同，buildUrl 默认拼 leoBase（xyks），
+      // 这里替换 host 后再返回。
+    });
+    if (isHostSolar) realUrl = realUrl.replace('https://' + config.leoHost, 'https://' + host);
+  } else {
+    const q = new URLSearchParams(query).toString();
+    realUrl = 'https://' + host + pathOnly + (q ? '?' + q : '');
+  }
+
+  const headers = Object.assign(
+    {},
+    isHostLeo || isHostSolar ? leo.riskHeaders() : {},
+    { 'Content-Type': passContentType },
+  );
+
+  let bodyBuf = null;
+  if (method !== 'GET' && method !== 'HEAD') {
+    bodyBuf = await readRaw(req, 8 * 1024 * 1024);
+  }
+
+  try {
+    const r = await request({
+      url: realUrl,
+      method: method,
+      jar: ctx.jar,
+      body: bodyBuf && bodyBuf.length ? bodyBuf : undefined,
+      headers: headers,
+    });
+
+    // 把响应原样回给 H5（H5 自己解析业务码）
+    const outHeaders = {
+      'Content-Type': (r.headers && r.headers['content-type']) || 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Access-Control-Allow-Origin': '*',
+    };
+    const outBody = Buffer.from(r.text || '', 'utf8');
+    outHeaders['Content-Length'] = outBody.length;
+    res.writeHead(r.status, outHeaders);
+    res.end(outBody);
+
+    // 审计：把「H5 打了什么、真实 URL 是什么、结果如何」记下来，便于定位 417
+    console.log('[pk-h5] ' + method + ' ' + host + pathOnly +
+      ' → HTTP ' + r.status + (r.status !== 200 ? ' body=' + String(r.text || '').slice(0, 200) : ''));
+  } catch (e) {
+    res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ ok: false, message: '代理失败：' + e.message }));
+  }
+}
+
+/** 读取原始请求体。 */
+function readRaw(req, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (d) => {
+      size += d.length;
+      if (size > limit) { reject(new Error('请求体过大')); req.destroy(); return; }
+      chunks.push(d);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+module.exports = {
+  CDN_HOST,
+  H5_BASE_PATH,
+  LOCAL_PREFIX,
+  API_HOSTS,
+  H5_INJECT,
+  rewriteHtml,
+  serve,
+  proxyApi,
+};
