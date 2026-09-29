@@ -694,6 +694,28 @@ const H5_INJECT = `(function () {
         } catch (e) { resolve(null); }
       });
     }
+    /** 把明文交给 Node 侧加密（浏览器里没有 keystream）。
+     *
+     *  ★ 2026-09-30：dataEncrypt 桥用 —— 这是「局数不增加」的正解。
+     *  加密 = gzip(level6,mtime0) + keystream XOR（见 src/native.js encodeSubmitBody），
+     *  与真机 libContentEncoder 逐字节一致（本项目已在刷分链路验证过）。
+     */
+    function nodeEncrypt(b64) {
+      return new Promise(function (resolve) {
+        try {
+          var x = new XMLHttpRequest();
+          x.open('POST', '/api/pk/h5/encrypt', true);
+          x.setRequestHeader('Content-Type', 'application/json');
+          x.onload = function () {
+            var out = null;
+            try { out = JSON.parse(x.responseText); } catch (e) { out = null; }
+            resolve(out && out.ok ? out.result : null);
+          };
+          x.onerror = function () { resolve(null); };
+          x.send(JSON.stringify({ base64: b64 }));
+        } catch (e) { resolve(null); }
+      });
+    }
 
     var HANDLERS = {
       openSchema: handleOpenSchema,
@@ -812,7 +834,34 @@ const H5_INJECT = `(function () {
           return { __pkOut: [null, { result: plainB64 }] };
         });
       },
-      dataEncrypt: function () { return ''; },   // 仅 PK 提交时用，暂不需要
+      /* ★★ dataEncrypt（LeoSecure）—— 2026-09-30：「局数不增加」的真因
+       *
+       *  对局结束 → H5 提交：
+       *    exercise-legacy C.postPkExerciseResult = n(t).then(t => a.put('/leo-game-pk/{client}/math/pk/submit',
+       *        t, { headers: { 'content-type': 'application/octet-stream' } }))
+       *    n = 把明文对象 → dataEncrypt 桥 → octet-stream 字节。
+       *
+       *  我曾把它写成空实现，于是：
+       *    桥返回空 → H5 判定 encrypt data fail（/debug/oralPK/dataEncryptFailed）
+       *    → **放弃提交** → 服务端没有本局记录 → 局数/胜场永远不涨。
+       *
+       *  真机契约（exercise-legacy 里读到）：
+       *    i('dataEncrypt', { base64: Base64.encode(JSON.stringify(e)), trigger:(i,c) => {
+       *        c && c.result ? resolve(Uint8Array(c.result)) : reject(Error('encrypt data fail'))
+       *    } }, 'LeoSecure')
+       *    → 桥回 { result: <加密字节> }，H5 用 Uint8Array(result) 当 body。
+       *
+       *  加密 = gzip(level6,mtime0) + keystream XOR（见 src/native.js encodeSubmitBody），
+       *  浏览器里没有 keystream，所以转发给 Node：POST /api/pk/h5/encrypt。
+       */
+      dataEncrypt: function (a) {
+        var b64 = (a && a.base64) || '';
+        return nodeEncrypt(b64).then(function (cipherB64) {
+          if (!cipherB64) return { __pkOut: ['ENCRYPT_FAILED'] };
+          diag('dataEncrypt', { inB64: b64.length, outB64: cipherB64.length });
+          return { __pkOut: [null, { result: cipherB64 }] };
+        });
+      },
       login: function () { return 'OK'; },
       // octopus 埋点 SDK 的配置读取。
       // ★ 键名必须是 method 本身：日志实测 H5 调的是 module=leo / method=getOrionConfig

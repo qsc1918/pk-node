@@ -156,7 +156,7 @@ function needAuth(pathname) {
   // PK H5 诊断回传：页面本身不需要登录（登录态在 Node 侧注入），
   // 所以这条也免鉴权，否则 hook 的诊断会被 401 挡掉。
   // 同样：H5 hook 的响应解密委托（dataDecrypt 桥），不能要求管理后台会话。
-  if (pathname === '/api/pk/h5/diag' || pathname === '/api/pk/h5/decrypt') return false;
+  if (pathname === '/api/pk/h5/diag' || pathname === '/api/pk/h5/decrypt' || pathname === '/api/pk/h5/encrypt') return false;
   if (pathname.startsWith('/api/')) return true;
   return false;
 }
@@ -406,6 +406,42 @@ async function handleApi(req, res, u, user) {
       } else {
         out = { ok: true, result: plain.toString('base64'), size: plain.length };
       }
+    } catch (e) {
+      out = { ok: false, message: String(e && e.message) };
+    }
+    const buf = Buffer.from(JSON.stringify(out), 'utf8');
+    res.writeHead(out.ok ? 200 : 500, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Length': buf.length,
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(buf);
+    return;
+  }
+  // ★ 2026-09-30：dataEncrypt 桥的 Node 侧（「局数不增加」的正解）。
+  //
+  //   H5 提交一局时：明文 JSON --base64--> 桥 dataEncrypt --> 本端点
+  //   本端点：明文 --gzip(level6,mtime0)+keystream XOR--> 密文
+  //   返回 { result: base64(密文) }，与真机桥协议一致（H5 用 Uint8Array(result) 当 body）。
+  //   与真机 libContentEncoder 逐字节一致（复用刷分链路的 native.encodeSubmitBody）。
+  if (p === '/api/pk/h5/encrypt') {
+    const txt = await new Promise((resolve) => {
+      const chunks = [];
+      let size = 0;
+      req.on('data', (d) => {
+        size += d.length;
+        if (size > 4 * 1024 * 1024) { req.destroy(); return; }
+        chunks.push(d);
+      });
+      req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      req.on('error', () => resolve(''));
+    });
+    let out = { ok: false };
+    try {
+      const body = JSON.parse(txt || '{}');
+      const plain = Buffer.from(String(body.base64 || ''), 'base64');
+      const cipher = nativeLib.encodeSubmitBody(plain);
+      out = { ok: true, result: cipher.toString('base64'), size: cipher.length };
     } catch (e) {
       out = { ok: false, message: String(e && e.message) };
     }
