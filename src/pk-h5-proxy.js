@@ -526,7 +526,11 @@ const H5_INJECT = `(function () {
       refreshStateView: 1,
       setForceBounceEnable: 1,
       observeTabChange: 1,
-      ShowPracticeDialogIfNeeded: 1,
+      // ★ 2026-09-30：ShowPracticeDialogIfNeeded 移到 HANDLERS（它其实是**查询**，
+      //   H5 要读 {dialogNeedToShow}），故从此处移除。
+      // setOnInteractivePopped：trigger 是「原生稍后回调」的一次性处理器，
+      //   登记时回调 = 立刻触发融合打卡 → 页面乱跳。只登记。
+      setOnInteractivePopped: 1,
     };
 
     /** 把结果按 H5 的协议回给页面：window[cbName](base64([err, ...data]))。
@@ -1025,10 +1029,61 @@ const H5_INJECT = `(function () {
       setLeftButton: function () { return 'OK'; },
       setForceBounceEnable: function () { return 'OK'; },
       getFireworkConfig: function () { return null; },
-      ShowPracticeDialogIfNeeded: function () { return 'OK'; },
+      // ★ 2026-09-30：ShowPracticeDialogIfNeeded 的实现在下方「桥补齐」区
+      //   （它其实返回 {dialogNeedToShow:false}，不再是空 'OK'）。
       observeTabChange: function () { return 'OK'; },
       // 抗沉迷查询（H5 用它决定要不要弹限制）。返回「无限制」。
       queryAntiAddiction: function () { return { status: 0 }; },
+
+      /* ==================== 桥补齐（2026-09-30，「全页面照逆向对齐」） ====================
+       *
+       * 方法：全量扫描 H5（oral-pk / exercise / result / pk / useMotivation /
+       * useRatingPopup / request-legacy / 荣誉榜）里的桥调用点，与 HANDLERS 做差集，
+       * 逐个读契约后补齐。契约一律照源码，不猜。
+       */
+      // 结算页弹窗（Result-legacy kt()）：无登录记录时用它拿「经验值」。
+      //   Q('getUnloggedUserExerciseExperience', { trigger:(a,i) => {
+      //        a ? reject(a) : resolve({ ..., lastExp: i.experience, ... }) } }, 'leo')
+      // ★ 必须回 { experience: <number> }，否则 resolve 出 lastExp=undefined。
+      getUnloggedUserExerciseExperience: function () { return { experience: 0 }; },
+      // 结算页随后上报：Q('addUnloggedUserExerciseRecord', {obtainExperience, ruleType}, 'leo')
+      addUnloggedUserExerciseRecord: function () { return 'OK'; },
+      // 官方 PK 主页（pk-legacy lt()）：能力 >= 3.118 时问「练习弹窗要不要弹」。
+      //   x('ShowPracticeDialogIfNeeded', { trigger:(e,t) => { !e && t && t.dialogNeedToShow } }, 'leo')
+      // ★ trigger 是**查询回调**（H5 读 t.dialogNeedToShow），必须回 {dialogNeedToShow:false}。
+      ShowPracticeDialogIfNeeded: function () { return { dialogNeedToShow: false }; },
+      // 旧版弹窗入口（能力 < 3.118 时调，无 trigger 语义）。
+      ShowMultiExpToolDialogIfNeeded: function () { return 'OK'; },
+      // 网络失败处理（request-legacy networkFailedManageByJsb）：
+      //   a('networkFailedManage', {errorCode, message}, 'leo').then(e => e ? reject(...) : resolve())
+      // ★ 返回值 e 为真 → H5 视为「失败」并 reject；回 '' 才 resolve。
+      networkFailedManage: function () { return ''; },
+      // 分享成图（Result-legacy / index-legacy.CHYoHfC0）：无返回值，只回执。
+      doShareAsImage: function () { return 'OK'; },
+      // 定位（oral-pk-legacy h()）：l('3.69.0') 时走本桥，期望 a.latitude / a.longitude。
+      getLocation: function () { return { latitude: 0, longitude: 0 }; },
+      // 应用商店版本判定（pk-legacy）。回 false = 不是商店版（我们不是 App 壳）。
+      isAppStoreVersion: function () { return false; },
+      // 评分弹窗（useRatingPopup）：
+      //   d() = new Promise(t => o('getRatingPopupFrequency', { trigger:(r,e) => t(r ? null : e) }, 'leo'))
+      //   ★ r 非空 → t(null) → H5 判定「不弹」；回对象则走频率判定。给 null 最保守。
+      getRatingPopupFrequency: function () { return null; },
+      // 主动展示评分弹窗（无 trigger）。回 'OK'。
+      showRatingPopup: function () { return 'OK'; },
+      // 回弹（下拉橡皮筋）开关：Oral-legacy / Result-legacy 都调 setBounceEnable。
+      // ★ 日志实测有 2 处调用，但 HANDLERS 此前只有 setForceBounceEnable → 会 bridge-miss。
+      setBounceEnable: function () { return 'OK'; },
+      /* ★★ setOnInteractivePopped（useMotivation M()）—— 特殊！
+       *
+       *   H5 用法（与 setLeftButton 那种「登记事件处理器」不同）：
+       *     M = () => { f() && u('setOnInteractivePopped', { trigger: () => { S() } }, 'leo'), ... }
+       *     // f() = 能力判定；S() = toFusionClockIn()：native://leo/tryShowFusionClockIn
+       *   这里的 trigger 是**一次性回调**：H5 期望原生在「该弹融合打卡时」回调它。
+       *
+       *   为避免「一登记就触发」（等于替用户操作 / 页面自己跳走），本桥**只登记不回调**
+       *   （列进 NO_TRIGGER_METHODS）。融合打卡本身在 inUse=false 环境里也不该发生。
+       */
+      setOnInteractivePopped: function () { return 'OK'; },
     };
     // 测试钩子：把桥处理器暴露给 Node 沙箱（tools/test-feature-config.js），
     // 便于对「纯函数桥」（feature flag 等）做断言，无需开浏览器。
