@@ -40,25 +40,43 @@ function toast(msg, kind) {
  * 用户要求：
  *   「当到达底部时会介入自动滚动，当用户上滑后关闭自动滚动，
  *     当下滑到底后又介入自动滚动，接着滚动要有丝滑的动画」
+ *   「滚动的速度应该和日志输出的速度匹配，做到连贯性下滑，看起来很快」
  *
  * 做法：
  *  - 给容器挂一次 `scroll` 监听（幂等，用 dataset 标记）；
  *  - 每次滚动后判断「是否（近）到底」→ 记录到 `dataset.autoFollow`；
- *  - 追加内容时若 autoFollow 为真 → `scrollTo({top: scrollHeight, behavior:'smooth'})`，
- *    这就是**丝滑动画**（不再是瞬移）。
+ *  - 追加内容时若 autoFollow 为真 → 平滑滚到底。
  *
- * ⚠️ 为什么不用 `scrollIntoView`：它会把**外层页面**也一起滚，导致整页跳动。
- *    只操作容器自身的 `scrollTo` 才安全。
+ * ⚠️ 为什么不用 `behavior:'smooth'`：浏览器对 smooth 用**固定时长**（约 300~500ms），
+ *    日志每 100ms 来一条时，上一条动画还没完就被下一条打断 → 看起来「一顿一顿」。
+ *    所以这里自己算时长（恒定线速度 ~3.2px/ms，钳制 80~600ms）。
+ *
+ * ⚠️ 不用 `scrollIntoView`：它会把**外层页面**也一起滚，导致整页跳动。
  */
+const AUTO_FOLLOW_SPEED = 3.2;   // px / ms
+
 function ensureAutoFollow(container) {
   if (!container || container.dataset.autoFollowBound === '1') return;
   container.dataset.autoFollowBound = '1';
   container.dataset.autoFollow = '1';   // 初始跟随
   container.addEventListener('scroll', () => {
+    // 我们自己发起的动画期间不要改开关（否则会被自己关掉）。
+    if (container.dataset.animating === '1') return;
     const gap = container.scrollHeight - container.scrollTop - container.clientHeight;
     // 距底 < 24px 视为「在底部」→ 打开跟随；否则（用户上滑了）→ 关闭。
     container.dataset.autoFollow = gap < 24 ? '1' : '0';
   }, { passive: true });
+}
+
+/** 平滑滚到底：按**剩余距离**算时长，恒定速度（与 Android 端一致）。 */
+function smoothScrollToBottom(container) {
+  const remaining = container.scrollHeight - container.scrollTop - container.clientHeight;
+  if (remaining <= 0) return;
+  const duration = Math.min(600, Math.max(80, Math.round(remaining / AUTO_FOLLOW_SPEED)));
+  container.dataset.animating = '1';
+  container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+  // smooth 的实际时长浏览器自定，这里用估算时长解锁开关即可（不会太长）。
+  setTimeout(() => { container.dataset.animating = '0'; }, Math.min(duration, 600));
 }
 
 /** 往日志容器追加一行；仅在「跟随中」时平滑滚到底。 */
@@ -70,9 +88,7 @@ function logLine(container, text, cls) {
   if (!div.dataset) div.dataset = {};
   container.appendChild(div);
   ensureAutoFollow(container);
-  if (container.dataset.autoFollow === '1') {
-    container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
-  }
+  if (container.dataset.autoFollow === '1') smoothScrollToBottom(container);
   return div;
 }
 
@@ -709,9 +725,7 @@ function updateTickLine(log, text, cls) {
   // ★ 2026-09-30：改为「跟随中才平滑滚到底」（原为无条件瞬移）。
   //   logLine 内部已处理过追加路径；这里是**原地更新心跳行**的路径，也要遵守同一语义。
   ensureAutoFollow(log);
-  if (log.dataset.autoFollow === '1') {
-    log.scrollTo({ top: log.scrollHeight, behavior: 'smooth' });
-  }
+  if (log.dataset.autoFollow === '1') smoothScrollToBottom(log);
 }
 
 /** 任务收尾：恢复按钮状态（并行模式下开始按钮一直是可用的）。 */
@@ -980,9 +994,7 @@ async function pumpPractice() {
     out.textContent += s + '\n';
     // ★ 2026-09-30：同「自动跟随」语义（跟随中才平滑滚，上滑后不打扰）。
     ensureAutoFollow(out);
-    if (out.dataset.autoFollow === '1') {
-      out.scrollTo({ top: out.scrollHeight, behavior: 'smooth' });
-    }
+    if (out.dataset.autoFollow === '1') smoothScrollToBottom(out);
   };
   const ruleTypes = $('prac-rts').value.split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n));
   try {
