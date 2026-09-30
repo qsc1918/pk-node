@@ -573,20 +573,26 @@ const H5_INJECT = `(function () {
           }
           if (target) {
             var local = addLeoId(toLocalH5(target));
-            // ★ 2026-09-30：「结算页没数据（0NaN年NaN月NaN日）」的真因。
+            // ★★ 2026-09-30 重大修正（推翻 ebc0451 的错误）：**绝不往 result.html 注入 isFromHistory**。
             //
-            //  Result-legacy 取数前先判断 ve() = B.search().isFromHistory：
-            //    isFromHistory → j.getPkExerciseResult(pkIdStr)  → GET history/detail ✅
-            //    否则          → J.getItem(_t) 读 localStorage（上一个 exercise 页存的）
-            //  我们拼的 result.html?pkIdStr=X 没带 isFromHistory，又没走真机的
-            //  saveLocalResult 顺序 → localStorage 空 → 结算数据为空 → 点「继续PK」无效。
-            //  真机「查看历史战绩」用的正是 isFromHistory=true，这里对齐它。
+            //  结算页 Result-legacy.loadData(he) 有两条分支：
+            //    ① ve()=B.search().isFromHistory 为真 → 这是「查看历史战绩」：
+            //         getPkExerciseResult(pkIdStr) → GET math/pk/history/detail
+            //         只填 examVO，correctCnt/selfWinCount/costTime **硬编码 0**
+            //         ★ 且此分支**完全不提交**（既不读 localStorage，也不 PUT submit）
+            //    ② 为假 → 这是「真机打完一局的结算」：
+            //         Kt(3,1000) 读 localStorage 'exerciseResult'（对局页 saveLocalResult 写的）
+            //         → se(o) = postPkExerciseResult → **PUT /math/pk/submit（这才是提交！）**
+            //         → 成功后 Zt() 清 localStorage、写入页面
+            //
+            //  真机对局结束跳转 = useNavigation f()，URL **不带** isFromHistory。
+            //  只有「查看历史战绩」I() 才带 isFromHistory=true。
+            //
+            //  我 ebc0451 自作聪明给所有 result.html 补了 isFromHistory=true →
+            //  结算页永远走分支① → 提交被彻底跳过 → 「局数不增加」。
+            //  这里必须保持原样，不做任何注入。
             if (local.indexOf('result.html') >= 0 && local.indexOf('isFromHistory') < 0) {
-              var hI = local.indexOf('#');
-              var qPart = hI >= 0 ? local.slice(0, hI) : local;
-              var hPart = hI >= 0 ? local.slice(hI) : '';
-              qPart += (qPart.indexOf('?') >= 0 ? '&' : '?') + 'isFromHistory=true';
-              local = qPart + hPart;
+              diag('result-no-history', { local: local.slice(0, 160) });
             }
             diag('openWebView', { url: target.slice(0, 300), local: local.slice(0, 300) });
             // 本机把「开新 WebView」实现为同窗口导航（H5 每页都是独立 html）。
