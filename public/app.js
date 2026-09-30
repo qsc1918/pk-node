@@ -199,8 +199,18 @@ function openPkPage() {
   if (!id) return toast('先导入小猿账号', 'err');
   const frame = $('pkpage-frame');
   // 带上 leoAccountId：hook 会把它拼进 API 代理 URL，Node 用它选账号 jar
-  frame.src = '/pk-h5/pk.html?leoAccountId=' + encodeURIComponent(id) + '&t=' + Date.now();
-  $('pkpage-hint').textContent = '正在加载原版 PK H5…（账号 id=' + id + '）';
+  //
+  // ★ 2026-09-30：悬浮窗已下线，自动能力改由 URL 参数驱动。
+  //   这里按当前勾选拼出 pkbot=... 传进去；没勾就传 off（显式全关）。
+  const caps = [];
+  if ($('pkbot-answer') && $('pkbot-answer').checked) caps.push('answer');
+  if ($('pkbot-stroke') && $('pkbot-stroke').checked) caps.push('autoStroke');
+  if ($('pkbot-next') && $('pkbot-next').checked) caps.push('autoNext');
+  const pkbot = caps.length ? caps.join(',') : 'off';
+  frame.src = '/pk-h5/pk.html?leoAccountId=' + encodeURIComponent(id) +
+    '&pkbot=' + encodeURIComponent(pkbot) + '&t=' + Date.now();
+  $('pkpage-hint').textContent = '正在加载原版 PK H5…（账号 id=' + id +
+    '，自动能力：' + (caps.length ? caps.join(' / ') : '无') + '）';
 }
 
 $('pkpage-leo').addEventListener('change', loadPkPageSubs);

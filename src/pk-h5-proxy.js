@@ -1441,7 +1441,41 @@ const H5_INJECT = `(function () {
   function pkBotSetPkId(id) { pkBotLastPkId = String(id || ''); }
   window.__pkBotSetPkId = pkBotSetPkId;
   var PK_BOT_KEY = 'pk-bot-cfg';
+
+  /* ---- 配置来源：★ 2026-09-30 移除网页悬浮窗，改由 URL 参数驱动 ----
+   *
+   * 背景：用户要求「网页端的 PK 功能悬浮窗不需要了」。
+   *
+   * 新机制：入口 URL 上带 ?pkbot=<逗号分隔的能力>，例如
+   *   /pk-h5/pk.html?leoAccountId=6&pkbot=answer,autoStroke,autoNext
+   * 支持的能力：answer（视为正确答案）、autoStroke（自动交笔）、
+   * autoNext（结算页自动开下一局）。
+   *
+   * 未带 pkbot 时：读取 localStorage（兼容旧值），否则**全关** ——
+   * 不再默认开 answer，避免「用户没要求却自动作答」。
+   *
+   * 兼容：pkbot=off 或 pkbot=（空）→ 显式全关。
+   */
+  function pkBotFromUrl() {
+    try {
+      var q = String(location.search || '');
+      var m = q.match(/[?&]pkbot=([^&#]*)/);
+      if (!m) return null;
+      var raw = decodeURIComponent(m[1] || '');
+      var parts = raw.split(',').map(function (s) { return s.trim().toLowerCase(); });
+      return {
+        answer: parts.indexOf('answer') >= 0,
+        autoStroke: parts.indexOf('autostroke') >= 0,
+        autoNext: parts.indexOf('autonext') >= 0,
+      };
+    } catch (e) { return null; }
+  }
+
   function pkBotCfg() {
+    // ① URL 参数优先（浏览器/无头抓取都走这条）
+    var fromUrl = pkBotFromUrl();
+    if (fromUrl) return fromUrl;
+    // ② 兼容旧值（此前悬浮窗写入的 localStorage）
     try {
       var raw = localStorage.getItem(PK_BOT_KEY);
       var o = raw ? JSON.parse(raw) : null;
@@ -1449,8 +1483,8 @@ const H5_INJECT = `(function () {
         return { answer: !!o.answer, autoStroke: !!o.autoStroke, autoNext: !!o.autoNext };
       }
     } catch (e) { /* ignore */ }
-    // 默认：视为正确答案 = 开（当前已验证可用）
-    return { answer: true, autoStroke: false, autoNext: false };
+    // ③ 默认全关（★ 不再默认开 answer）
+    return { answer: false, autoStroke: false, autoNext: false };
   }
   function pkBotSet(patch) {
     var c = pkBotCfg();
@@ -1580,55 +1614,8 @@ const H5_INJECT = `(function () {
       });
     } catch (e) { diag('bot-dom', { err: String(e && e.message) }); }
   }
-  /* ---- 面板 UI ---- */
-  function pkBotPanel() {
-    try {
-      if (document.getElementById('pk-bot-panel')) return;
-      if (!document.body) return;
-      var wrap = document.createElement('div');
-      wrap.id = 'pk-bot-panel';
-      wrap.style.cssText = 'position:fixed;right:8px;bottom:96px;z-index:2147483646;' +
-        'background:rgba(20,20,20,.86);color:#fff;font:12px/1.5 sans-serif;' +
-        'border-radius:10px;padding:8px 10px;box-shadow:0 2px 10px rgba(0,0,0,.3)';
-      var c = pkBotCfg();
-      function row(key, label) {
-        var lab = document.createElement('label');
-        lab.style.cssText = 'display:block;cursor:pointer;white-space:nowrap;margin:1px 0';
-        var cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.checked = !!(c && c[key]);
-        cb.style.cssText = 'vertical-align:-1px;margin-right:4px';
-        cb.onchange = function () {
-          var nc = {}; nc[key] = cb.checked;
-          pkBotSet(nc);
-          diag('bot-cfg', pkBotSet({}));
-        };
-        lab.appendChild(cb);
-        lab.appendChild(document.createTextNode(label));
-        return lab;
-      }
-      wrap.appendChild(row('answer', '视为正确答案'));
-      wrap.appendChild(row('autoStroke', '自动提交画笔'));
-      wrap.appendChild(row('autoNext', '自动下一局'));
-      var btn = document.createElement('div');
-      btn.textContent = '立即交一笔';
-      btn.style.cssText = 'margin-top:5px;text-align:center;background:#3b6ef6;' +
-        'border-radius:6px;padding:3px 6px;cursor:pointer';
-      btn.onclick = function () {
-        pkBotStroke();
-        setTimeout(function () { var n = pkBotFindNext(); if (n) n.click(); }, 350);
-      };
-      wrap.appendChild(btn);
-      var dbg = document.createElement('div');
-      dbg.textContent = 'dump DOM';
-      dbg.style.cssText = 'margin-top:4px;text-align:center;background:#444;' +
-        'border-radius:6px;padding:3px 6px;cursor:pointer';
-      dbg.onclick = function () { pkBotDumpDom('manual'); };
-      wrap.appendChild(dbg);
-      document.body.appendChild(wrap);
-      diag('bot-panel', pkBotCfg());
-    } catch (e) { /* ignore */ }
-  }
+  /** 悬浮窗 UI 已于 2026-09-30 整体移除（用户要求）。
+   * 自动能力改由入口 URL 的 ?pkbot= 参数驱动（见 pkBotFromUrl）。 */
 
   /* ---- 定时器：自动交笔 / 自动下一局 ---- */
   var pkBotStrokeBusy = false;
@@ -1682,8 +1669,7 @@ const H5_INJECT = `(function () {
   setTimeout(function () { pkBotDumpDom('t3s'); }, 3000);
   setTimeout(function () { pkBotDumpDom('t6s'); }, 6000);
 
-  setTimeout(pkBotPanel, 800);
-  setTimeout(pkBotPanel, 3000);
+  /* 悬浮窗调用已移除（2026-09-30）：自动能力改由 URL 参数 ?pkbot= 驱动。 */
 
   window.__pkH5Hook = { version: 2, local: LOCAL, hosts: TARGET_HOSTS };
 })();`;

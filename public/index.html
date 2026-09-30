@@ -152,6 +152,18 @@
         <button id="pkpage-open" class="primary">打开 PK 页面</button>
         <button id="pkpage-reload" class="ghost">重新加载</button>
       </div>
+      <div class="row" style="flex-wrap:wrap;gap:12px;align-items:center;margin-top:6px">
+        <label class="muted small" style="display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="pkbot-answer"> 视为正确答案
+        </label>
+        <label class="muted small" style="display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="pkbot-stroke"> 自动提交画笔
+        </label>
+        <label class="muted small" style="display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="pkbot-next"> 自动下一局
+        </label>
+        <span class="muted small">（勾选后点「打开 PK 页面」生效；页面内已不再显示悬浮窗）</span>
+      </div>
       <p class="muted small" id="pkpage-hint"></p>
     </div>
     <div class="card" style="padding:0;overflow:hidden">
