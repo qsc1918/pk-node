@@ -2,9 +2,12 @@
 # pk-node 启动脚本。
 #
 # 用法：
-#   ./start.sh                  # 默认 8787；被占则自动往后找一个空闲端口
+#   ./start.sh                  # 默认 8792；被占则自动往后找一个空闲端口
 #   PK_PORT=9000 ./start.sh     # 指定端口（被占则报错退出，不偷偷换）
 #   PK_HOST=0.0.0.0 ./start.sh  # 局域网可访问
+#
+# ★ 2026-09-30：默认端口从 8787 改为 8792 —— 本机 8787/8791 已被 MT APK MCP 占用。
+#   （8791 曾是 pk-node 默认，用户决定让给 MCP；PK 页面请用 8792。）
 #
 # 零依赖：不需要 npm install（只用 Node 内置模块）。
 # 要求：Node >= 22（用到 node:sqlite）。
@@ -39,13 +42,13 @@ if [ -n "${PK_PORT:-}" ]; then
   fi
   PORT="$PK_PORT"
 else
-  PORT="$("$NODE_BIN" bin/pick-port.js 8787 8820 2>/dev/null || true)"
+  PORT="$("$NODE_BIN" bin/pick-port.js 8792 8830 2>/dev/null || true)"
   if [ -z "$PORT" ]; then
-    echo "8787~8819 都被占用了，请用 PK_PORT=<空闲端口> ./start.sh" >&2
+    echo "8792~8829 都被占用了，请用 PK_PORT=<空闲端口> ./start.sh" >&2
     exit 1
   fi
-  if [ "$PORT" != "8787" ]; then
-    echo "提示：8787 已被占用，自动改用 $PORT"
+  if [ "$PORT" != "8792" ]; then
+    echo "提示：8792 已被占用，自动改用 $PORT"
   fi
 fi
 

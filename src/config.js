@@ -20,7 +20,10 @@ const config = {
   root: ROOT,
   /** 监听地址。默认只监听回环（用户要求 127.0.0.1）；内网/穿透时用 0.0.0.0。 */
   host: process.env.PK_HOST || '127.0.0.1',
-  port: envInt('PK_PORT', 8787),
+  // ★ 2026-09-30：本机 8791 已被 MT APK MCP 占用（用户决定 MCP 留 8791），
+  //   pk-node 固定用 8792，避免每次都要带 PK_PORT= 环境变量。
+  //   仍可用 PK_PORT 覆盖。
+  port: envInt('PK_PORT', 8792),
 
   /** SQLite 文件。放在项目 data/ 下，随项目走。 */
   dbFile: process.env.PK_DB || path.join(ROOT, 'data', 'pk-node.sqlite'),

@@ -47,7 +47,7 @@ if %NODE_MAJOR% LSS 22 (
 if not defined PK_HOST set PK_HOST=127.0.0.1
 
 rem ---- 端口：被占就往后找一个空的（用 node 自己试最准）----
-if not defined PK_PORT set PK_PORT=8787
+if not defined PK_PORT set PK_PORT=8792
 
 set PORT=
 for /f "delims=" %%p in ('node bin\pick-port.js %PK_PORT% 8820 2^>nul') do set PORT=%%p
