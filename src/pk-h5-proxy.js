@@ -717,6 +717,32 @@ const H5_INJECT = `(function () {
       });
     }
 
+    var FEATURE_CONFIG = {
+      // pk-legacy / useHomeModel：未登录也允许 PK。取值字符串 'true'/'false'。
+      'leo.unlogin.pk': 'false',
+      // usePreschoolGate：显示学龄前入口。'true'/'false'。
+      'leoShowPreschool': 'false',
+      // useNavigation：对局页用 oral-merge.html(true) 还是 exercise.html(false)。
+      'leoOralPKExerciseUseMerge': 'false',
+      // useMotivation：荣誉榜是否启用 → r.content.inUse（对象）
+      'leo.fusion.honor.ranking.config': { content: { inUse: true } },
+      // pk-legacy：校园赛季入口 → e.content.enable
+      'leo.oral.pk.schoolSeason.entry': { content: { enable: false } },
+      // ready_go：匹配等待文案 → o.content.courses[].imageUrl
+      'leo.pk.matching.waiting.text': { content: { courses: [] } },
+    };
+    /** 取功能开关值。键名可能来自 featureKey（getFeatureConfig）或 orionKey（getOrionConfig）。
+     *  未收录的键返回 null（H5 会走 HTTP 兜底 → 404 → 用它自己的默认值，与现状一致）。 */
+    function featureValue(key) {
+      var k = String(key || '');
+      if (Object.prototype.hasOwnProperty.call(FEATURE_CONFIG, k)) {
+        diag('feature-config', { key: k, hit: true });
+        return FEATURE_CONFIG[k];
+      }
+      diag('feature-config', { key: k, hit: false });
+      return null;
+    }
+
     var HANDLERS = {
       openSchema: handleOpenSchema,
       // H5 的跳转既可能发 openSchema（schemas 数组），也可能直接发 openWebView。
@@ -867,9 +893,29 @@ const H5_INJECT = `(function () {
       // ★ 键名必须是 method 本身：日志实测 H5 调的是 module=leo / method=getOrionConfig
       //   （payload.method = "leo_getOrionConfig"，由 callNative 拆成 module + method）。
       //   之前误写成 leo_getOrionConfig，导致 18 条 bridge-miss。
-      getOrionConfig: function () { return {}; },
-      leo_getOrionConfig: function () { return {}; },
-      leoGetOrionConfig: function () { return {}; },
+      /* ★★ 功能开关配置表（feature flag / orion key）—— 2026-09-30
+       *
+       * 背景（读 feature-legacy.C2Nasqum.js 全文得到）：
+       *   feature(key, default) 取值优先级：
+       *     ① 原生桥 getFeatureConfig('leo')（能力 version >= 3.36.0）  ← 真机走这条
+       *     ② HTTP POST {ORION_HOST}/orion-config-center/api/feature-config {bizKey}
+       *        .catch(() => default)   ← 出错一律降级为默认值
+       *
+       * 实测：xyst / oapi / xyks 三家的 orion 端点**全部 404** →
+       *   在我们环境里所有开关都会降级 → 入口/控件异常。
+       *
+       * 所以桥必须**直接给正确形态的值**，让 H5 走 ① 分支。
+       * 值形态来自各调用点（逐处读代码得到，勿凭感觉改）：
+       */
+      getOrionConfig: function (a) {
+        return featureValue(a && (a.orionKey || a.featureKey || a.key));
+      },
+      leo_getOrionConfig: function (a) {
+        return featureValue(a && (a.orionKey || a.featureKey || a.key));
+      },
+      leoGetOrionConfig: function (a) {
+        return featureValue(a && (a.orionKey || a.featureKey || a.key));
+      },
 
       // ★★ requestConfig（LeoSecure 模块）—— 2026-09-30 的又一个真 bug
       //
@@ -905,8 +951,12 @@ const H5_INJECT = `(function () {
 
       // 埋点上报（H5 用它记 request 日志）。无返回值，回 'OK'。
       addFrog: function () { return 'OK'; },
-      // 配置中心（走后端接口，见 feature-legacy）。返回空配置。
-      getFeatureConfig: function () { return null; },
+      // 配置中心（feature flag）。★ 必须回**真实值**：H5 优先走本桥，
+// 拿不到才走 HTTP（orion 端点实测 404 → 一律降级）。
+// 取值见上方 FEATURE_CONFIG / featureValue()。
+      getFeatureConfig: function (a) {
+        return featureValue(a && (a.featureKey || a.orionKey || a.key));
+      },
       // 设备标识：给一个稳定的伪 id（同一会话内一致，避免反复变化触发重渲染）。
       getDeviceId: function () { return { deviceId: DEVICE_ID }; },
       // 状态栏/导航栏：返回空对象即可（我们不用原生壳）。
@@ -919,7 +969,10 @@ const H5_INJECT = `(function () {
       // 抗沉迷查询（H5 用它决定要不要弹限制）。返回「无限制」。
       queryAntiAddiction: function () { return { status: 0 }; },
     };
-
+    // 测试钩子：把桥处理器暴露给 Node 沙箱（tools/test-feature-config.js），
+    // 便于对「纯函数桥」（feature flag 等）做断言，无需开浏览器。
+    // ★ 必须紧跟 HANDLERS 定义（同一作用域），不要挪到文件末尾。
+    window.__pkHandlers = HANDLERS;
     /** 缺省处理器：不认识的桥方法统一回「不支持」，并按协议回 trigger。
      *  —— 关键是**一定要回调**，否则 H5 侧 Promise 永久挂起，整条链路卡死。 */
     var MSG_METHOD_NOT_SUPPORT = 'METHOD_NOT_SUPPORT';
