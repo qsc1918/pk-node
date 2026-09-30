@@ -1221,7 +1221,47 @@ async function switchPracticeSub() {
 }
 /* ========================= 刷练习 结束 ========================= */
 
+/* ========================= 配置持久化 ========================= */
+/*
+ * 把「刷局 / 刷练习」面板里的配置存进 localStorage。
+ *
+ * ★★ 2026-09-30：用户反馈「网页版的刷练习的冷却间隔没法改」。
+ *
+ * 真因：本文件此前**完全没用 localStorage** —— 「每轮最小/最大间隔」这类输入框
+ * 一刷新页面 / 切到别的 tab 再回来，就恢复成 HTML 里的默认值（练习的默认是 0），
+ * 用户改完回来发现还是 0，看起来就是「改不了」。
+ *
+ * 做法：对下面这些输入框统一「改即存、启动即回填」。只存字符串，
+ * 语义校验仍由各表单自己负责（这里不越权）。
+ */
+const PERSIST_IDS = [
+  // 刷 PK 局
+  'grind-point', 'grind-rounds', 'grind-gapmin', 'grind-gapmax',
+  'grind-delaymin', 'grind-delaymax', 'grind-rlbase', 'grind-rlmax',
+  'grind-mretry', 'grind-mmax', 'grind-cost',
+  // 刷练习
+  'prac-kp', 'prac-limit', 'prac-rounds', 'prac-gapmin', 'prac-gapmax',
+  'prac-delta', 'prac-rts',
+];
+
+function bindPersist() {
+  for (const id of PERSIST_IDS) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    const key = 'pknode.cfg.' + id;
+    try {
+      const saved = localStorage.getItem(key);
+      // 只有「存过」才覆盖 HTML 默认值；空串也算有效（用户有意清空）。
+      if (saved !== null) el.value = saved;
+    } catch (e) { /* 隐私模式等，忽略 */ }
+    const save = () => { try { localStorage.setItem(key, el.value); } catch (e) { /* ignore */ } };
+    el.addEventListener('change', save);
+    el.addEventListener('blur', save);
+  }
+}
+
 (async function init() {
+  bindPersist();
   try {
     const ok = await refreshMe();
     if (ok) await bootstrapAfterLogin();
