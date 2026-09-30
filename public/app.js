@@ -34,7 +34,34 @@ function toast(msg, kind) {
   toastTimer = setTimeout(() => { el.className = 'toast hidden'; }, 4000);
 }
 
-/** 往日志容器追加一行并滚到底。 */
+/**
+ * ★ 2026-09-30：日志容器的「自动跟随滚动」——与 Android 端 [AutoFollowScroll] 同一语义。
+ *
+ * 用户要求：
+ *   「当到达底部时会介入自动滚动，当用户上滑后关闭自动滚动，
+ *     当下滑到底后又介入自动滚动，接着滚动要有丝滑的动画」
+ *
+ * 做法：
+ *  - 给容器挂一次 `scroll` 监听（幂等，用 dataset 标记）；
+ *  - 每次滚动后判断「是否（近）到底」→ 记录到 `dataset.autoFollow`；
+ *  - 追加内容时若 autoFollow 为真 → `scrollTo({top: scrollHeight, behavior:'smooth'})`，
+ *    这就是**丝滑动画**（不再是瞬移）。
+ *
+ * ⚠️ 为什么不用 `scrollIntoView`：它会把**外层页面**也一起滚，导致整页跳动。
+ *    只操作容器自身的 `scrollTo` 才安全。
+ */
+function ensureAutoFollow(container) {
+  if (!container || container.dataset.autoFollowBound === '1') return;
+  container.dataset.autoFollowBound = '1';
+  container.dataset.autoFollow = '1';   // 初始跟随
+  container.addEventListener('scroll', () => {
+    const gap = container.scrollHeight - container.scrollTop - container.clientHeight;
+    // 距底 < 24px 视为「在底部」→ 打开跟随；否则（用户上滑了）→ 关闭。
+    container.dataset.autoFollow = gap < 24 ? '1' : '0';
+  }, { passive: true });
+}
+
+/** 往日志容器追加一行；仅在「跟随中」时平滑滚到底。 */
 function logLine(container, text, cls) {
   const div = document.createElement('div');
   if (cls) div.className = cls;
@@ -42,7 +69,10 @@ function logLine(container, text, cls) {
   // 心跳行靠 data-tick 标记，便于原地更新而不是刷屏
   if (!div.dataset) div.dataset = {};
   container.appendChild(div);
-  container.scrollTop = container.scrollHeight;
+  ensureAutoFollow(container);
+  if (container.dataset.autoFollow === '1') {
+    container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+  }
   return div;
 }
 
@@ -676,7 +706,12 @@ function updateTickLine(log, text, cls) {
     const div = logLine(log, text, cls);
     div.dataset.tick = '1';
   }
-  log.scrollTop = log.scrollHeight;
+  // ★ 2026-09-30：改为「跟随中才平滑滚到底」（原为无条件瞬移）。
+  //   logLine 内部已处理过追加路径；这里是**原地更新心跳行**的路径，也要遵守同一语义。
+  ensureAutoFollow(log);
+  if (log.dataset.autoFollow === '1') {
+    log.scrollTo({ top: log.scrollHeight, behavior: 'smooth' });
+  }
 }
 
 /** 任务收尾：恢复按钮状态（并行模式下开始按钮一直是可用的）。 */
@@ -941,7 +976,14 @@ async function pumpPractice() {
   if (!id) return toast('先选择小猿账号', 'err');
   const out = $('prac-log');
   out.textContent = '';
-  const say = (s) => { out.textContent += s + '\n'; out.scrollTop = out.scrollHeight; };
+  const say = (s) => {
+    out.textContent += s + '\n';
+    // ★ 2026-09-30：同「自动跟随」语义（跟随中才平滑滚，上滑后不打扰）。
+    ensureAutoFollow(out);
+    if (out.dataset.autoFollow === '1') {
+      out.scrollTo({ top: out.scrollHeight, behavior: 'smooth' });
+    }
+  };
   const ruleTypes = $('prac-rts').value.split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n));
   try {
     say('开始上报…');
