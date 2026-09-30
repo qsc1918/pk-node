@@ -65,11 +65,46 @@ pkH5.setUserInfoProvider(async (leoAccountId) => {
         };
       }
     }
+    // ★★ 2026-09-30：兜底 —— 服务端 `baseUserInfoVO` 可能为 null。
+    //
+    //  实测（账号 7）：POST 请求 `math/pk/home` 返回 200，但 baseUserInfoVO=null
+    //  （该账号在 PK 侧没有用户资料，totalWinCount=0 / title=null）。
+    //  而 rewriteHtml 只在这个函数返回非空时才注入 window.__PK_USER，
+    //  于是 H5 的 getUserInfo 回 `{}` → isLogin=false → 界面显示「未登录」。
+    //
+    //  兜底：用 cookie 里的 `userid`（真实的 小猿 userId）构造最小可用信息，
+    //  保证 isLogin 成立；昵称/头像缺失时由 H5 用占位图，不影响功能。
+    const uid = Number(readCookieFromAccount(acc, 'userid') || 0);
+    if (uid) {
+      console.log('[pk-h5] baseUserInfoVO 为空，用 cookie userid 兜底：' + uid);
+      return {
+        userId: uid,
+        nickName: '',
+        nickname: '',
+        avatarUrl: '',
+        userPendantUrl: '',
+        userTag: r.json && r.json.userTag,
+        gradeId: (r.json && r.json.gradeId) || Number(acc.grade) || 0,
+      };
+    }
   } catch (e) {
     console.log('[pk-h5] pkHome 取用户信息失败：' + e.message);
   }
   return null;
 });
+
+/** 从账号的 cookies_json（数组形式）里读取某个 cookie 的值。 */
+function readCookieFromAccount(acc, name) {
+  try {
+    const arr = JSON.parse(acc.cookies_json || '[]');
+    if (!Array.isArray(arr)) return '';
+    for (const c of arr) {
+      if (!c) continue;
+      if ((c.name || c.key) === name) return String(c.value || '');
+    }
+  } catch (e) { /* ignore */ }
+  return '';
+}
 
 /* ---------------------------- 通用工具 ---------------------------- */
 
