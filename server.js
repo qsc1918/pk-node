@@ -156,6 +156,18 @@ function needAuth(pathname) {
   // PK H5 诊断回传：页面本身不需要登录（登录态在 Node 侧注入），
   // 所以这条也免鉴权，否则 hook 的诊断会被 401 挡掉。
   // 同样：H5 hook 的响应解密委托（dataDecrypt 桥），不能要求管理后台会话。
+  // ★★ 2026-09-30：PK H5 的出站代理（/api/pk/h5/api）也必须免鉴权！
+  //
+  //  现象：H5 主页面「登录态没了」、练习/好友PK 进不去、控件变少。
+  //  真因：H5 页面发的所有业务请求都经 /api/pk/h5/api 转发，
+  //        但 H5 页面**不带管理后台会话 cookie** → 被这里 401
+  //        （响应体是 {"ok":false,"message":"未登录"}，不是远端返回的）。
+  //        之前测试时我本人浏览器登录着管理后台，所以没暴露。
+  //
+  //  安全性：代理本身不做鉴权 —— 它用「URL 里 leoAccountId 对应的那个小猿账号」
+  //  的 cookie 出站（见 proxyApi），与访问者是不是管理后台用户无关。
+  //  这与 /pk-h5/ 页面本身免鉴权的设计一致。
+  if (pathname === '/api/pk/h5/api' || pathname.startsWith('/api/pk/h5/api/')) return false;
   if (pathname === '/api/pk/h5/diag' || pathname === '/api/pk/h5/decrypt' || pathname === '/api/pk/h5/encrypt') return false;
   if (pathname.startsWith('/api/')) return true;
   return false;
@@ -483,7 +495,16 @@ async function handleApi(req, res, u, user) {
   if (p === '/api/pk/h5/api') {
     const leoId = Number(u.searchParams.get('leoAccountId') || 0);
     const acc = db.getLeoAccount(leoId);
-    if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '账号不存在' });
+    // ★★ 2026-09-30 修正：**不再要求「小猿账号属于当前管理后台用户」**。
+    //
+    //  原来的 `acc.user_id !== user.id` 判定导致：
+    //    H5 页面（/pk-h5/pk.html）不带管理后台会话 → user=undefined →
+    //    所有业务请求被拒（401/404）→ 主页面「登录态没了」、练习/好友PK 进不去。
+    //
+    //  这里与「/pk-h5/ 页面本身免鉴权」的设计保持一致：页面与出站代理都不需要
+    //  管理后台登录；代理只是**用选定小猿账号的 cookie 出站**。
+    //  只要该账号在库中存在（用户自己配置的），就允许代理。
+    if (!acc) return sendJson(res, 404, { ok: false, message: '账号不存在' });
     return pkH5.proxyApi(req, res, u, { jar: jobs.jarOf(acc) });
   }
 
@@ -888,7 +909,11 @@ const server = http.createServer(async (req, res) => {
     // 无需登录：页面本身不含凭据，登录态由 H5 的 API 请求（走 /api/pk/h5/api）
     // 在 Node 侧注入。
     if (u.pathname === '/pk-h5' || u.pathname.startsWith('/pk-h5/') ||
-        u.pathname.startsWith('/pk-h5-cdn/')) {
+        u.pathname.startsWith('/pk-h5-cdn/') ||
+        // ★ 2026-09-30：H5 有入口直接拼 `${location.origin}/bh5/...`
+        //   （如「好友挑战」→ /bh5/leo-web-oral-pk/invite-friend.html），
+        //   这里一并交给 PK H5 代理处理，否则 404「未提供」。
+        u.pathname.indexOf('/bh5/') === 0) {
       try {
         const handled = await pkH5.serve(req, res, u);
         if (handled) return;

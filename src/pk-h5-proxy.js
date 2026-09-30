@@ -648,8 +648,28 @@ const H5_INJECT = `(function () {
       var low = u.toLowerCase();
       if (low.indexOf('data:') === 0 || low.indexOf('blob:') === 0 ||
           low.indexOf('javascript:') === 0) return u;
-      // 已经是本机同源
-      if (u.indexOf(location.origin) === 0) return u;
+      // 已经是本机同源 —— ★ 但仍需归一化 /bh5/ 前缀！
+      //
+      // ★★ 2026-09-30 真 bug（用户实测「好友挑战显示未提供」）：
+      //   pk-legacy 里有些入口直接拼 location.origin + '/bh5/leo-web-oral-pk/xxx.html'
+      //   （见 pk-legacy 的 gotoSimpleInvitePage / english-words 等），
+      //   URL 已经是本机 origin，于是走这条 early-return。
+      //   但本机**没有** /bh5/ 路由 → 404「未提供」。
+      //   正解：把同源的 /bh5/<任意目录>/ 也归一到 /pk-h5-cdn/<目录>/。
+      if (u.indexOf(location.origin) === 0) {
+        var samePath = u.slice(location.origin.length);
+        var bhp2 = '/bh5/';
+        var bi = samePath.indexOf(bhp2);
+        if (bi === 0) {
+          var rest2 = samePath.slice(bhp2.length);
+          var cdnOral2 = 'leo-web-oral-pk/';
+          if (rest2.indexOf(cdnOral2) === 0) {
+            return location.origin + '/pk-h5/' + rest2.slice(cdnOral2.length);
+          }
+          return location.origin + '/pk-h5-cdn/' + rest2;
+        }
+        return u;
+      }
 
       var BHP = '/bh5/';
       var i = u.indexOf(BHP);
@@ -724,8 +744,16 @@ const H5_INJECT = `(function () {
       'leoShowPreschool': 'false',
       // useNavigation：对局页用 oral-merge.html(true) 还是 exercise.html(false)。
       'leoOralPKExerciseUseMerge': 'false',
-      // useMotivation：荣誉榜是否启用 → r.content.inUse（对象）
-      'leo.fusion.honor.ranking.config': { content: { inUse: true } },
+// ★★ 2026-09-30 重要修正（用户实测「结算页点返回就直接继续PK」）：
+        //  inUse 是**融合荣誉榜开关**，useMotivation.exerciseMotivation = content.inUse。
+        //  而 Result-legacy 的「返回」按钮：
+        //      ht = () => c.value||u() ? (M.value ? onBackClick
+        //                                : F.value ? toFusionClockIn()   // ← F=exerciseMotivation
+        //                                : T())
+        //                              : (c.value = true)
+        //  所以 inUse=true 会让「返回」变成「继续 PK 打卡流程」而不是返回！
+        //  真机常规（非融合）环境该值是 false。
+        'leo.fusion.honor.ranking.config': { content: { inUse: false } },
       // pk-legacy：校园赛季入口 → e.content.enable
       'leo.oral.pk.schoolSeason.entry': { content: { enable: false } },
       // ready_go：匹配等待文案 → o.content.courses[].imageUrl
@@ -800,6 +828,33 @@ const H5_INJECT = `(function () {
       // 所以必须返回**真实的** userId（非 0 即视为已登录）。
       // 数据由 Node 侧注入 window.__PK_USER（见 server.js 的 /pk-h5 分支）。
       getUserInfo: function () { return window.__PK_USER || {}; },
+      /* ★★ 2026-09-30：补齐两个「练习入口」必需的能力桥。
+       *
+       *  现象：H5 主页面登录态拿不到、练习/好友 PK 进不去。
+       *  日志实证：bridge-miss leo/getExerciseInfo → H5 reject(METHOD_NOT_SUPPORT)。
+       *
+       *  契约（读 oral-pk-legacy.CoJN1ZvA.js 得到）：
+       *    w() = new Promise((resolve, reject) => {
+       *      p() ? 走接口 : callNative('getExerciseInfo', {
+       *        trigger: (err, r) => err ? reject(err) : resolve(r) }, 'leo')
+       *    })
+       *    // 期望 r = { exerciseGradeId, exerciseSemesterId }
+       *    //   调用方 b(): r.exerciseGradeId 用作 grade
+       *  另一处（useUserInfo-legacy）：能力 >= 3.81.0 时调
+       *    leo/getExerciseConfig → 期望 { grade, semester, bookMath, bookChinese, bookEnglish }
+       *
+       *  两者都返回当前账号的真实年级（来自 window.__PK_USER.gradeId / window.__PK_GRADE）。
+       */
+      getExerciseInfo: function () {
+        var g = Number(window.__PK_GRADE || (window.__PK_USER && window.__PK_USER.gradeId) || 0) || 1;
+        diag('getExerciseInfo', { grade: g });
+        return { exerciseGradeId: g, exerciseSemesterId: 1 };
+      },
+      getExerciseConfig: function () {
+        var g = Number(window.__PK_GRADE || (window.__PK_USER && window.__PK_USER.gradeId) || 0) || 1;
+        diag('getExerciseConfig', { grade: g });
+        return { grade: g, semester: 1, bookMath: 1, bookChinese: 4, bookEnglish: 10 };
+      },
 
       /* ★★ dataDecrypt（LeoSecure）—— 2026-09-30：「PK 一直匹配中」的最后一层
        *
@@ -1437,6 +1492,30 @@ const H5_INJECT = `(function () {
         canvases: info.join(' | '),
         texts: texts.join(' / '),
         url: location.pathname,
+        // ★ 2026-09-30：把「模式开关」的当前状态与全部 localStorage 键一起回报。
+        //   背景：pk.html 有 CLASSICS(口算PK) / PROPS(诗词·单词) 两个模式，
+        //   两者共用同一块面板 —— 停在哪一个决定用户看到哪些入口。
+        //   之前只能靠猜（CSS 类名 props-mode 其实是样式，不是存储键），
+        //   这里一次性把真值取回来。
+        mode: (function () {
+          try {
+            var SW = document.querySelectorAll('[class*=mode-switch] .switch');
+            var act = document.querySelector('[class*=mode-switch] [class*=active-bar]');
+            var left = act ? (act.style && act.style.left) : '';
+            var sw = document.querySelectorAll('.mode-switch .switch');
+            return 'switchCount=' + sw.length + ' activeLeft=' + left;
+          } catch (e) { return 'err:' + (e && e.message); }
+        })(),
+        ls: (function () {
+          try {
+            var out = [];
+            for (var z = 0; z < localStorage.length; z++) {
+              var k = localStorage.key(z);
+              out.push(k + '=' + String(localStorage.getItem(k)).slice(0, 40));
+            }
+            return out.join(' | ').slice(0, 900);
+          } catch (e) { return 'err:' + (e && e.message); }
+        })(),
       });
     } catch (e) { diag('bot-dom', { err: String(e && e.message) }); }
   }
@@ -1536,6 +1615,11 @@ const H5_INJECT = `(function () {
   // ★ 自动 DOM 快照（2026-09-30）：每 5s 回传一次界面结构。
   //  用于定位「卡在某个浮层」类问题 —— 直接看到有哪些可点文本与画板尺寸。
   setInterval(function () { pkBotDumpDom('bot-auto-dom'); }, 5000);
+  // ★ 加载即 dump（1.2s / 3s / 6s 各一次）—— 无头抓取（visit_web）存活时间短，
+  //   5s 定时器可能来不及跑，导致拿不到 mode / localStorage 观测。
+  setTimeout(function () { pkBotDumpDom('t1.2s'); }, 1200);
+  setTimeout(function () { pkBotDumpDom('t3s'); }, 3000);
+  setTimeout(function () { pkBotDumpDom('t6s'); }, 6000);
 
   setTimeout(pkBotPanel, 800);
   setTimeout(pkBotPanel, 3000);
@@ -1573,6 +1657,11 @@ function rewriteHtml(html, opts) {
     leoId ? '<script>window.__PK_LEO_ID=' + JSON.stringify(leoId) + ';</script>' : '',
     '<script>window.__PK_STORAGE_PRESET={"oral-pk-guide":"true"};</script>',
     user ? '<script>window.__PK_USER=' + JSON.stringify(user) + ';</script>' : '',
+    // ★ 2026-09-30：年级单独暴露一份，供 getExerciseInfo/getExerciseConfig 等能力桥使用
+    //   （H5 的 grade 直接影响练习/好友PK 入口是否可用）。
+    user && user.gradeId
+      ? '<script>window.__PK_GRADE=' + JSON.stringify(Number(user.gradeId) || 0) + ';</script>'
+      : '',
   ].join('');
 
   // 1) 把 CDN 上的 H5 目录换成本机 /pk-h5 前缀
@@ -1727,6 +1816,21 @@ async function serve(req, res, u) {
 
   if (path === '/pk-h5' || path === '/pk-h5/' || path === '/pk-h5/pk.html') {
     cdnUrl = CDN_HOST + H5_BASE_PATH + '/pk.html';
+  } else if (path.indexOf('/bh5/') === 0) {
+    // ★★ 2026-09-30：兼容直接访问 `/bh5/<目录>/<页面>`。
+    //
+    //  现象（用户实测）：点「好友挑战」→ location.href 或 openWebView 指向
+    //    http://127.0.0.1:8792/bh5/leo-web-oral-pk/invite-friend.html → 「未提供」。
+    //  原因：H5 有若干入口直接拼 `${location.origin}/bh5/...`（不经过 CDN 域），
+    //        本机没有 /bh5/ 路由。
+    //  处理：把 /bh5/<目录>/x 映射到 /pk-h5-cdn/<目录>/x（与资产改写一致）。
+    //        其中 leo-web-oral-pk 走更短的 /pk-h5/<x>，与其它页面保持一致。
+    const rest = path.slice('/bh5/'.length);
+    if (rest.indexOf('leo-web-oral-pk/') === 0) {
+      cdnUrl = CDN_HOST + H5_BASE_PATH + '/' + rest.slice('leo-web-oral-pk/'.length);
+    } else {
+      cdnUrl = CDN_HOST + '/bh5/' + rest;
+    }
   } else if (path.startsWith(LOCAL_PREFIX + '/')) {
     // /pk-h5/assets/x.js → CDN 的 leo-web-oral-pk/assets/x.js
     cdnUrl = CDN_HOST + H5_BASE_PATH + path.slice(LOCAL_PREFIX.length);
@@ -1895,16 +1999,44 @@ const pkLastAt = {};     // host -> 上次出站时间
 
 function sleepMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-/** 串行化 + 最小间隔地执行一次出站请求。 */
-function pkThrottleRun(host, fn) {
-  const prev = pkThrottle[host] || Promise.resolve();
-  const next = prev.then(async () => {
+/** ★ 2026-09-30：首屏关键请求 —— 必须**优先出站**。
+ *
+ *  背景：同一 host 串行 + 最小间隔（默认 120ms）是为绕开服务端突发限流。
+ *  但 pk.html 首屏会同时发 6+ 个 xyks 请求，若一律 FIFO，
+ *  `math/pk/home`（口算PK 卡片的数据源，决定 pointList 是否渲染）
+ *  可能排在最后 → 首屏 700ms+ 才拿到 → 卡片不显示/加载慢。
+ *
+ *  这里给关键请求开一条**优先通道**：它不排在同 host 的普通队列后面，
+ *  而是插到队首立刻执行（仍受最小间隔约束，避免触发限流）。
+ */
+const PK_PRIORITY_PATHS = [
+  '/leo-game-pk/api/math/pk/home',
+  '/leo-game-pk/api/math/pk/props/home',
+  '/leo-game-pk/api/math/pk/match',
+];
+function pkIsPriorityPath(pathAndQuery) {
+  const p = String(pathAndQuery || '');
+  for (let i = 0; i < PK_PRIORITY_PATHS.length; i++) {
+    if (p.indexOf(PK_PRIORITY_PATHS[i]) >= 0) return true;
+  }
+  return false;
+}
+
+/** 串行化 + 最小间隔地执行一次出站请求。
+ *  @param {boolean} [priority] 关键请求：不与普通队列排队（直接插队，只受间隔约束）。
+ */
+function pkThrottleRun(host, fn, priority) {
+  const gate = async () => {
     const now = Date.now();
     const wait = PK_THROTTLE_GAP_MS - (now - (pkLastAt[host] || 0));
     if (wait > 0) await sleepMs(wait);
     try { return await fn(); }
     finally { pkLastAt[host] = Date.now(); }
-  });
+  };
+  // 关键请求：直接跑（不接在 pkThrottle[host] 链尾）
+  if (priority) return gate();
+  const prev = pkThrottle[host] || Promise.resolve();
+  const next = prev.then(gate);
   // 链尾不因为单次失败而断掉
   pkThrottle[host] = next.then(() => {}, () => {});
   return next;
@@ -2067,11 +2199,13 @@ async function proxyApi(req, res, u, ctx) {
         rawBody: isEncryptedPath(pathOnly),
       });
     }
-    let r = await pkThrottleRun(host, once);
+    // ★ 首屏关键请求走优先通道（不被同 host 普通队列拖慢，见 pkIsPriorityPath）
+    const prio = pkIsPriorityPath(pathOnly);
+    let r = await pkThrottleRun(host, once, prio);
     if (r.status === 401 || r.status === 429) {
       diagLog('retry', pathOnly + ' ' + r.status + ' → 退避重试');
       await sleepMs(400);
-      r = await pkThrottleRun(host, once);
+      r = await pkThrottleRun(host, once, prio);
       diagLog('retry', pathOnly + ' 重试后 ' + r.status);
     }
 
