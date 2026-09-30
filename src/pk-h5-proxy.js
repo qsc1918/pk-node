@@ -838,6 +838,16 @@ const H5_INJECT = `(function () {
       // 所以必须返回**真实的** userId（非 0 即视为已登录）。
       // 数据由 Node 侧注入 window.__PK_USER（见 server.js 的 /pk-h5 分支）。
       getUserInfo: function () { return window.__PK_USER || {}; },
+      /* ★★ 2026-09-30：getBasicInfo —— 桥调用器里的 r("B")（index-legacy.CHYoHfC0）。
+       *
+       * H5 调 Zt("getBasicInfo", {trigger})，未实现时会走 callNative 兜底 → 回
+       * undefined → await 到 undefined 可能让初始化提前结束（页面停「0 胜 / 胜率 0%」）。
+       * 契约：resolve 出基础信息对象，字段未被硬依赖，回对象即可。
+       */
+      getBasicInfo: function () {
+        var u = window.__PK_USER || {};
+        return { userId: u.userId || 0, gradeId: u.gradeId || 0 };
+      },
       /* ★★ 2026-09-30：补齐两个「练习入口」必需的能力桥。
        *
        *  现象：H5 主页面登录态拿不到、练习/好友 PK 进不去。
