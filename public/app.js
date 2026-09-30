@@ -52,8 +52,24 @@ function toast(msg, kind) {
  *    所以这里自己算时长（恒定线速度 ~3.2px/ms，钳制 80~600ms）。
  *
  * ⚠️ 不用 `scrollIntoView`：它会把**外层页面**也一起滚，导致整页跳动。
+ *
+ * ★★ 2026-09-30 v2：改用 **二阶阻尼弹簧引擎**（对齐 dsh-smooth-stream
+ *    的「弹簧跟随引擎」，也对齐 Android 端 [AutoFollowScroll]）：
+ *
+ *     a = (k*(target - x) - c*v) / m ;  v += a*dt ;  x += v*dt
+ *
+ *    参数 k=130, c=24, m=1；每帧 rAF 积分，掉帧时 dt 钳位 ≤ 32ms。
+ *    新日志到达只是抬高 target，速度 v **连续**（不像 tween 每次重启归零），
+ *    因此是「连贯下滑」而不是一顿一顿。
  */
-const AUTO_FOLLOW_SPEED = 3.2;   // px / ms
+const SPRING_K = 130, SPRING_C = 24, SPRING_M = 1;
+const SPRING_MAX_DT = 0.032;   // 掉帧钳位（秒，对齐 dsh）
+const SPRING_REST_V = 1.0;     // 速度阈值（px/s）
+
+function springState(container) {
+  if (!container.__spring) container.__spring = { x: 0, v: 0, raf: 0, last: 0 };
+  return container.__spring;
+}
 
 function ensureAutoFollow(container) {
   if (!container || container.dataset.autoFollowBound === '1') return;
@@ -63,20 +79,41 @@ function ensureAutoFollow(container) {
     // 我们自己发起的动画期间不要改开关（否则会被自己关掉）。
     if (container.dataset.animating === '1') return;
     const gap = container.scrollHeight - container.scrollTop - container.clientHeight;
-    // 距底 < 24px 视为「在底部」→ 打开跟随；否则（用户上滑了）→ 关闭。
-    container.dataset.autoFollow = gap < 24 ? '1' : '0';
+    // 距底 < 48px 视为「在底部」→ 打开跟随；否则（用户上滑了）→ 关闭。
+    container.dataset.autoFollow = gap < 48 ? '1' : '0';
   }, { passive: true });
 }
 
-/** 平滑滚到底：按**剩余距离**算时长，恒定速度（与 Android 端一致）。 */
+/** 弹簧跟随到底：rAF 逐帧积分（速度连续，所以连贯、不顿）。 */
 function smoothScrollToBottom(container) {
-  const remaining = container.scrollHeight - container.scrollTop - container.clientHeight;
-  if (remaining <= 0) return;
-  const duration = Math.min(600, Math.max(80, Math.round(remaining / AUTO_FOLLOW_SPEED)));
+  const st = springState(container);
+  if (st.raf) return;                  // 已在跑 → 单帧循环会自然追上新的 scrollHeight
+  const maxTop = container.scrollHeight - container.clientHeight;
+  if (maxTop - container.scrollTop <= 0) return;
+  st.x = container.scrollTop;
+  st.v = 0;
+  st.last = 0;
   container.dataset.animating = '1';
-  container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
-  // smooth 的实际时长浏览器自定，这里用估算时长解锁开关即可（不会太长）。
-  setTimeout(() => { container.dataset.animating = '0'; }, Math.min(duration, 600));
+  st.raf = requestAnimationFrame(function step(now) {
+    const s = springState(container);
+    const dt = s.last ? Math.min(SPRING_MAX_DT, (now - s.last) / 1000) : (1 / 60);
+    s.last = now;
+    // 目标恒为「滚到底」——内容继续变高时 maxTop 变大，弹簧自然接着追。
+    const target = container.scrollHeight - container.clientHeight;
+    const a = (SPRING_K * (target - s.x) - SPRING_C * s.v) / SPRING_M;
+    s.v += a * dt;
+    s.x += s.v * dt;
+    if (s.x < 0) { s.x = 0; s.v = 0; }
+    if (s.x > target) { s.x = target; }
+    container.scrollTop = s.x;
+    if (Math.abs(target - s.x) < 0.5 && Math.abs(s.v) < SPRING_REST_V) {
+      container.scrollTop = target;
+      s.raf = 0; s.last = 0; s.v = 0;
+      container.dataset.animating = '0';
+      return;
+    }
+    s.raf = requestAnimationFrame(step);
+  });
 }
 
 /** 往日志容器追加一行；仅在「跟随中」时平滑滚到底。 */
