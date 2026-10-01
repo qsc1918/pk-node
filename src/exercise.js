@@ -113,18 +113,20 @@ function buildExerciseUrl(path, params) {
 /**
  * 练习端点的签名策略。
  *
- * ## ★ 练习**必须**带 sign（2026-09-28 实测）
+ * ## ★ 练习**必须**带 sign（实测）
  *
  * ```
- * 不带 sign → 417 No message available   （solar-encoder 拦）
- * 带 sign   → 200
+ * 不带 sign / 假 sign → 417 No message available   （solar-encoder 拦）
+ * 带真 sign           → 200
  * ```
  *
- * 与 PK 相反（PK 的 home/match/submit 都不需要 sign）。
- * 所以这里**不受 `config.signMode` 影响**：只要原生库在，就一定算上；
- * 只有确实算不出来时才退化为不带（并会在 selftest 里体现）。
+ * 这里**不受 `config.signMode` 影响** —— 练习端点一律带上。
  *
- * 这也解释了「PK 能在 Windows 上跑、练习不能」：练习依赖 sign（arm64 原生库）。
+ * ## ★ 2026-10-01：sign 已可在任意平台计算（417 根治）
+ *
+ * 此前 sign 依赖 `bin/native/linker64 + dump7`（arm64），Windows/x86 上算不出来，
+ * 于是练习端点必然 417 —— 这就是「PK 能用、练习不能用」的根因。
+ * 现在 T 由 `src/lre-emu.js` 在 JS 里执行同一段机器码算出，**平台无关**。
  */
 function maybeSign(path) {
   try {
@@ -471,13 +473,21 @@ async function pumpScore(jar, opts) {
 }
 
 /**
- * 练习出题冷却（**实测 ≈62 秒/账号**，2026-09-28）。
+ * 练习出题冷却（毫秒）—— 每轮之间的**下沿**，不是硬上限。
  *
- * 与 PK 的出题冷却（61.6s）几乎同一个数 —— 应是同一个账号级限流器。
- * 所以「出题 → 提交」一轮 ≈ 62s；但一局可以开 **100 题 = 200 exp**，
- * 折算下来仍远快于按 10 题一局地刷。
+ * ## ★ 2026-10-01 实测：62s 的旧结论已作废
+ *
+ * 旧值取下 PK 同源的「账号级 62 秒限流」（2026-09-28 实测）。但当前服务端
+ * **已彻底放开**：同一账号连续出题（间隔 1.5s）**4 次全 200**，无 429。
+ * 继续按 62s 配速会把刷练习拖慢 60 倍 —— 这也是「刷练习感觉没用」的原因之一。
+ *
+ * 现在默认 **1s**（与安卓端 `ExercisePumpEngine.DEFAULT_COOLDOWN_MS` 对齐），
+ * 可用 `PK_EX_MATCH_COOLDOWN_MS` 覆盖。
+ *
+ * 它同时是「每轮间隔的下沿」：实际等待 = `max(冷却剩余, 随机间隔)`，
+ * 万一服务端将来收紧，[runPractice] 内部的 429 重试仍会兜底。
  */
-const MATCH_COOLDOWN_MS = 62_000;
+const MATCH_COOLDOWN_MS = Math.max(0, Number(process.env.PK_EX_MATCH_COOLDOWN_MS) || 1_500);
 /** 撞 429 时的重试间隔 / 总等待上限。 */
 const MATCH_RETRY_INTERVAL_MS = 10_000;
 const MATCH_RETRY_MAX_MS = 4 * 60 * 1000;
@@ -601,7 +611,10 @@ async function practiceLoop(jar, opts) {
    */
   const gapMin = Math.max(0, Number(o.gapMinMs) || 0);
   const gapMax = Math.max(gapMin, Number(o.gapMaxMs) || 0);
-  const safety = o.cooldownSafetyMs == null ? 1000 : Math.max(0, Number(o.cooldownSafetyMs));
+  // 安全边距：从冷却下沿往回退一点，避免每次都贴着窗口边缘白撞 429。
+  // 默认 200ms —— 原来是 1000ms，那会把 1s 的冷却**完全抵消**（净等待 0），
+  // 结果每轮都撞 429 再白等 10s 重试，比不配速还慢。
+  const safety = o.cooldownSafetyMs == null ? 200 : Math.max(0, Number(o.cooldownSafetyMs));
   const randGap = () => (gapMax > gapMin
     ? gapMin + Math.floor(Math.random() * (gapMax - gapMin + 1))
     : gapMin);

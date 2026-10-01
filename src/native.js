@@ -20,6 +20,8 @@ const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 const { config } = require('./config');
 const keystream = require('./keystream');
+const { calcT } = require('./lre-emu');
+const { chainMd5 } = require('./sign');
 
 // 单次 harness 超时（毫秒）。真机实测 100~250ms，给足余量。
 const NATIVE_TIMEOUT_MS = 20000;
@@ -117,8 +119,27 @@ function encodeSubmitBody(jsonBytes) {
 // sign 缓存：同 path + 同分钟结果相同。key = `${minute}|${path}`
 const signCache = new Map();
 const SIGN_CACHE_MAX = 512;
+// T 缓存：只按分钟变化，与 path 无关 —— 同一分钟内所有 path 复用同一份 T。
+const tCache = new Map();
+const T_CACHE_MAX = 8;
 
-// sign = chain(path, "wdi4n2t8edr", 0)，path 为 URL.encodedPath()（不含 query），第三参恒为 0。
+/**
+ * 算主域签名 `sign`。
+ *
+ * ## ★ 2026-10-01：改为纯 JS 复刻，不再依赖 arm64（这是练习链路 417 的根治）
+ *
+ * 原实现用 `bin/native/linker64 + dump7` 执行 `lre.so` 里那段混淆代码来取 T ——
+ * 那是 **arm64 ELF，Windows / x86 上根本跑不起来**，`calcSign` 一失败，
+ * `exercise.maybeSign()` 就静默不带 `sign`，练习端点必然 **417
+ * `x-block-by: solar-encoder`**（PK 端点不需要 sign，所以只有练习挂）。
+ *
+ * 现在 T 由 [calcT] 在 JS 里执行同一段机器码算出（见 `src/lre-emu.js`），
+ * 平台无关。正确性以 `src/sign.js` 的真机 fixture 为准：模拟输出与抓包 T
+ * **逐字节一致（410/410）**。
+ *
+ * `sign` 公式仍是 `chainMd5(path, T)`：path 为 `url.encodedPath()`（不含 query），
+ * 第三参 ts 恒为 0。
+ */
 function calcSign(urlPath) {
   const p = String(urlPath);
   const minute = Math.floor(Date.now() / 60000);
@@ -126,12 +147,13 @@ function calcSign(urlPath) {
   const hit = signCache.get(key);
   if (hit) return hit;
 
-  const so = path.join(config.nativeDir, 'lre.so');
-  const r = runNative('dump7', [so, p, '0']);
-  const m = /SIGN=([0-9a-f]{32})/.exec(r.stdout);
-  if (!m) throw new Error('sign 计算失败：' + (r.stdout + r.stderr).slice(0, 300));
-
-  const sign = m[1];
+  let T = tCache.get(minute);
+  if (!T) {
+    T = calcT(minute * 60);
+    if (tCache.size >= T_CACHE_MAX) tCache.clear();
+    tCache.set(minute, T);
+  }
+  const sign = chainMd5(p, T);
   if (signCache.size >= SIGN_CACHE_MAX) signCache.clear();
   signCache.set(key, sign);
   return sign;
@@ -141,46 +163,40 @@ function safeUnlink(p) {
   try { fs.unlinkSync(p); } catch (e) { /* 临时文件已被清或不存在 */ }
 }
 
-// 启动自检：**编码**（纯 JS，必需）+ **sign**（仅当 signMode != off 时需要）。
-// 失败则启动即报错，比跑起来才发现强。
+/**
+ * 启动自检：**内容编码**（纯 JS）+ **sign**（纯 JS 模拟 arm64）都必须可用。
+ *
+ * ★ 2026-10-01：sign 不再依赖 arm64 原生资产（linker64 / dump7），只需
+ * `bin/native/lre.so` 提供机器码 + `src/lre-insns.js` 指令表 —— 所以
+ * **Windows / x86 上练习链路也能完整跑通**（此前这里是 417 的根因）。
+ */
 function selfTest() {
   const enc = keystream.selfTest();
   if (!enc.ok) return { ok: false, detail: '内容编码器不可用：' + enc.detail };
 
-  const mode = String(config.signMode || 'off').toLowerCase();
-  if (mode === 'off') {
-    // 默认路径：完全不需要原生库 → x86 / Windows 也能完整刷局
-    return {
-      ok: true,
-      encoding: enc,
-      signMode: 'off',
-      detail: '编码（纯 JS）可用；sign 已关闭（PK 端点实测不需要）→ 无需 arm64 原生库',
-    };
-  }
-
-  const need = ['linker64', 'lre.so', 'dump7'];
-  const missing = need.filter((f) => !fs.existsSync(path.join(config.nativeDir, f)));
-  if (missing.length) {
-    const msg = '缺 sign 所需原生资产：' + missing.join(', ') +
-      '（sign 需要 arm64；如不需要可设 PK_SIGN_MODE=off）';
-    if (mode === 'auto') return { ok: true, encoding: enc, signMode: mode, detail: 'sign 已跳过（' + msg + '）' };
-    return { ok: false, detail: msg };
+  if (!fs.existsSync(path.join(config.nativeDir, 'lre.so'))) {
+    return { ok: false, encoding: enc, detail: '缺少 bin/native/lre.so（T 生成所需）' };
   }
 
   try {
+    const T = calcT(Math.floor(Date.now() / 1000));
+    if (typeof T !== 'string' || T.length !== 410 || !/^[0-9]+$/.test(T)) {
+      return { ok: false, encoding: enc, detail: 'T 输出异常（长度 ' + (T && T.length) + '）' };
+    }
     const sample = calcSign('/leo-game-pk/android/math/pk/submit');
-    if (!/^[0-9a-f]{32}$/.test(sample)) return { ok: false, detail: 'sign 输出异常：' + sample };
+    if (!/^[0-9a-f]{32}$/.test(sample)) {
+      return { ok: false, encoding: enc, detail: 'sign 输出异常：' + sample };
+    }
     return {
       ok: true,
       encoding: enc,
-      signMode: mode,
-      detail: '编码（纯 JS）+ sign（原生）均可用',
+      signMode: 'js',
+      detail: '编码（纯 JS）+ sign（纯 JS 模拟 arm64）均可用，无需 arm64 原生资产',
+      tLength: T.length,
       sample: sample,
     };
   } catch (e) {
-    const msg = 'sign 计算失败：' + e.message;
-    if (mode === 'auto') return { ok: true, encoding: enc, signMode: mode, detail: 'sign 已跳过（' + msg + '）' };
-    return { ok: false, encoding: enc, detail: msg };
+    return { ok: false, encoding: enc, detail: 'sign 计算失败：' + e.message };
   }
 }
 
