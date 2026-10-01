@@ -15,7 +15,7 @@
  * |---|---|
  * | `data/` | 运行时数据库，**含明文 cookie**，绝不能进发布包 |
  * | `bin/cloudflared` | 36 MB 穿透客户端，用 `bin/get-cloudflared.sh` 按需下载 |
- * | `bin/native/` | arm64 Android 原生库。**当前已不需要**：内容编码是纯 JS，sign 默认关闭。带上它只会让包大 7.5 MB |
+ * | `bin/native/`（**除 `lre.so` 外**） | arm64 Android 原生库。**已不需要**：内容编码是纯 JS；`sign` 也已改为纯 JS 模拟，且**只需 `lre.so` 作为「数据」**（`src/lre-emu.js` 从中读机器码 + 常量，不在本地执行）。其余 `linker64`/`dump7`/`libc*`/`libContentEncoder*` 共约 7.5 MB，一律不带 |
  * | `.git/` `dist/` `node_modules/` | 无关 |
  *
  * 打包后会自动**解包到临时目录跑一遍自检 + 起服务验证**，通过了才留下 zip。
@@ -47,6 +47,7 @@ const INCLUDE = [
   'bin/reset-admin.js',
   'bin/selftest.js',
   'bin/keystream.bin',        // ★ 纯 JS 内容编码器的密钥流，必需
+  'bin/native/lre.so',        // ★ sign 纯 JS 模拟所需的「机器码数据」（约 0.9MB，不执行）
   'bin/get-cloudflared.sh',
   'public',
   'docs',
@@ -56,7 +57,8 @@ const INCLUDE = [
 /** 永不打包（就算 INCLUDE 里手滑写进来也要挡住）。 */
 const NEVER = [
   'data',
-  'bin/native',
+  // ⚠️ 这里**不能**写 `bin/native` —— `lre.so`（sign 纯 JS 模拟的数据源）要随包发布。
+  //    其余 arm64 库靠「不在 INCLUDE 里」自然排除（collect 只遍历 INCLUDE）。
   'bin/cloudflared',
   '.git',
   'dist',
@@ -176,17 +178,20 @@ const leaks = allInPkg.filter((f) =>
   /(^|\/)(data|node_modules)(\/|$)/.test(f)
   || f.includes('.sqlite')
   || /(^|\/)cloudflared$/.test(f)          // 只挡二进制本体，不挡 get-cloudflared.sh
-  || f.startsWith('bin/native'));
+  // ⚠️ bin/native 里**只有 lre.so 允许**（sign 纯 JS 模拟读它当数据）；
+  //    其余 arm64 可执行库（linker64/dump7/libc*/libContentEncoder*）必须挡掉。
+  || (f.startsWith('bin/native') && !f.endsWith('bin/native/lre.so')));
 if (leaks.length) { console.error('  ✘ 包内出现不应有的文件：' + leaks.join(', ')); process.exit(1); }
-console.log('  [OK] 无 data/ 、无 sqlite、无 cloudflared、无 bin/native');
+console.log('  [OK] 无 data/ 、无 sqlite、无 cloudflared、bin/native 只含 lre.so');
 
 // 2) 关键文件在位
-for (const must of ['server.js', 'start.bat', 'start.sh', 'bin/keystream.bin', 'src/keystream.js']) {
+for (const must of ['server.js', 'start.bat', 'start.sh', 'bin/keystream.bin',
+  'src/keystream.js', 'bin/native/lre.so']) {
   if (!fs.existsSync(path.join(OUTDIR, must))) { console.error('  ✘ 缺关键文件：' + must); process.exit(1); }
 }
-console.log('  [OK] server.js / start.bat / start.sh / bin/keystream.bin 均在位');
+console.log('  [OK] server.js / start.bat / start.sh / bin/keystream.bin / bin/native/lre.so 均在位');
 
-// 3) 真跑自检（不依赖 bin/native）
+// 3) 真跑自检（sign 用纯 JS 模拟，只需 bin/native/lre.so 当数据）
 const st = spawnSync(process.execPath, ['bin/selftest.js'], { cwd: OUTDIR, encoding: 'utf8' });
 const stOut = (st.stdout || '') + (st.stderr || '');
 const passLine = /全部通过/.test(stOut);

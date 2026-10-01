@@ -42,7 +42,7 @@ MIT License —— `bin/native/` 下的第三方二进制不在授权范围内�
 PK_PORT=8790 ./start.sh    # 换端口
 ```
 
-Windows：双击 `start.bat` —— **可完整刷局**（内容编码已是纯 JS，sign 实测 PK 端点不需要）
+Windows：双击 `start.bat` —— **可完整刷局 + 刷练习**（内容编码是纯 JS；`sign` 也已改成纯 JS 模拟 arm64 机器码，不再需要 WSL / arm64）
 
 浏览器打开 → 用 `admin / admin` 登录（**第一次登录后请立刻改密**）。
 
@@ -126,32 +126,28 @@ sh bin/get-cloudflared.sh      # 下载穿透客户端（可选）
    并且**与真机抓包密文一致**。收益：x86/Windows 也能编码，且省掉每轮 80–250ms 的子进程开销
    （实测降到 ~14ms）。
 
-2. **`sign`** —— ✅ **PK 端点实测不需要，已默认关闭**（`PK_SIGN_MODE=off`）。
-   实测：不带 sign 时 `match` 与 `submit` **都返回 HTTP 200**（提交成功）；
-   而带 sign 反而遇到过 403。至于那批「必须带 sign」的主域端点
-   （`accounts/switch` / `batchGet`），**带了也照样 417** —— 它们的拦截与 sign 无关。
+2. **`sign`** —— ✅ **已改为纯 JS 复刻**（2026-10-01，PR #1）。
 
-   > 补充：sign 的 `T` 段确实无法纯 JS 复现（它是 base-100 大数的十进制展开，
-   > 随分钟变化且无周期，实测 m→10m 时位数只 +40~48，不符合任何简单闭式）。
-   > 但既然 PK 用不到它，这个难点就不再挡路。
-   > 需要时设 `PK_SIGN_MODE=on` 并在 arm64 上跑即可。
+   `sign` 的 `T` 段原先只能靠 `bin/native/linker64 + dump7` 执行 `lre.so` 里那段
+   arm64 机器码取得，**Windows / x86 / 非 arm64 上算不出来** —— `calcSign` 一失败，
+   `maybeSign()` 就静默不带 `sign`，**练习端点必然 417 `x-block-by: solar-encoder`**
+   （这就是「PK 能用、练习不能用」的真正根因）。
 
-### 在 x86_64 Linux / WSL2 上跑（qemu-user「转译」）
+   现由 `src/lre-emu.js` 用 JS **逐条解释执行同一段机器码**算出 T
+   （指令表 `src/lre-insns.js`，由 `tools/gen-lre-insns.py` 用 capstone 离线生成），
+   平台无关、零外部依赖。判据：真机抓包 fixture 在该分钟的输出 **逐字节一致（410/410）**，
+   自检里跑 `node tools/sign-selftest.js` 即可验证。
 
-内容编码已是纯 JS，**只剩 `sign`** 需要执行 arm64 的 `linker64` + `lre.so`。
-x86 上可以用 qemu 的**用户态模拟**（不改一行代码）：
+   > 说明：`T` 是 base-100 大数的十进制展开、随分钟变化且无闭式，所以**不能「推导」**；
+   > 但可以「**执行**」—— 模拟器做的就是执行原机器码本身，因此结果与真机等同。
+   >
+   > `PK_SIGN_MODE` 默认 `auto`：练习端点一律带 sign；PK 端点按需。
 
-```sh
-sudo apt install qemu-user-static binfmt-support
-sudo update-binfmts --enable qemu-aarch64      # 或 systemctl restart systemd-binfmt
+### 原生库还需要吗
 
-# 验证：能打印出 SIGN=... 就成功了
-LD_LIBRARY_PATH=bin/native bin/native/linker64 bin/native/dump7   bin/native/lre.so /leo-game-pk/android/math/pk/submit 0
-```
-
-> ⚠️ **本机未在 x86 上实测过**（开发环境本身就是 arm64）——
-> 这属于「机制上成立、但作者未验证」的方案，遇到问题请提 issue。
-> 另：Windows 原生（非 WSL）不适用，需要先有 WSL2 或 Linux 环境。
+**不需要 `linker64` / `dump7` / `libc*` / `libContentEncoder*` 这些可执行资产了**（内容编码
+纯 JS、sign 纯 JS 模拟）。**唯一保留的是 `bin/native/lre.so`（0.9MB）** —— 它不再被
+*执行*，而是作为**数据**：`src/lre-emu.js` 从里面读机器码字节与常量表。发布包里已含它。
 
 ### 跑 Android so 的做法
 

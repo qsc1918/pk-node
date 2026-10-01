@@ -59,10 +59,14 @@ jobs:
           names = z.namelist()
           print(f'{len(names)} entries')
           bad = [n for n in names if '/data/' in n or n.endswith('.sqlite')
-                 or '/native/' in n or n.endswith('/cloudflared')]
+                 or n.endswith('/cloudflared')]
+          # ⚠️ bin/native/lre.so 是**必需**的（sign 纯 JS 模拟读它当数据），
+          #    所以这里只禁止其它 arm64 原生库，不再整体禁 /native/。
+          bad += [n for n in names if '/bin/native/' in n and not n.endswith('/lre.so')]
           if bad:
               print('✘ 包含不该有的文件：', bad); sys.exit(1)
-          must = ['server.js', 'start.bat', 'start.sh', 'bin/keystream.bin']
+          must = ['server.js', 'start.bat', 'start.sh', 'bin/keystream.bin',
+                  'bin/native/lre.so']
           for m in must:
               if not any(n.endswith('/' + m) for n in names):
                   print('✘ 缺', m); sys.exit(1)
@@ -101,8 +105,10 @@ jobs:
 
           - **Node.js ≥ 22**（用到内置 `node:sqlite`）。除此之外**零依赖**，不需要 `npm install`。
           - **不需要** WSL、Docker、qemu。
-          - **不需要** 任何 arm64 原生库：内容编码器已是纯 JS（固定密钥流 XOR），
-            而 `sign` 经实测对 PK 端点不必要，默认关闭（`PK_SIGN_MODE=off`）。
+          - **不需要** 任何 arm64 原生库：内容编码器已是纯 JS（固定密钥流 XOR）；
+            `sign` 也已改为**纯 JS 模拟 arm64 机器码**（`src/lre-emu.js`），
+            **Windows / x86 上练习链路也能跑**（此前练习 417 `solar-encoder` 的根因就是
+            sign 算不出）。包里只带 `bin/native/lre.so`（0.9MB）作为**数据**，不执行它。
 
           ### 首次使用
 
