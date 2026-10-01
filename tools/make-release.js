@@ -46,6 +46,11 @@ const INCLUDE = [
   'bin/pick-port.js',
   'bin/reset-admin.js',
   'bin/selftest.js',
+  // ★★ `bin/start.js` 是**启动入口**：package.json 的 "start"、start.bat、start.sh
+  //    全都指向它。PR#2 新增了这个文件，但当时没同步加进本白名单 →
+  //    v1.6.0 的发布包里缺它，Windows 双击 start.bat 直接崩：
+  //    `Error: Cannot find module '...\pk-node-1.6.0\bin\start.js'`（用户实测）。
+  'bin/start.js',
   'bin/keystream.bin',        // ★ 纯 JS 内容编码器的密钥流，必需
   'bin/native/lre.so',        // ★ sign 纯 JS 模拟所需的「机器码数据」（约 0.9MB，不执行）
   'bin/get-cloudflared.sh',
@@ -185,11 +190,25 @@ if (leaks.length) { console.error('  ✘ 包内出现不应有的文件：' + le
 console.log('  [OK] 无 data/ 、无 sqlite、无 cloudflared、bin/native 只含 lre.so');
 
 // 2) 关键文件在位
-for (const must of ['server.js', 'start.bat', 'start.sh', 'bin/keystream.bin',
+for (const must of ['server.js', 'start.bat', 'start.sh', 'bin/start.js', 'bin/keystream.bin',
   'src/keystream.js', 'bin/native/lre.so']) {
   if (!fs.existsSync(path.join(OUTDIR, must))) { console.error('  ✘ 缺关键文件：' + must); process.exit(1); }
 }
-console.log('  [OK] server.js / start.bat / start.sh / bin/keystream.bin / bin/native/lre.so 均在位');
+console.log('  [OK] server.js / start.bat / start.sh / bin/start.js / bin/keystream.bin / bin/native/lre.so 均在位');
+
+// 2b) ★ 反向校验：package.json 里所有 `node <file>` 形式的脚本入口都必须在包里。
+//     这类「白名单漏了新入口文件」的 bug 已经踩过一次（v1.6.0 缺 bin/start.js →
+//     Windows 用户双击 start.bat 直接 Cannot find module）。以后新增入口会自动被挡住。
+for (const [name, cmd] of Object.entries(pkg.scripts || {})) {
+  const m = /(?:^|\s)node\s+([^\s&|]+)/.exec(String(cmd));
+  if (!m) continue;
+  const entry = m[1];
+  if (!fs.existsSync(path.join(OUTDIR, entry))) {
+    console.error(`  ✘ package.json scripts["${name}"] 指向的入口不在发布包里：${entry}`);
+    process.exit(1);
+  }
+}
+console.log('  [OK] package.json 所有 node 脚本入口均在包内');
 
 // 3) 真跑自检（sign 用纯 JS 模拟，只需 bin/native/lre.so 当数据）
 const st = spawnSync(process.execPath, ['bin/selftest.js'], { cwd: OUTDIR, encoding: 'utf8' });
