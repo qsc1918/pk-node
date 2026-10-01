@@ -38,11 +38,18 @@ MIT License —— `bin/native/` 下的第三方二进制不在授权范围内�
 只要求 **Node.js ≥ 22**（用到内置 `node:sqlite`），除此之外零依赖。
 
 ```bash
-./start.sh                 # 默认 http://127.0.0.1:8787
+./start.sh                 # 默认 http://127.0.0.1:8792（被占则自动往后找一个空端口）
 PK_PORT=8790 ./start.sh    # 换端口
 ```
 
 Windows：双击 `start.bat` —— **可完整刷局 + 刷练习**（内容编码是纯 JS；`sign` 也已改成纯 JS 模拟 arm64 机器码，不再需要 WSL / arm64）
+
+> ★ 2026-10-01：`start.sh` 与 `start.bat` 现在**都只是薄壳**，真正的
+> 「Node 版本校验 / 挑空闲端口 / 打印横幅」都在 `bin/start.js` 里（一份代码两个平台）。
+> 之前 `start.bat` 在 Windows 上跑不起来，真因是它是 **LF 行尾**（cmd.exe 要求 CRLF，
+> `if errorlevel … (` 这种多行结构会被当成一行解析直接报错），且端口探测写成了
+> `for /f … node -p …`，在 UTF-8 中文的 bat 里容易被代码页搅乱。现在 bat 只有
+> 十几行、**纯 ASCII + CRLF**，不再需要 Git/MSYS2。
 
 浏览器打开 → 用 `admin / admin` 登录（**第一次登录后请立刻改密**）。
 
@@ -55,7 +62,7 @@ Windows：双击 `start.bat` —— **可完整刷局 + 刷练习**（内容编�
 ```bash
 git clone https://github.com/sxd91/pk-node.git && cd pk-node
 ./start.sh                     # Windows：双击 start.bat
-# 默认 http://127.0.0.1:8787
+# 默认 http://127.0.0.1:8792（端口被占会自动避让）
 ```
 或直接下 [免安装包](https://github.com/sxd91/pk-node/releases/latest) 解压运行（**推荐**，免 `npm install`）。
 需要 **Node.js ≥ 22**（用到内置 `node:sqlite`），除此之外**零依赖**。
@@ -74,7 +81,7 @@ git clone https://github.com/sxd91/pk-node.git && cd pk-node
 ### 第 4 步 · 刷练习（推荐）或 刷 PK
 | 玩法 | 入口 | 说明 |
 |---|---|---|
-| **刷练习** ⭐ | 「刷练习」tab → 选账号 / 知识点 / `limit` / 轮数 → 开始 | 出题→抄答案→提交**全自动闭环**。经验 = 答对题数 × 2（**100 题 = 200 经验**）。出题冷却 ≈62 秒/账号，引擎**自动配速**、撞频控自动重试 |
+| **刷练习** ⭐ | 「刷练习」tab → 选账号 / 知识点 / `limit` / 轮数 → 开始 | 出题→抄答案→提交**全自动闭环**。经验 = 答对题数 × 2（**100 题 = 200 经验**）。轮数**无上限**；任务是**正经后台任务**（落库、可在「任务」页看进度、可停止、切走/关掉浏览器都继续跑） |
 | 刷 PK 对局 | 「刷局」tab → 选子账号 / 知识点 / 局数 → 开始 | 右侧 SSE 实时日志；「任务」页可查逐轮明细 |
 
 ### 第 5 步 · 看结果
@@ -84,6 +91,8 @@ git clone https://github.com/sxd91/pk-node.git && cd pk-node
 ### 命令行等价操作
 ```bash
 node bin/selftest.js          # 自检（native / sign / RSA / 笔画 / 编码器）
+node tools/check-inject.js    # H5 注入脚本（语法 + 桥协议）
+node tools/test-pk-h5-bot.js  # PK H5 三个自动能力的回归测试
 node bin/reset-admin.js 新密码 # 重置管理员密码
 sh bin/get-cloudflared.sh      # 下载穿透客户端（可选）
 ```
@@ -180,7 +189,8 @@ node bin/selftest.js
 ```
 pk-node/
 ├── server.js               # HTTP 服务 + 路由（零依赖）
-├── start.sh                # 启动脚本（校验 Node 版本 + 打印 native 资产）
+├── start.sh                # 启动脚本（薄壳：找到 node → 交给 bin/start.js）
+├── start.bat               # 同上（Windows；纯 ASCII + CRLF，cmd 直接可跑）
 ├── package.json
 ├── src/
 │   ├── config.js           # 配置与 PK 协议常量（公共参数、频控参数）
@@ -204,8 +214,9 @@ pk-node/
 │   └── app.js
 ├── bin/
 │   ├── native/             # 原生资产（见上）
+│   ├── start.js            # ★ 真正的启动器：Node 版本校验 + 挑空闲端口 + 横幅
 │   ├── selftest.js         # 命令行自检
-│   ├── pick-port.js        # 挑空闲端口（start.sh 用）
+│   ├── pick-port.js        # 挑空闲端口（独立小工具，start.js 已内置同样的逻辑）
 │   ├── reset-admin.js      # 忘记密码时重置管理员
 │   └── get-cloudflared.sh  # 下载穿透客户端
 └── data/pk-node.sqlite     # 运行时生成
@@ -251,7 +262,7 @@ sign = md5(s3 + d3 + salt)          salt = "wdi4n2t8edr"
 因此本项目**串行**跑任务，且默认 `60s / 120s` 大退避、最多 2 次（可在网页高级参数里改）。
 并发提交只会把请求一起打进频控窗口。
 
-### 4.2 出题接口的冷却：**≈ 61.6 秒，按账号**（2026-09-27 实测）
+### 4.2 出题接口的冷却：**≈ 60 秒，按账号**（2026-09-27 实测；2026-10-01 再次确认仍在）
 
 这是本项目最反直觉、也最容易踩的一点：
 
@@ -304,6 +315,30 @@ sign = md5(s3 + d3 + salt)          salt = "wdi4n2t8edr"
 > 如实说明：**「每账号 ≈60s 一局」就是硬上限**。原版之所以能秒开下一局，
 > 是因为它走 `match/v2`（需要 App 的 LeoSecure 原生桥，纯 HTTP 一律 417）。
 > 想再快只有**加账号** —— 冷却按账号隔离，多号并行近似线性提速。
+
+> ### ★★ 2026-10-01 复测修正：冷却**没有消失**，但引擎改成「不强制、只建议」
+>
+> 中途有一次复测（同账号连续出题、间隔 1.5s，4 次全 200）曾被当成
+> 「服务端已放开」；**后续实测推翻了这个结论 —— ≈60 秒的账号级出题冷却依然在**。
+>
+> 现在的产品口径（这也是代码里的实现）：
+>
+> | 谁 | 行为 |
+> |---|---|
+> | **引擎** | `PK.matchCooldownMs` 默认 **0** —— **不强制**替你等冷却，节奏完全由用户填的「每轮最小/最大间隔」决定 |
+> | **网页** | 这两个框默认填 **60000 / 65000**，并明确提示「服务端有约 60 秒冷却，建议设 60 秒」；旁边还有「填入推荐值」按钮（因为输入框的值会持久化到 localStorage，改 HTML 默认值对老用户不生效） |
+> | **兜底** | 撞到 400/403 仍按「出题频控重试间隔」（默认 3s）重试，累计超「出题最长等待」（默认 240s = 4 分钟）才判该轮失败 —— 所以间隔设小了也不会立刻白跑，只是等待会挪进重试里、日志多几行 |
+>
+> 用户要是偏要设 1000ms：不拦，能跑，只是日志会出现一串
+> 「出题被频控…自动重试」，整体耗时反而比设 60s 更长。
+>
+> 想让引擎**自动**贴着冷却下沿跑（不依赖用户填数）：
+> `PK_MATCH_COOLDOWN_MS=61600`。
+>
+> ⚠️ **练习链路没有这个冷却**（那边实测 ~1 秒，见 4.7），两边的结论不要互相套用。
+>
+> 同一思路也应用到 **H5 PK 页面**：代理侧对 `match` 的 400/403/429 会**自动退避重试**
+> 最多 6 次 —— 详见 [4.11](#411-pk-h5-三个自动能力2026-10-01-修好)。
 
 ### 4.5 出题 → 提交 → **结算核对**（对齐真机结算页）
 
@@ -368,21 +403,26 @@ platform=android36 → 417      platform=android37 → 200
 > `M = 29839199`（可由 fixture 中的 `M//9 = 3315466`、`M//3 = 9946399`
 > 反推锁定）——模拟器在该点的输出与 fixture **逐字节一致（410/410）**。
 
-#### ★ 出题冷却：62 秒的旧结论已作废（2026-10-01 复测）
+#### ★ 练习链路的出题冷却：≈1 秒（2026-10-01 复测）
 
-`62s/账号` 是 2026-09-28 的实测值，**当前服务端已放开**：
+⚠️ 这一条**只适用于练习**（`/leo-math`）；**PK 的 ≈60s 冷却是另一回事，仍然在**
+（见 4.2）。两条链路的冷却**不要互相套用**。
+
+练习侧实测：
 
 ```
 同一账号连续出题（间隔 1.5s） × 4  →  全部 200，无 429
 成功出题后隔 1.1s 再出题          →  200（放行）
 ```
 
-所以 `MATCH_COOLDOWN_MS` 已从 `62_000` 改为 **`1_500`**（可用
-`PK_EX_MATCH_COOLDOWN_MS` 覆盖），另把配速安全边距从 1000ms 降到 200ms
+所以练习的 `MATCH_COOLDOWN_MS` 是 **`1_500`**（可用
+`PK_EX_MATCH_COOLDOWN_MS` 覆盖），配速安全边距 200ms
 —— 之前 1000ms 的安全边距会把 1s 的冷却**完全抵消**，导致每轮都撞 429
 再白等 10 秒重试，比不配速还慢。
 
 实测效果：**5 轮 × 100 题（1000 经验）共 6.3 秒，零 429**。
+
+因此**刷练习的「每轮间隔」保持 0~0**（贴着冷却跑最快）；刷局那边是 60000 起。
 
 #### 三条链路
 
@@ -401,9 +441,21 @@ platform=android36 → 417      platform=android37 → 200
 
 网页顶部多了「**刷练习**」tab：
 
-- **自动刷练习**：`出题 → 抄答案 → 提交` 完整闭环（`/api/exercise/run` + SSE 实时日志 `/api/exercise/stream`）。
-  引擎按出题冷却（≈62s/账号）自动配速，撞频控（429）自动重试；建议 `limit=100`（=200 经验）。
+- **自动刷练习**：`出题 → 抄答案 → 提交` 完整闭环。建议 `limit=100`（=200 经验）。
+  出题冷却实测只有 ~1s（见上），撞频控（429）自动重试。
 - 刷新分数/任务、经验上报（刷分）、只看题（不提交）。
+- **轮数无上限**（2026-10-01：以前 `Math.min(99, …)` 会把填的大数字**无声改成 99**，
+  用户看到的就是「填 >100 也按 100 算」，已改为只挡非法值）。
+- **是正经后台任务**（2026-10-01）：`POST /api/exercise/run` 现在会
+  ① 往 `jobs` 表写一条 `config.kind='exercise'` 的记录、② 交给
+  `jobs.startExerciseJob()` 跑。于是：
+  - 「任务」页能看到它（标题带 `[刷练习]`），可看**逐轮明细**；
+  - 可以「停止」（立即中断在途请求与轮间隔等待）；
+  - **切到别的 tab、甚至关掉浏览器，服务端都会继续跑完**；
+  - 回到「刷练习」页会按 localStorage 记的 jobId 重新挂上日志流
+    （`/api/exercise/stream` 仍保留，事件里带 `jobId` 供过滤；多用户互不可见）。
+  - 进程重启时，残留的 `running/queued` 任务会被自动标成「服务重启，任务已中断」，
+    不会再有永远「运行中」的僵尸任务。
 
 ### 5. 登录（短信 / 密码）的加密口径 —— **两条路的字段不一样**
 
@@ -466,7 +518,8 @@ context: cur=511467407   ★ 切换成功
 - `src/leo.js`：`buildUrl` 按路径选公共参数（主域 `MAIN_COMMON_QUERY` / PK `COMMON_QUERY`），`_productId` 提到最前。
 - `config.signMode` 默认改 **`auto`**（有 arm64 native 就算 sign，没有则跳过）。
 - `leo-accounts.js`：`switchToSubAccount(id, targetUserId)` —— 切号 + 用服务端回包校验生效身份 + 写回库。
-- ⚠️ **sign 需要 arm64**：Windows/x86 上 switch / batchGet 仍不可用（PK 出题不受影响）。
+- ⚠️ **sign 不再需要 arm64**（2026-10-01 起为纯 JS 复刻，见 4.7），
+  所以 switch / batchGet 在 Windows/x86 上同样可用。
 
 ## 4.9 设备链池与 cookie 加密（2026-09-28）
 
@@ -502,6 +555,84 @@ enc:v1:<b64 iv12>:<b64 tag16>:<b64 ciphertext>
 - **历史明文自动迁移**：启动时检测到明文就加密，并 `VACUUM` 清掉旧页（`POST /api/leo/accounts/migrate-crypt` 可手动触发）。
 - ⚠️ **密钥别丢**：丢了 = 已加密的 cookie 无法解密，需要重新导入账号。
 
+## 4.11 PK H5 三个自动能力（2026-10-01 修好）
+
+网页「PK 页面」tab 上那三个勾选框（**视为正确答案 / 自动提交画笔 / 自动下一局**）
+此前是**完全无效**的。三个独立真 bug，都已定位到源码/实测：
+
+### ① `?pkbot=` 参数在子页面丢了 → 三个开关全部回到「关」
+
+- 入口页 `pk.html` 的 URL 上带 `pkbot=answer,autoStroke,autoNext`；
+- H5 跳 `exercise.html` / `result.html` 时是自己拼 URL 的（只带业务参数），
+  注入脚本的 `addLeoId()` **又只补 `leoAccountId`** → 子页面读不到 `pkbot`，
+  localStorage 里也没存过 → `pkBotCfg()` 返回全 false。
+
+后果（正是用户看到的现象）：
+- `recognize` 桥收到「关」→ 直接回**空串** → 手写识别永远判错
+  （「即使写的是正确符号，也完全没有用，根本做不了」）；
+- `autoStroke` / `autoNext` 同理，一个都不跑。
+
+**修法（互为保险）**：① 跳转时把 `pkbot` 一起带上；② `pkBotCfg()` 一旦从 URL
+读到就写进 localStorage（同源共享，子页面天然继承）。
+
+### ② 「自动提交画笔」发的是手写板**根本不监听**的事件
+
+手写板（`useRecognizeBoard-legacy` 里 signature_pad 的那份移植）是以
+`forceUseTouch: true` 创建的，`on()` 的分支是：
+
+```js
+(!window.PointerEvent || mac || forceUseTouch)
+  ? (this._handleMouseEvents(), 'ontouchstart' in window && this._handleTouchEvents())
+  : this._handlePointerEvents()
+```
+
+即**总是绑 mousedown**，浏览器支持触摸时**再**绑 touchstart ——
+**从来不绑 `pointerdown`**。而注入脚本原来只 `dispatchEvent(PointerEvent)`，
+一笔都进不去。
+
+**修法**：严格镜像它自己的判定 ——
+`'ontouchstart' in window` → `touchstart/touchmove/touchend`，否则 →
+`mousedown/mousemove/mouseup`（`buttons:1`）。
+注意 `_handleTouchStart` 要求 `targetTouches.length === 1`、
+`_handleTouchEnd` 要求 `targetTouches.length === 0`，长度给错会被直接忽略。
+
+### ③ 「自动下一局」的按钮文案匹配错了两处
+
+结算页按钮文案来自 `Result-legacy` 的 `_t`：`继续PK` / `再练一次` / `继续挑战`。
+原匹配命中「继续」「再来」却**漏了「再练」**，同时**把「返回首页」也算了进去**
+（点它等于直接离开结算页，白打一局）。
+
+**修法**：匹配「继续 / 再练 / 再来」开头 + 元素可见（尺寸 > 6px），并去掉「返回首页」。
+
+### 「PK现场太火爆，人太多挤不进去了」是怎么回事
+
+那张弹窗的文案**是图片里的字**（`assets/type-1.Ng7ZhNY2.png`），所以在 H5 的 JS 里
+搜字符串永远搜不到。逐行读对局页代码可知它的触发条件只有一个：
+
+```js
+catch (h) {
+  Fe('/debug/oralPk/exercise/netError', { exception: h });
+  if (!Be() || (h.response.status !== 429 && h.response.status !== 400)) { /* 普通重试弹窗 */ }
+  else { O.value = true }        // ← 渲染 PkAbnormalDialog(默认 type=1) = 这张图
+}
+```
+
+⇒ **`match/v2` 返回 400 / 429 就会弹「太火爆」**（服务端的瞬时出题频控）。
+
+**修法**：代理侧 `/api/pk/h5/api` 对匹配类请求（`/match`、`/eliminate/`）的
+`400 / 403 / 429` **自动退避重试**（最多 6 次，间隔 0.9s×n，上限 4s），
+把瞬时频控挡在代理层；普通接口的 401 仍只重试 1 次，避免登录态失效时整页变卡。
+可用 `PK_H5_RETRY_MAX` / `PK_H5_RETRY_GAP_MS` 调整。
+
+### 回归测试
+
+```bash
+node tools/test-pk-h5-bot.js    # 20 项断言：recognize / 事件类型 / 下一局按钮 / 频控重试
+node tools/check-inject.js      # 注入脚本语法 + 桥协议（每次改 hook 后必跑）
+```
+
+---
+
 ## 五、使用流程
 
 三种添加小猿账号的方式，效果完全一致（都走同一套「探活 + 拉子账号 + 落库」）：
@@ -535,8 +666,9 @@ enc:v1:<b64 iv12>:<b64 tag16>:<b64 ciphertext>
 |---|---|
 | `costTime`（毫秒） | 整卷耗时，写进提交体。**留空 = 自动**（按题数 × 5ms 给下限，避免 0ms 不自然）。 |
 | 画笔算法 | `弧线（推荐）` = 密集弧线 21/24 点，服务端接受，**PK 默认**；`七段码` = 字形折线，可能被判作弊 403，仅作对照。 |
-| 每轮最小 / 最大间隔 | 轮与轮之间的随机等待，用来规避频控。默认 12000~20000ms。 |
-| 频控退避基数 / 最大次数 | 遇到 403 频控时的退避策略：`基数 × 2^n`，默认 60000ms、最多 2 次。 |
+| 每轮最小 / 最大间隔 | **唯一的节奏旋钮**（引擎不强制等冷却）。服务端有 ≈60s 的账号级出题冷却，所以默认 **60000~65000ms**；旁边有「填入推荐值」按钮。填更小也不拦，只是等待会挪到「出题频控重试」里。 |
+| 出题频控重试间隔 / 最长等待 | 出题撞 400/403 时的重试节奏：默认 3000ms、累计 240000ms（4 分钟）后判该轮失败。 |
+| 频控退避基数 / 最大次数 | **提交**遇 403 时的退避策略：`基数 × 2^n`，默认 60000ms、最多 2 次。 |
 
 > 画笔算法两种模式的**坐标口径不同**（弧线是像素坐标 x≈150-240；七段码是归一化 ×1000），
 > 不要试图统一 —— 见 `src/strokes.js` 顶部注释。
@@ -547,6 +679,10 @@ enc:v1:<b64 iv12>:<b64 tag16>:<b64 ciphertext>
 ```bash
 # 自检（native / sign / RSA / 笔画 / body 结构 / 编码器）
 node bin/selftest.js
+
+# PK H5 的「自动能力」回归测试 + 注入脚本校验
+node tools/test-pk-h5-bot.js
+node tools/check-inject.js
 
 # 重置管理员密码
 node bin/reset-admin.js 新密码
@@ -563,7 +699,7 @@ sh bin/get-cloudflared.sh
 | `PK_PORT` | `8787` | 端口（`start.sh` 会自动避让被占用的端口） |
 | `PK_DB` | `data/pk-node.sqlite` | SQLite 路径 |
 | `PK_ADMIN_USER` / `PK_ADMIN_PASS` | `admin` / `admin` | 首次启动写入的管理员 |
-| `PK_MAX_CONCURRENT` | `3` | 最大并行任务数 |
+| `PK_MAX_CONCURRENT` | `0`（不限） | 最大并行任务数；`0` = 不限制 |
 | `PK_SHEPHERD_DID` | 空 | 风控设备标识 `x-shepherd-did`，见下 |
 | `PK_DEVICE_BRAND` / `PK_DEVICE_MODEL` / `PK_DEVICE_SDK` / `PK_DEVICE_SCALE` | `Redmi` / `25053RT47C` / `37` / `3.25` | 拼 App 原生 UA 用，建议按自己设备改 |
 
@@ -589,7 +725,7 @@ strings /data/data/com.fenbi.android.leo/files/mmkv/leo_shepherd_id \
 网页「穿透」页点启动，等价于：
 
 ```bash
-bin/cloudflared tunnel --url http://127.0.0.1:8787 --no-autoupdate
+bin/cloudflared tunnel --url http://127.0.0.1:8792 --no-autoupdate
 ```
 
 - 免账号，得到一个 `https://xxxx.trycloudflare.com`。
@@ -609,10 +745,11 @@ bin/cloudflared tunnel --url http://127.0.0.1:8787 --no-autoupdate
 （`enc:v1:iv:tag:ct`），密钥来自 `PK_SECRET`（≥16 字符）或 `data/secret.key`（0600，自动生成）。
 **光拿到 db 文件打不开登录态与设备链**；要同时拿到密钥文件才行。默认只监听 `127.0.0.1`。 |
 | 默认密码 | `admin/admin` 只是为了「开箱能进」。**对外暴露前必须改密**。 |
-| 频控 | 服务端对提交接口有独立频控窗口。刷太快会 403/400，属正常保护，不是本项目的 bug。 |
+| 频控 | 服务端对提交接口有独立频控窗口。刷太快会 403/400，属正常保护，不是本项目的 bug。**任务之间不限制并行个数**（`PK_MAX_CONCURRENT=0`），任务内部逐轮串行；出题/提交撞频控都会自动退避重试。 |
 | 风控 | 连续高频出题可能触发「已封禁，暂时无法使用」的短时冷却，等几分钟再试。 |
+| H5 弹「PK现场太火爆 / 挤不进去」 | 对局页在 `match/v2` 返回 **400/429** 时就会弹那张图（文案在图片里）。代理侧已对匹配请求自动退避重试（最多 6 次）；若依旧弹，多半是账号被短时风控（出题 400「已封禁」），等几分钟。 |
 | 设备链 | **PK 出题必须带 `ks_*`**（没它 `pk/match` 恒 400）。本服务用「**设备链池**」解决：多份来源存进池子，登录导入的账号自动挑一份补齐（多份轮换）。 |
-| 子账号切换 | ✅ **已攻破**（见 4.10）：需 `sign` + `_productId` 最前 + `android37/3.140.1`。子账号名字/头像（batchGet）也 ✅。⚠️ 依赖 arm64 sign，Windows/x86 不可用。 |
+| 子账号切换 | ✅ **已攻破**（见 4.10）：需 `sign` + `_productId` 最前 + `android37/3.140.1`。子账号名字/头像（batchGet）也 ✅。sign 自 2026-10-01 起是纯 JS 复刻，**Windows/x86 同样可用**。 |
 | 短信登录 | 未实现（默认走「导入登录态」）。如需要按 `ape-api.yuanfudao.com/accounts/android/safe/login` 补。 |
 
 ---
@@ -622,7 +759,8 @@ bin/cloudflared tunnel --url http://127.0.0.1:8787 --no-autoupdate
 | 现象 | 处理 |
 |---|---|
 | 启动报 `缺少 native 资产` | 确认 `bin/native/` 齐全（见第二节），跑 `node bin/selftest.js`。 |
-| 启动报 `EADDRINUSE` | 端口被占：`PK_PORT=8790 ./start.sh`。 |
+| 启动报 `EADDRINUSE` | 端口被占：`PK_PORT=8790 ./start.sh`（或 `set PK_PORT=8790` 后双击 `start.bat`）。启动器也会自动往后找空端口。 |
+| Windows 双击 `start.bat` 一闪而过 | 已修（2026-10-01）：现在 bat 是 **CRLF + 纯 ASCII**，逻辑在 `bin/start.js`。若仍失败，在 cmd 里手动跑 `node bin\start.js` 看报错。 |
 | 导入 cookie 报「上下文接口 HTTP 401/417」 | cookie 过期或域不对；重新导出（需含 `sess`，域 `.yuanfudao.com`）。 |
 | 提交一直 403 / 400「请求过于频繁」 | 服务端频控。停一会儿，或调大「频控退避基数」。 |
 | 出题 400「已封禁，暂时无法使用」 | 短时风控冷却，等待后重试。 |

@@ -180,7 +180,13 @@ function selfTest() {
 
   try {
     const T = calcT(Math.floor(Date.now() / 1000));
-    if (typeof T !== 'string' || T.length !== 410 || !/^[0-9]+$/.test(T)) {
+    // ★ 2026-10-01：这里原来断言「T 长度必须 === 410」，是个**会误报的硬编**。
+    //   T 是那个大数的十进制展开，**位数本来就随分钟浮动**（实测同一晚
+    //   408/409/410 都会出现，fixture 对应的 M=29839199 恰好是 410）。
+    //   之前一旦落在 408 就会打印「编码链路不可用，PK 提交会失败」，把人吓一跳，
+    //   而实际上编码/签名完全正常。
+    //   正确判据：**全是数字 + 位数在合理区间**；精确性由 sign.js 的 fixture 自校验保证。
+    if (typeof T !== 'string' || !/^[0-9]+$/.test(T) || T.length < 380 || T.length > 460) {
       return { ok: false, encoding: enc, detail: 'T 输出异常（长度 ' + (T && T.length) + '）' };
     }
     const sample = calcSign('/leo-game-pk/android/math/pk/submit');

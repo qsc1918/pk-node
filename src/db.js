@@ -532,6 +532,26 @@ function listJobRounds(jobId, limit = 200) {
     .all(Number(jobId), Number(limit));
 }
 
+/**
+ * 把「上次进程被杀时残留的 running/queued 任务」标成 interrupted。
+ *
+ * ★ 2026-10-01：现在刷练习也是后台任务了，进程重启后库里会留下永远
+ * 「运行中」的僵尸任务，UI 会一直显示「运行中 / 2 个在跑」且无法停止。
+ * 启动时清理一次，语义与「服务重启 = 任务中断」一致。
+ *
+ * @returns {number} 被标记的任务数
+ */
+function markInterruptedJobs() {
+  const now = Date.now();
+  const info = get()
+    .prepare(
+      `UPDATE jobs SET status = 'failed', finished_at = ?, error = ?
+        WHERE status IN ('running','queued')`,
+    )
+    .run(now, '服务重启，任务已中断');
+  return Number(info.changes) || 0;
+}
+
 /* ------------------------- 键值 / 审计 ------------------------- */
 
 function kvGet(k, def = null) {
@@ -604,6 +624,7 @@ module.exports = {
   listJobs,
   listAllJobs,
   listJobRounds,
+  markInterruptedJobs,
   kvGet,
   kvSet,
   audit,

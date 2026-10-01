@@ -539,7 +539,7 @@ async function runPractice(jar, opts) {
       type: 'ex-rate-limit',
       message: `出题被限流（HTTP 429），${MATCH_RETRY_INTERVAL_MS / 1000}s 后重试（已等 ${Math.round(waited / 1000)}s）`,
     });
-    await sleep(MATCH_RETRY_INTERVAL_MS);
+    await sleep(MATCH_RETRY_INTERVAL_MS, o.signal);
     live();
   }
 
@@ -597,7 +597,6 @@ async function practiceLoop(jar, opts) {
   const rounds = Math.max(1, Number(o.rounds) || 1);
   const limit = o.limit == null ? 100 : Number(o.limit);
   const kp = o.keypointId == null ? 235001 : o.keypointId;
-
   /**
    * 「每轮间隔」（用户在 UI 上配的）——与 PK 引擎同一套语义。
    *
@@ -624,7 +623,7 @@ async function practiceLoop(jar, opts) {
   let lastWaitMs = 0;
 
   for (let i = 1; i <= rounds; i++) {
-    if (o.signal && o.signal.aborted) throw Object.assign(new Error('已取消'), { aborted: true });
+    if (o.signal && o.signal.aborted) throw abortedError();
 
     // 每轮间隔：冷却剩余 与 随机间隔 取大者
     if (lastMatchOkAt) {
@@ -635,17 +634,19 @@ async function practiceLoop(jar, opts) {
       if (wait > 0) {
         emit({
           type: 'ex-gap',
+          round: i,
           message: `间隔 ${(wait / 1000).toFixed(1)}s 后开始第 ${i} 轮` +
             `（配置 ${(gap / 1000).toFixed(1)}s，冷却剩 ${(cooldownLeft / 1000).toFixed(1)}s）`,
           configuredMs: gap,
           cooldownLeftMs: cooldownLeft,
           waitMs: wait,
         });
-        await sleep(wait);
+        // 可中断等待：点「停止」立刻退出，不用等这段间隔走完
+        await sleep(wait, o.signal);
       }
     }
 
-    emit({ type: 'ex-round', message: `第 ${i}/${rounds} 轮开始` });
+    emit({ type: 'ex-round', round: i, message: `第 ${i}/${rounds} 轮开始` });
     const t0 = Date.now();
     let r;
     try {
@@ -661,9 +662,12 @@ async function practiceLoop(jar, opts) {
     }
     if (!r || !r.ok) {
       failed++;
-      emit({ type: 'ex-round-fail', message: `第 ${i} 轮失败：${(r && r.text || '').slice(0, 90)}` });
+      emit({
+        type: 'ex-round-fail', round: i, status: (r && r.status) || null,
+        message: `第 ${i} 轮失败：${(r && r.text || '').slice(0, 90)}`,
+      });
       // 出题失败多半是还在冷却 → 补等一轮再继续
-      await sleep(MATCH_RETRY_INTERVAL_MS);
+      await sleep(MATCH_RETRY_INTERVAL_MS, o.signal);
       continue;
     }
     done++;
@@ -671,6 +675,11 @@ async function practiceLoop(jar, opts) {
     lastMatchOkAt = Date.now();
     emit({
       type: 'ex-round-ok',
+      round: i,
+      correctCnt: r.correctCnt,
+      questionCnt: r.questionCnt,
+      exp: r.exp,
+      examId: r.examId,
       message: `第 ${i} 轮成功：判对 ${r.correctCnt}/${r.questionCnt}，+${r.exp} 经验（耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s，累计 +${totalExp}）`,
     });
   }
@@ -693,8 +702,35 @@ function explainLimits() {
   };
 }
 
-/** 小睡（内部用）。 */
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+/**
+ * 小睡（内部用）。
+ *
+ * ★ 2026-10-01：支持 AbortSignal —— 轮间隔可能很长（用户可配到几十秒），
+ * 点「停止任务」时必须**立刻**退出，而不是等这段等待睡满。
+ */
+function sleep(ms, signal) {
+  const total = Math.max(0, Number(ms) || 0);
+  if (!signal) return new Promise((r) => setTimeout(r, total));
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(abortedError());
+    const timer = setTimeout(() => {
+      if (typeof signal.removeEventListener === 'function') signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, total);
+    function onAbort() {
+      clearTimeout(timer);
+      reject(abortedError());
+    }
+    if (typeof signal.addEventListener === 'function') signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/** 中断错误：`aborted === true`，上层据此把任务标成 stopped 而不是 failed。 */
+function abortedError() {
+  const e = new Error('任务已被手动结束');
+  e.aborted = true;
+  return e;
+}
 
 module.exports = {
   // 头 / URL

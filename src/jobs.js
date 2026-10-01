@@ -16,10 +16,16 @@ const db = require('./db');
 const leo = require('./leo');
 const leoAccounts = require('./services/leo-accounts');
 const engine = require('./pk-engine');
+const exercise = require('./exercise');
 const { config } = require('./config');
 
-/** 默认最大并行任务数（可用 PK_MAX_CONCURRENT 或高级参数覆盖）。 */
-const MAX_CONCURRENT = 3;
+/**
+ * 默认最大并行任务数。
+ *
+ * ★ 2026-10-01：改为 **0 = 不限制**（用户要求解除「最多 3 个」的限制）。
+ * 仍可用 `PK_MAX_CONCURRENT=<正整数>` 设上限。
+ */
+const MAX_CONCURRENT = 0;
 
 /** 运行中的任务表：jobId → { stopped:boolean, jar, config } */
 const running = new Map();
@@ -131,11 +137,11 @@ function startJob(o) {
   if (!job) return { ok: false, message: '任务不存在' };
   if (running.has(job.id)) return { ok: false, message: '该任务已在运行' };
 
-  // 允许并行：默认最多同时跑 MAX_CONCURRENT 个任务。
+  // 允许并行：默认**不限制**（cap <= 0 即不限）。
   // 每个任务内部仍然串行（一轮一轮来），只是**任务之间**可以同时跑。
-  // 注意：提交接口有频控，并行越多越容易撞 403/400，所以给个上限而不是无限开。
+  // 想收紧就设 PK_MAX_CONCURRENT=<正整数>。
   const cap = Number(config.maxConcurrentJobs) || MAX_CONCURRENT;
-  if (running.size >= cap) {
+  if (cap > 0 && running.size >= cap) {
     return { ok: false, message: `最多同时运行 ${cap} 个任务，请先停掉一些（可在高级参数里调）` };
   }
 
@@ -216,8 +222,7 @@ function stopJob(jobId, immediate) {
 }
 
 /** 主循环：一轮一轮跑，每轮落库并广播。 */
-async function runLoop(job, cfg, ctx) {
-  const jobId = job.id;
+async function runLoop(job, cfg, ctx) {  const jobId = job.id;
   let done = job.rounds_done || 0;
   let failed = job.rounds_failed || 0;
 
@@ -300,14 +305,139 @@ async function runLoop(job, cfg, ctx) {
   });
 }
 
+/* ======================== 刷练习任务（2026-10-01 新增） ========================
+ *
+ * ## 为什么练习也要走这套调度
+ *
+ * 以前 `/api/exercise/run` 是**裸的 async IIFE**：不登记 running、不落库、
+ * 不占并行名额。于是：
+ *   · 「任务」页永远看不到刷练习；
+ *   · 切到别的 tab（SSE 断开）再回来，日志空白，看起来「没在跑 / 被中断」；
+ *   · 没法停止。
+ *
+ * 现在它和刷局任务**同源**：db 里一条 jobs 记录 + job_rounds 逐轮明细，
+ * 共用同一套 `publish` / `subscribe` / `stopJob` / SSE。
+ */
+
+/**
+ * 启动一个刷练习任务（异步执行，立即返回）。
+ *
+ * @param {object} o
+ * @param {number} o.jobId  已入库的任务 id（config_json 里含 kind:'exercise'）
+ * @returns {{ok:boolean, message?:string}}
+ */
+function startExerciseJob(o) {
+  const job = db.getJob(o.jobId);
+  if (!job) return { ok: false, message: '任务不存在' };
+  if (running.has(job.id)) return { ok: false, message: '该任务已在运行' };
+
+  const cap = Number(config.maxConcurrentJobs) || MAX_CONCURRENT;
+  if (cap > 0 && running.size >= cap) {
+    return { ok: false, message: `最多同时运行 ${cap} 个任务，请先停掉一些（可在高级参数里调）` };
+  }
+
+  const account = db.getLeoAccount(job.leo_account_id);
+  if (!account) return { ok: false, message: '小猿账号不存在（可能已被删除）' };
+
+  const cfg = JSON.parse(job.config_json);
+  const controller = new AbortController();
+  const ctx = {
+    stopped: false,
+    jar: jarOf(account),
+    config: cfg,
+    controller: controller,
+    signal: controller.signal,
+  };
+  running.set(job.id, ctx);
+  db.setJobStatus(job.id, 'running', { startedAt: Date.now() });
+  publish(job.id, {
+    type: 'status', exercise: true, jobId: job.id,
+    message: `练习任务开始：${job.rounds_total} 轮 × ${cfg.limit} 题（知识点 ${cfg.keypointId}）`,
+    at: Date.now(),
+  });
+
+  runExerciseLoop(job, cfg, ctx).catch((e) => {
+    // startExerciseJob 里 runExerciseLoop 已自行 try/catch，这里是最后兜底
+    const aborted = e && e.aborted === true;
+    db.setJobStatus(job.id, aborted ? 'stopped' : 'failed', {
+      finishedAt: Date.now(), error: aborted ? null : e.message,
+    });
+    publish(job.id, {
+      type: 'status', exercise: true, jobId: job.id, finished: true,
+      message: aborted ? '练习已停止' : ('练习任务异常：' + e.message),
+      at: Date.now(),
+    });
+  }).finally(() => { running.delete(job.id); });
+
+  return { ok: true };
+}
+
+/** 练习主循环：把 practiceLoop 的每一轮事件落库 + 广播。 */
+async function runExerciseLoop(job, cfg, ctx) {
+  const jobId = job.id;
+  let done = job.rounds_done || 0;
+  let failed = job.rounds_failed || 0;
+
+  const emit = (ev) => {
+    if (!ev || typeof ev !== 'object') return;
+    const e = Object.assign({}, ev, { exercise: true, jobId: jobId });
+    publish(jobId, e);
+    // 同时镜像到「练习通道 0」：前端订阅 /api/exercise/stream 时能一次性看到
+    // 所有练习任务的日志（按 jobId 过滤）。带上 userId 避免多用户串台。
+    publish(0, Object.assign({}, e, { userId: job.user_id }));
+    // 每轮结束 → 落库（与刷局同一张 job_rounds 表，「任务」页的「明细」直接可用）
+    if (ev.round != null && (ev.type === 'ex-round-ok' || ev.type === 'ex-round-fail')) {
+      const ok = ev.type === 'ex-round-ok';
+      if (ok) done++; else failed++;
+      db.addJobRound(jobId, ev.round, ok, ok ? 200 : (ev.status || null), ev.message, ev.detail);
+      db.setJobStatus(jobId, 'running', { roundsDone: done, roundsFailed: failed });
+    }
+  };
+
+  try {
+    const r = await exercise.practiceLoop(ctx.jar, {
+      rounds: cfg.rounds, limit: cfg.limit, keypointId: cfg.keypointId,
+      gapMinMs: cfg.gapMinMs, gapMaxMs: cfg.gapMaxMs,
+      costTimePerQuestionMs: cfg.costTimePerQuestionMs,
+      signal: ctx.signal,
+      onEvent: emit,
+    });
+    done = r.done; failed = r.failed;
+    db.setJobStatus(jobId, 'done', { finishedAt: Date.now(), roundsDone: done, roundsFailed: failed });
+    // 收尾核对一次周分数（只读接口，不计入任何频控）——「经验到底到账没」的唯一可信口径
+    let scoreMsg = '';
+    try {
+      const score = await exercise.readScore(ctx.jar);
+      if (score != null) scoreMsg = `，当前 curWeekScore=${score}`;
+    } catch (e) { /* 核对失败不影响任务结论 */ }
+    publish(jobId, {
+      type: 'status', exercise: true, jobId: jobId, finished: true,
+      message: `练习任务完成：成功 ${done} / ${r.rounds}，失败 ${failed}，累计经验 +${r.totalExp}${scoreMsg}`,
+      at: Date.now(),
+    });
+  } catch (e) {
+    const aborted = e && e.aborted === true;
+    db.setJobStatus(jobId, aborted ? 'stopped' : 'failed', {
+      finishedAt: Date.now(), roundsDone: done, roundsFailed: failed,
+      error: aborted ? null : e.message,
+    });
+    publish(jobId, {
+      type: 'status', exercise: true, jobId: jobId, finished: true,
+      message: aborted ? `练习已停止（完成 ${done}）` : ('练习任务异常：' + e.message),
+      at: Date.now(),
+    });
+  }
+}
+
 /** 是否有任务在跑（UI 用来提示）。 */
 function isBusy() {
   return running.size > 0;
 }
 
-/** 正在运行的任务数 / 上限（UI 显示「2/3 在跑」）。 */
+/** 正在运行的任务数 / 上限（cap=0 表示不限制，UI 显示「2 个在跑」）。 */
 function runningCount() {
-  return { running: running.size, cap: Number(config.maxConcurrentJobs) || MAX_CONCURRENT };
+  const cap = Number(config.maxConcurrentJobs) || MAX_CONCURRENT;
+  return { running: running.size, cap: cap > 0 ? cap : null };
 }
 
 /** 运行中的任务 id 列表。 */
@@ -318,6 +448,7 @@ function runningIds() {
 module.exports = {
   MAX_CONCURRENT,
   startJob,
+  startExerciseJob,
   stopJob,
   subscribe,
   publish,

@@ -631,13 +631,26 @@ const H5_INJECT = `(function () {
      */
     function addLeoId(u) {
       var id = window.__PK_LEO_ID || '';
-      if (!id || !u) return u;
-      if (u.indexOf('leoAccountId=') >= 0) return u;
+      if (!u) return u;
+      var add = [];
+      if (id && u.indexOf('leoAccountId=') < 0) add.push('leoAccountId=' + encodeURIComponent(id));
+      // ★★ 2026-10-01 真 bug：「自动能力」在子页面统统失效的根因。
+      //
+      //  ?pkbot= 只挂在**入口页**（pk.html）的 URL 上。H5 跳到 exercise.html /
+      //  result.html 时是自己拼 URL 的（只带业务参数），addLeoId 又只补
+      //  leoAccountId —— 于是子页面 pkBotCfg() 读不到 URL、localStorage 里也没存过，
+      //  三个开关**全部回到默认「关」**：
+      //     · recognize 桥回 ''      → 手写识别永远判错（「写了正确符号也没用」）
+      //     · autoStroke 不跑        → 没有人自动交笔
+      //     · autoNext 不跑          → 结算页不会自己开下一局
+      //  修法两条（互为保险）：① 跳转时把 pkbot 带上；② pkBotCfg 读到就写进 localStorage。
+      if (u.indexOf('pkbot=') < 0) add.push('pkbot=' + encodeURIComponent(pkBotCurrentRaw()));
+      if (!add.length) return u;
       var hashIdx = u.indexOf('#');
       var hash = hashIdx >= 0 ? u.slice(hashIdx) : '';
       var base = hashIdx >= 0 ? u.slice(0, hashIdx) : u;
       var sep = base.indexOf('?') >= 0 ? '&' : '?';
-      return base + sep + 'leoAccountId=' + encodeURIComponent(id) + hash;
+      return base + sep + add.join('&') + hash;
     }
 
     /** 把任意外部 H5 地址折成本机同源地址（否则下级页面没有 hook 与桥）。
@@ -1484,8 +1497,21 @@ const H5_INJECT = `(function () {
   function pkBotCfg() {
     // ① URL 参数优先（浏览器/无头抓取都走这条）
     var fromUrl = pkBotFromUrl();
-    if (fromUrl) return fromUrl;
-    // ② 兼容旧值（此前悬浮窗写入的 localStorage）
+    if (fromUrl) {
+      // ★★ 2026-10-01：读到就**落盘**（localStorage，同源共享）。
+      //  子页面（exercise.html / result.html）的 URL 上通常没有 pkbot，
+      //  只能靠这里存下来的值，否则三个自动能力会全部退回「关」。
+      pkBotSet(fromUrl);
+      return fromUrl;
+    }
+    // ② 兼容旧值（早期悬浮窗 / ①写入的值）
+    var fromStore = pkBotFromStorage();
+    if (fromStore) return fromStore;
+    // ③ 默认全关（★ 不再默认开 answer）
+    return { answer: false, autoStroke: false, autoNext: false };
+  }
+  /** 只读 localStorage 里的配置（不触发写入）。 */
+  function pkBotFromStorage() {
     try {
       var raw = localStorage.getItem(PK_BOT_KEY);
       var o = raw ? JSON.parse(raw) : null;
@@ -1493,41 +1519,128 @@ const H5_INJECT = `(function () {
         return { answer: !!o.answer, autoStroke: !!o.autoStroke, autoNext: !!o.autoNext };
       }
     } catch (e) { /* ignore */ }
-    // ③ 默认全关（★ 不再默认开 answer）
-    return { answer: false, autoStroke: false, autoNext: false };
+    return null;
   }
   function pkBotSet(patch) {
-    var c = pkBotCfg();
+    // ⚠️ 不能调 pkBotCfg()（会递归）：只从 localStorage 基线合并。
+    var c = pkBotFromStorage() || { answer: false, autoStroke: false, autoNext: false };
     for (var k in patch) { if (Object.prototype.hasOwnProperty.call(patch, k)) c[k] = patch[k]; }
     try { localStorage.setItem(PK_BOT_KEY, JSON.stringify(c)); } catch (e) { /* ignore */ }
     return c;
   }
+  /** 当前生效的能力 → URL 参数串（'answer,autoStroke,autoNext'；全关给 'off'）。 */
+  function pkBotCurrentRaw() {
+    var c = pkBotCfg();
+    var a = [];
+    if (c.answer) a.push('answer');
+    if (c.autoStroke) a.push('autoStroke');
+    if (c.autoNext) a.push('autoNext');
+    return a.length ? a.join(',') : 'off';
+  }
   window.__pkBotCfg = pkBotCfg;
   window.__pkBotSet = pkBotSet;
+  window.__pkBotRaw = pkBotCurrentRaw;
+  // 测试钩子（tools/test-pk-h5-bot.js 用）：验证「自动交笔」发的是哪种事件、
+  // 「自动下一局」找的是哪个按钮。运行时无害。
+  window.__pkBotStroke = pkBotStroke;
+  window.__pkBotFindNext = pkBotFindNext;
 
-  /** 在画板上模拟一次「写一笔后抬手」。 */
+  /** 造一个 Touch 对象（Chrome 支持 Touch 构造器；不支持时退回鸭子类型对象）。 */
+  function pkBotMakeTouch(target, x, y) {
+    try {
+      return new Touch({
+        identifier: 1, target: target,
+        clientX: x, clientY: y, pageX: x, pageY: y, screenX: x, screenY: y,
+        radiusX: 4, radiusY: 4, rotationAngle: 0, force: 0.5,
+      });
+    } catch (e) {
+      return {
+        identifier: 1, target: target,
+        clientX: x, clientY: y, pageX: x, pageY: y, screenX: x, screenY: y,
+        force: 0.5,
+      };
+    }
+  }
+  /** 发一个 TouchEvent（targetTouches 的长度决定手写板认不认这次手势）。 */
+  function pkBotFireTouch(target, type, list, active) {
+    var act = active ? list : [];
+    var ev = null;
+    try {
+      ev = new TouchEvent(type, {
+        view: window, bubbles: true, cancelable: true, composed: true,
+        touches: act, targetTouches: act, changedTouches: list,
+      });
+    } catch (e) {
+      // 极少见：环境没有 TouchEvent 构造器 → 用普通 Event + 手挂三个列表
+      ev = document.createEvent('Event');
+      ev.initEvent(type, true, true);
+      try { ev.touches = act; ev.targetTouches = act; ev.changedTouches = list; } catch (e2) { /* ignore */ }
+    }
+    target.dispatchEvent(ev);
+  }
+  /** 发一个 MouseEvent（buttons 必须对：手写板用它判断「是不是按住左键」）。 */
+  function pkBotFireMouse(target, type, x, y, buttons) {
+    target.dispatchEvent(new MouseEvent(type, {
+      view: window, bubbles: true, cancelable: true, composed: true,
+      clientX: x, clientY: y, screenX: x, screenY: y,
+      button: 0, buttons: buttons, detail: 1,
+    }));
+  }
+
+  /**
+   * 在画板上模拟一次「写一笔后抬手」。
+   *
+   * ★★ 2026-10-01 真 bug：原来只发 PointerEvent，而手写板（signature_pad
+   * 的那份移植）是带着 forceUseTouch: true 创建的，它的 on() 是：
+   *
+   *    (!window.PointerEvent || mac || forceUseTouch)
+   *      ? (this._handleMouseEvents(),
+   *         'ontouchstart' in window && this._handleTouchEvents())
+   *      : this._handlePointerEvents()
+   *
+   * 即：**总是绑 mousedown**，且「浏览器支持触摸」时**再**绑 touchstart；
+   * **从来不绑 pointerdown**。所以 PointerEvent 一个都进不去
+   * → 「自动提交画笔」勾了也一笔都不写（用户实测）。
+   *
+   * 现在严格镜像它自己的判定：
+   *   'ontouchstart' in window → touchstart/touchmove/touchend
+   *   否则                     → mousedown/mousemove/mouseup（buttons:1）
+   *
+   * 另：_handleTouchStart 要求 targetTouches.length === 1，
+   * _handleTouchEnd 要求 targetTouches.length === 0 —— 长度给错会被直接忽略。
+   */
   function pkBotStroke() {
     try {
-      var el = document.querySelector('canvas')
+      var el = document.querySelector('canvas.canvas')
+        || document.querySelector('canvas')
         || document.querySelector('.write-pad, .writing-pad, [class*=write], [class*=pad]')
         || document.querySelector('[class*=oral-pk]');
       if (!el) { diag('bot-stroke', { ok: false, why: 'no-canvas' }); return false; }
       var r = el.getBoundingClientRect();
-      if (!r || r.width < 10) { diag('bot-stroke', { ok: false, why: 'zero-size' }); return false; }
-      var cx = r.left + r.width / 2;
-      var cy = r.top + r.height / 2;
-      function fire(type, x, y) {
-        var ev = new PointerEvent(type, {
-          bubbles: true, cancelable: true, composed: true,
-          clientX: x, clientY: y, pointerId: 1, pointerType: 'touch', isPrimary: true, buttons: 1,
-        });
-        el.dispatchEvent(ev);
+      if (!r || r.width < 10 || r.height < 10) {
+        diag('bot-stroke', { ok: false, why: 'zero-size', w: r && Math.round(r.width) });
+        return false;
       }
-      fire('pointerdown', cx, cy);
-      fire('pointermove', cx + 4, cy + 4);
-      fire('pointermove', cx + 8, cy);
-      fire('pointerup', cx + 8, cy);
-      diag('bot-stroke', { ok: true, tag: el.tagName, cls: String(el.className).slice(0, 60) });
+      var cx = r.left + r.width * 0.5;
+      var cy = r.top + r.height * 0.55;
+      // 一小段折线。画的内容不重要：判对由 recognize 桥接管（服务端只在
+      // 提交时回放笔迹做「有没有写」的一致性检查，不要求与答案字形一致）。
+      var pts = [[cx - 16, cy + 8], [cx - 7, cy - 8], [cx + 6, cy + 8], [cx + 16, cy - 6]];
+      var useTouch = ('ontouchstart' in window);
+      var i;
+      if (useTouch) {
+        for (i = 0; i < pts.length; i++) {
+          pkBotFireTouch(el, i === 0 ? 'touchstart' : 'touchmove',
+            [pkBotMakeTouch(el, pts[i][0], pts[i][1])], true);
+        }
+        var last = pts[pts.length - 1];
+        pkBotFireTouch(el, 'touchend', [pkBotMakeTouch(el, last[0], last[1])], false);
+      } else {
+        pkBotFireMouse(el, 'mousedown', pts[0][0], pts[0][1], 1);
+        for (i = 1; i < pts.length; i++) pkBotFireMouse(el, 'mousemove', pts[i][0], pts[i][1], 1);
+        pkBotFireMouse(el, 'mouseup', pts[pts.length - 1][0], pts[pts.length - 1][1], 0);
+      }
+      diag('bot-stroke', { ok: true, mode: useTouch ? 'touch' : 'mouse', tag: el.tagName, cls: String(el.className).slice(0, 40) });
       return true;
     } catch (e) {
       diag('bot-stroke', { ok: false, why: String(e && e.message) });
@@ -1566,8 +1679,17 @@ const H5_INJECT = `(function () {
         if (el.children.length > 0) continue;
         var t = (el.textContent || '').trim();
         if (!t || t.length > 12) continue;
-        if (t.indexOf('继续') === 0 || t.indexOf('再来') === 0 ||
-            t === '下一局' || t === '返回首页' || t === '继续 PK') return el;
+        // ★★ 2026-10-01 修正（两处）：
+        //   ① 结算页按钮文案来自 Result-legacy 的 _t：
+        //        isMultiPk ? '继续PK' : challengeCode ? '继续挑战'
+        //                  : 赢了 ? '继续PK' : '再练一次'
+        //      原来的匹配有「继续/再来」却漏了 **再练** → 「再练一次」时点不到。
+        //   ② 原来还匹配了 '返回首页' —— 那是**离开**按钮，点它等于放弃刷局，
+        //      必须去掉（自动下一局绝不该点返回）。
+        if (t.indexOf('继续') === 0 || t.indexOf('再练') === 0 || t.indexOf('再来') === 0) {
+          var r = el.getBoundingClientRect();
+          if (r && r.width > 6 && r.height > 6) return el;
+        }
       }
     } catch (e) { /* ignore */ }
     return null;
@@ -1659,12 +1781,16 @@ const H5_INJECT = `(function () {
         }
       }
       if (c.autoStroke && !pkBotStrokeBusy) {
-        // 只在「有画板」的页面自动交笔（对局页）
-        var cv = document.querySelector('canvas');
+        // 只在**对局页**自动交笔（那里才有手写板 canvas）。
+        // ★ 2026-10-01：原来只判断「有 canvas」—— pk.html 主页也有 canvas，
+        //   会在无关页面上瞎比划。现在按路径收窄。
+        var p = String(location.pathname || '');
+        var onExercise = p.indexOf('exercise') >= 0 || p.indexOf('oral-merge') >= 0;
+        var cv = onExercise ? (document.querySelector('canvas.canvas') || document.querySelector('canvas')) : null;
         if (cv) {
           pkBotStrokeBusy = true;
           pkBotStroke();
-          setTimeout(function () { pkBotStrokeBusy = false; }, 2500);
+          setTimeout(function () { pkBotStrokeBusy = false; }, 2000);
         }
       }
     } catch (e) { /* ignore */ }
@@ -2079,11 +2205,60 @@ function pkIsPriorityPath(pathAndQuery) {
   return false;
 }
 
+/**
+ * 是否为「匹配/出题」类请求。
+ *
+ * ## 为什么只对这类请求加重试（2026-10-01，读 H5 源码得到的因果链）
+ *
+ * 对局页（index-legacy / Oral-legacy）出题是在 mounted 的 try 里跑的，
+ * catch 分支（逐字）：
+ *
+ * ```js
+ * catch (h) {
+ *   Fe('/debug/oralPk/exercise/netError', { exception: h });
+ *   if (!Be() || (h.response.status !== 429 && h.response.status !== 400)) {
+ *     // → 普通「加载失败，重试」弹窗
+ *   } else {
+ *     O.value = true;      // → 渲染 PkAbnormalDialog(type 默认 1)
+ *   }
+ * }
+ * ```
+ *
+ * 而 PkAbnormalDialog 的 type=1 图片就是用户在截图里看到的那张：
+ *
+ *     「PK现场太火爆，人太多挤不进去了 / 重新再试一次吧！/ 返回首页」
+ *     （assets/type-1.Ng7ZhNY2.png，文案是**图片**里的，所以搜不到字符串）
+ *
+ * ⇒ **match/v2 只要返回 400 / 429，用户看到的就是「太火爆」**。
+ *   出题冷却现在只有 ~1s（见 README 4.7 的复测），退避重试几次基本必得 200，
+ *   所以绝不该把这个瞬时频控原样透给 H5。
+ */
+function pkIsMatchPath(pathAndQuery) {
+  const p = String(pathAndQuery || '');
+  return p.indexOf('/match') >= 0 || p.indexOf('/eliminate/') >= 0;
+}
+
+/** 这一次响应值得重试几次（0 = 不重试）。 */
+function pkRetryBudget(status, text, pathAndQuery) {
+  // 出题/匹配：400/403/429 都是「瞬时频控」，给足预算（H5 见了会弹「太火爆」）
+  if (pkIsMatchPath(pathAndQuery) && (status === 400 || status === 403 || status === 429)) return PK_RETRY_MAX;
+  if (status === 429) return 2;
+  // ★ 401 只重试 1 次：它基本都是「登录态失效」（cookie 过期），
+  //   重试多了会让**整页每个请求都拖十几秒**，页面反而卡死。
+  if (status === 401) return 1;
+  const t = String(text || '');
+  if (t.indexOf('请求过于频繁') >= 0 || t.indexOf('频繁') >= 0 || t.indexOf('火爆') >= 0) return 2;
+  return 0;
+}
+
+/** 出站重试上限 / 退避基数（可用环境变量调）。 */
+const PK_RETRY_MAX = Number(process.env.PK_H5_RETRY_MAX || 6);
+const PK_RETRY_GAP_MS = Number(process.env.PK_H5_RETRY_GAP_MS || 900);
+
 /** 串行化 + 最小间隔地执行一次出站请求。
  *  @param {boolean} [priority] 关键请求：不与普通队列排队（直接插队，只受间隔约束）。
  */
-function pkThrottleRun(host, fn, priority) {
-  const gate = async () => {
+function pkThrottleRun(host, fn, priority) {  const gate = async () => {
     const now = Date.now();
     const wait = PK_THROTTLE_GAP_MS - (now - (pkLastAt[host] || 0));
     if (wait > 0) await sleepMs(wait);
@@ -2259,9 +2434,20 @@ async function proxyApi(req, res, u, ctx) {
     // ★ 首屏关键请求走优先通道（不被同 host 普通队列拖慢，见 pkIsPriorityPath）
     const prio = pkIsPriorityPath(pathOnly);
     let r = await pkThrottleRun(host, once, prio);
-    if (r.status === 401 || r.status === 429) {
-      diagLog('retry', pathOnly + ' ' + r.status + ' → 退避重试');
-      await sleepMs(400);
+    // ★★ 2026-10-01：频控自动重试（原来只试 1 次，且只对 401/429）。
+    //
+    //  出题（match）返回 400/429 时 H5 会直接弹「PK现场太火爆，挤不进去」
+    //  那张图（见 pkIsMatchPath 的说明），而服务端冷却只有 ~1s —— 所以
+    //  这里退避重试若干次，把「瞬时频控」挡在代理层，用户就看不到那张弹窗了。
+    let tries = 0;
+    // 每次拿到响应**重新**算预算：某次重试换来了别的错误码（如 404），就该停下。
+    for (;;) {
+      const budget = pkRetryBudget(r.status, r.text, pathOnly);
+      if (tries >= budget) break;
+      tries++;
+      const wait = Math.min(4000, PK_RETRY_GAP_MS * tries);
+      diagLog('retry', pathOnly + ' ' + r.status + ' → 退避 ' + wait + 'ms 后重试（第 ' + tries + '/' + budget + ' 次）');
+      await sleepMs(wait);
       r = await pkThrottleRun(host, once, prio);
       diagLog('retry', pathOnly + ' 重试后 ' + r.status);
     }
@@ -2347,6 +2533,9 @@ module.exports = {
   serve,
   proxyApi,
   setUserInfoProvider,
+  // 频控重试判定（tools/test-pk-h5-bot.js 会直接断言它）
+  pkIsMatchPath,
+  pkRetryBudget,
   // H5 的 dataDecrypt 桥委托 Node 侧解密时用（见 server.js /api/pk/h5/decrypt）。
   decryptBuffer: decodeEncrypted,
 };
