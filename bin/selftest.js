@@ -153,7 +153,32 @@ const missingLeo = REQUIRED_LEO.filter((k) => typeof leoLib[k] === 'undefined');
 check('leo.js 导出齐全', missingLeo.length === 0,
   missingLeo.length === 0 ? REQUIRED_LEO.length + ' 项' : '缺少 ' + missingLeo.join(', '));
 
-// 练习协议层（/leo-star /leo-math；417 已破，version 必须 3.140.1）
+// ★ sign / T 链路：必须能在**任意平台**（含 Windows/x86）算出 T。
+//
+// 这是练习链路 417 的根治点：sign 依赖的 T 原先只能由 arm64 的
+// linker64+dump7 执行 lre.so 得到，Windows 上算不出来 → 练习端点必然 417
+// （x-block-by: solar-encoder）。现在改由 src/lre-emu.js 在 JS 里执行同一段
+// 机器码，判据是「真机抓包 fixture 逐字节一致」。
+{
+  const lreEmu = require(path.join(root, 'src', 'lre-emu'));
+  const FIXTURE_T = '331546629839215717298392312983921519499463992983919162712654497319929839215'
+    + '33554432459678392983923159678391704973199175967839994639929839215192983920117298391697'
+    + '17174210221952172983911717421022195217298391691677721625298392012983920016229532317298'
+    + '39200335544322983919171677721649731991625024865992983912295323298392154973199298392159'
+    + '94639933154672486599596783927126541617733154661759678397596783999463993315467';
+  let tOk = false;
+  let tDetail = '';
+  try {
+    const T = lreEmu.calcT(29839199 * 60);     // fixture 对应的分钟（见 README）
+    tOk = T === FIXTURE_T;
+    tDetail = tOk ? '410 字符，与真机抓包逐字节一致' : ('长度 ' + T.length + '，期望 410');
+  } catch (e) {
+    tDetail = '异常：' + e.message;
+  }
+  check('T 生成（纯 JS 模拟 arm64）与真机 fixture 逐字节一致', tOk, tDetail);
+}
+
+// 练习协议层（/leo-star /leo-math；version 必须 3.140.1）
 const exLib = require(path.join(root, 'src', 'exercise'));
 const REQUIRED_EX = ['buildExerciseUrl', 'exerciseHeaders', 'overview', 'getExam', 'attend', 'pumpScore', 'readScore', 'runPractice', 'practiceLoop', 'submitExam', 'answerAll'];
 const missingEx = REQUIRED_EX.filter((k) => typeof exLib[k] !== 'function');

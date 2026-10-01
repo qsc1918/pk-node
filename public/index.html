@@ -172,7 +172,7 @@
     </div>
   </main>
 
-  <!-- 刷练习（/leo-star 主域；417 已破） -->
+  <!-- 刷练习（/leo-star 主域；sign 已在 JS 侧复刻，Windows/x86 也能跑） -->
   <main class="panel hidden" id="tab-practice">
     <div class="card">
       <h2>练习 / 刷分</h2>
@@ -217,7 +217,8 @@
         完整闭环：<code>POST /leo-math/android/exams</code> 出题（每题自带 <code>answer</code>）→
         <code>PUT /leo-math/android/exams/{examId}</code> <b>JSON 明文</b>提交（含笔迹 <code>script</code>，服务端凭笔迹判卷）。
         经验 = <b>答对题数 × 2</b>（10 题 20 / 100 题 200）。<br>
-        出题冷却 <b>≈62 秒/账号</b>（与 PK 同源）；引擎<b>贴着冷却自动配速</b>，撞频控（429）会自动重试。建议 <code>limit=100</code>。
+        出题冷却实测 <b>约 1 秒/账号</b>（2026-10-01 复测：连续出题 4 次全 200，旧的「62 秒硬限流」已作废）；
+        引擎<b>贴着冷却自动配速</b>，撞频控（429）会自动重试。建议 <code>limit=100</code>（一轮 200 经验，约 1.5 秒）。
       </p>
       <div class="row">
         <label class="grow">知识点 ID<input id="prac-kp" type="number" value="16"></label>
@@ -230,8 +231,8 @@
       </div>
       <p class="muted small">
         每轮间隔 = <code>max(出题冷却剩余, 随机[最小, 最大])</code>。
-        <b>出题冷却 ≈62s/账号 是硬下限</b>，配得比它小也不会更快（会 429）；
-        都填 <code>0</code> = 贴着冷却下沿跑（最快）；想更稳就配大一点（如 0~10000）。
+        <b>出题冷却约 1 秒</b>（服务端已放宽；引擎自带 1.5s 配速 + 429 自动重试）。
+        都填 <code>0</code> = 贴着冷却下沿跑（最快，实测 5 轮 100 题仅 6 秒）；想更稳就配大一点（如 0~3000）。
       </p>
       <div class="row">
         <button id="prac-run" class="primary grow">开始刷练习</button>
