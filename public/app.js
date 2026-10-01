@@ -16,6 +16,12 @@ async function api(path, options) {
   let data = null;
   try { data = await res.json(); } catch (e) { data = null; }
   if (!res.ok) {
+    // ★ 2026-10-01：会话被服务端判失效（被管理员禁用 / 改密 / 过期）→ 别让用户
+    //   对着一堆「未登录」报错干瞪眼，直接告诉他并退回登录页。
+    if (res.status === 401 && state.user) {
+      toast('登录已失效（账号可能被管理员禁用），正在返回登录页…', 'err');
+      setTimeout(() => location.reload(), 1200);
+    }
     const msg = (data && data.message) || ('HTTP ' + res.status);
     const err = new Error(msg);
     err.status = res.status;
@@ -327,6 +333,9 @@ async function loadLeoAccounts() {
   if (prev && r.accounts.some((a) => String(a.id) === prev)) sel.value = prev;
 
   renderLeoList(r.accounts);
+  // 批量开任务的多选列表（刷局 / 刷练习各一份，共用同一批账号）
+  renderBatchPicker('grind-batch', r.accounts, batchSel.grind);
+  renderBatchPicker('prac-batch', r.accounts, batchSel.prac);
   await loadSubsForSelectedLeo();
 }
 
@@ -579,25 +588,11 @@ $('btn-start').addEventListener('click', async () => {
   const leoAccountId = Number($('grind-leo').value);
   if (!leoAccountId) return toast('先导入小猿账号', 'err');
 
-  const strokeEl = document.querySelector('input[name="strokeMode"]:checked');
-  const body = {
+  // 参数解析抽成 collectPkBody()：单开与「批量开」共用同一份代码，避免两边漂移
+  const body = Object.assign({
     leoAccountId: leoAccountId,
     subUserId: $('grind-sub').value ? Number($('grind-sub').value) : null,
-    pointId: Number($('grind-point').value || 1951),
-    rounds: Number($('grind-rounds').value || 10),
-    gapMinMs: Number($('grind-gapmin').value || 4000),
-    gapMaxMs: Number($('grind-gapmax').value || 8000),
-    submitDelayMinMs: Number($('grind-delaymin').value || 0),
-    submitDelayMaxMs: Number($('grind-delaymax').value || 0),
-    rateLimitBaseMs: Number($('grind-rlbase').value || 60000),
-    rateLimitMaxWait: Number($('grind-rlmax').value || 2),
-    matchRetryIntervalMs: Number(($('grind-mretry') || {}).value || 8000),
-    matchRetryMaxMs: Number(($('grind-mmax') || {}).value || 240000),
-    strokeMode: strokeEl ? strokeEl.value : 'ARC',
-  };
-  // costTime 留空 = 自动（服务端按题数 × 5ms 给下限）
-  const cost = $('grind-cost').value.trim();
-  if (cost !== '') body.costTimeMs = Number(cost);
+  }, collectPkBody());
 
   $('log').innerHTML = '';
   try {
@@ -786,28 +781,111 @@ async function loadJobs() {
     if (r.jobs.length === 0) { box.innerHTML = '<p class="muted small">暂无任务</p>'; return; }
     for (const j of r.jobs) {
       const el = document.createElement('div');
-      el.className = 'item';
-      el.innerHTML = '<div><div class="title"></div><div class="meta"></div></div><div class="actions"></div>';
+      el.className = 'item stack';
+      el.innerHTML = '<div class="main"><div class="title"></div><div class="meta"></div><div class="cfg"></div></div>' +
+        '<div class="actions"></div>';
       el.querySelector('.title').textContent =
-        '#' + j.id + ' [' + (j.kind === 'exercise' ? '刷练习' : '刷局') + '] ' + statusText(j.status);
+        '#' + j.id + ' [' + kindText(j) + '] ' + statusText(j.status);
       el.querySelector('.meta').textContent =
         '成功 ' + j.roundsDone + '/' + j.roundsTotal + ' · 失败 ' + j.roundsFailed +
-        (j.kind === 'exercise'
-          ? ' · 知识点 ' + (j.config ? j.config.keypointId : '?') + ' · 每轮 ' + (j.config ? j.config.limit : '?') + ' 题'
-          : ' · pointId ' + (j.config ? j.config.pointId : '?')) +
-        ' · ' + fmtTime(j.createdAt);
-      const btn = document.createElement('button');
-      btn.className = 'mini';
-      btn.textContent = '明细';
-      btn.addEventListener('click', () => showJobDetail(j.id));
-      el.querySelector('.actions').appendChild(btn);
+        (j.leoName ? ' · ' + j.leoName : '') + ' · ' + fmtTime(j.createdAt);
+      // 完整配置（原来只显示 pointId，看不到画笔/间隔/耗时等）
+      el.querySelector('.cfg').textContent = jobConfigText(j);
+      const actions = el.querySelector('.actions');
+      if (isActiveJob(j)) {
+        actions.appendChild(makeMiniButton('暂停', async () => {
+          await jobAction(j.id, 'pause');
+          await loadJobs();
+        }));
+        actions.appendChild(makeMiniButton('停止', async () => {
+          await jobAction(j.id, 'stop');
+          await loadJobs();
+        }, 'danger'));
+      }
+      if ((j.status === 'paused' || j.status === 'stopped') && j.roundsDone < j.roundsTotal) {
+        actions.appendChild(makeMiniButton('继续', async () => {
+          await jobAction(j.id, 'resume');
+          await loadJobs();
+        }));
+      }
+      actions.appendChild(makeMiniButton('明细', () => showJobDetail(j.id)));
       box.appendChild(el);
     }
   } catch (err) { toast(err.message, 'err'); }
 }
 
 function statusText(s) {
-  return { queued: '排队中', running: '运行中', done: '已完成', failed: '失败', stopped: '已停止' }[s] || s;
+  return {
+    queued: '排队中', running: '运行中', done: '已完成',
+    failed: '失败', stopped: '已停止', paused: '已暂停',
+  }[s] || s;
+}
+
+/** 造一个列表里的小按钮。 */
+function makeMiniButton(label, onClick, extraClass) {
+  const b = document.createElement('button');
+  b.className = 'mini' + (extraClass ? ' ' + extraClass : '');
+  b.textContent = label;
+  b.addEventListener('click', () => { onClick().catch((e) => toast(e.message, 'err')); });
+  return b;
+}
+
+/**
+ * 对**自己的**任务执行 pause / resume / stop。
+ *
+ * 接口本身也做了归属校验（服务端不会让你碰别人的任务），这里只是前端入口。
+ */
+async function jobAction(id, action) {
+  const path = '/api/jobs/' + id + '/' + action;
+  const r = await api(path, { method: 'POST', body: {} });
+  toast(r.message || ('已' + ({ pause: '暂停', resume: '继续', stop: '停止' }[action] || action)), 'ok');
+  return r;
+}
+
+/** 任务是不是「还没结束」（管理页筛选 / 按钮可用性都用它）。 */
+function isActiveJob(j) {
+  return j.status === 'running' || j.status === 'queued' || j.status === 'paused';
+}
+
+function kindText(j) {
+  return j.kind === 'exercise' ? '刷练习' : '刷局';
+}
+
+/**
+ * 把任务的完整参数拼成人能读的一段文字。
+ *
+ * ★ 2026-10-01：管理页原来只有「用户名 + 运行中」，看不出对方在刷局还是刷练习、
+ * 更看不到配置。这里把 config_json 里**所有**关键参数摊开（刷局与刷练习字段不同，
+ * 所以分两路拼），管理员一眼就能判断这个任务在干什么、节奏合不合理。
+ */
+function jobConfigText(j) {
+  const c = j.config || {};
+  const head = [
+    '任务类型：' + kindText(j),
+    '轮次：' + (j.roundsDone || 0) + '/' + (j.roundsTotal || 0) + '（失败 ' + (j.roundsFailed || 0) + '）',
+  ];
+  if (j.kind === 'exercise') {
+    head.push(
+      '知识点 ID：' + c.keypointId,
+      '每轮题数：' + c.limit,
+      '每轮间隔：' + (c.gapMinMs || 0) + '~' + (c.gapMaxMs || 0) + 'ms',
+    );
+    if (c.costTimePerQuestionMs != null) head.push('每题耗时：' + c.costTimePerQuestionMs + 'ms');
+  } else {
+    head.push(
+      '知识点 ID：' + c.pointId,
+      '画笔算法：' + (c.strokeMode === 'SEVEN_SEGMENT' ? '七段码' : '弧线'),
+      'costTime：' + (c.costTimeMs == null ? '自动' : c.costTimeMs + 'ms'),
+      '每轮间隔：' + (c.gapMinMs == null ? '?' : c.gapMinMs) + '~' + (c.gapMaxMs == null ? '?' : c.gapMaxMs) + 'ms',
+      '答题间隔：' + ((c.submitDelayMaxMs || 0) > 0 ? (c.submitDelayMinMs + '~' + c.submitDelayMaxMs + 'ms') : '无'),
+      '频控退避：' + (c.rateLimitBaseMs == null ? '?' : c.rateLimitBaseMs) + 'ms × ' + (c.rateLimitMaxWait == null ? '?' : c.rateLimitMaxWait),
+      '出题重试：' + (c.matchRetryIntervalMs == null ? '?' : c.matchRetryIntervalMs) + 'ms / 上限 ' + (c.matchRetryMaxMs == null ? '?' : c.matchRetryMaxMs) + 'ms',
+    );
+    if (c.subUserId != null) head.push('子账号：' + c.subUserId);
+  }
+  if (j.subUserId != null && j.kind !== 'exercise') head.push('（库内 sub_user_id：' + j.subUserId + '）');
+  if (j.error) head.push('错误：' + j.error);
+  return head.join('\n');
 }
 
 async function showJobDetail(id) {
@@ -910,40 +988,49 @@ async function loadAdmin() {
     ub.innerHTML = '';
     for (const u of users.users) {
       const el = document.createElement('div');
-      el.className = 'item';
-      el.innerHTML = '<div><div class="title"></div><div class="meta"></div></div><div class="actions"></div>';
+      el.className = 'item stack';
+      el.innerHTML = '<div class="main"><div class="title"></div><div class="meta"></div></div><div class="actions"></div>';
       el.querySelector('.title').textContent = u.username + (u.role === 'admin' ? '（管理员）' : '');
-      el.querySelector('.meta').textContent = '最后登录 ' + fmtTime(u.last_login_at) + (u.disabled ? ' · 已禁用' : '');
-      const b1 = document.createElement('button');
-      b1.className = 'mini';
-      b1.textContent = '重置密码';
-      b1.addEventListener('click', async () => {
-        const np = prompt('输入新密码（≥6 位）');
-        if (!np) return;
-        try { await api('/api/admin/users/' + u.id + '/password', { method: 'POST', body: { password: np } }); toast('已重置', 'ok'); }
-        catch (err) { toast(err.message, 'err'); }
-      });
-      const b2 = document.createElement('button');
-      b2.className = 'mini';
-      b2.textContent = u.disabled ? '启用' : '禁用';
-      b2.addEventListener('click', async () => {
-        try { await api('/api/admin/users/' + u.id + '/disable', { method: 'POST', body: { disabled: !u.disabled } }); loadAdmin(); }
-        catch (err) { toast(err.message, 'err'); }
-      });
-      el.querySelector('.actions').append(b1, b2);
+      el.querySelector('.meta').textContent =
+        '最后登录 ' + fmtTime(u.last_login_at) + (u.disabled ? ' · 已禁用' : '') +
+        ' · 小猿账号 ' + (u.leoAccounts == null ? '?' : u.leoAccounts) + ' 个' +
+        ' · 进行中任务 ' + (u.activeJobs == null ? '?' : u.activeJobs) + ' 个';
+      el.querySelector('.actions').append(
+        makeMiniButton('重置密码', async () => {
+          const np = prompt('输入新密码（≥6 位）');
+          if (!np) return;
+          await api('/api/admin/users/' + u.id + '/password', { method: 'POST', body: { password: np } });
+          toast('已重置', 'ok');
+        }),
+        makeMiniButton(u.disabled ? '启用' : '禁用', async () => {
+          const r = await api('/api/admin/users/' + u.id + '/disable', {
+            method: 'POST', body: { disabled: !u.disabled },
+          });
+          toast(r.message || '已更新', 'ok');
+          await loadAdmin();
+        }),
+        // ★ 2026-10-01：新增删除账号（原先只能禁用，删不掉）
+        makeMiniButton('删除', async () => {
+          const tip = u.id === state.user.id
+            ? '不能删除自己。'
+            : `确定删除账号「${u.username}」？\n\n` +
+              `· 名下 ${u.leoAccounts || 0} 个小猿账号（登录态）将被清除\n` +
+              `· 历史任务与逐轮明细将被清除\n` +
+              `· 进行中的任务会先被停止\n` +
+              `· 该账号所有登录会话立即失效\n\n` +
+              `此操作不可恢复。`;
+          if (u.id === state.user.id) return toast('不能删除自己', 'err');
+          if (!confirm(tip)) return;
+          const r = await api('/api/admin/users/' + u.id, { method: 'DELETE' });
+          toast(r.message || '已删除', 'ok');
+          adminJobSel.delete(u.id);
+          await loadAdmin();
+        }, 'danger'),
+      );
       ub.appendChild(el);
     }
 
-    const jb = $('admin-jobs');
-    jb.innerHTML = '';
-    for (const j of jobs.jobs) {
-      const el = document.createElement('div');
-      el.className = 'item';
-      el.innerHTML = '<div><div class="title"></div><div class="meta"></div></div>';
-      el.querySelector('.title').textContent = '#' + j.id + ' ' + (j.username || '-') + ' ' + statusText(j.status);
-      el.querySelector('.meta').textContent = '成功 ' + j.roundsDone + '/' + j.roundsTotal + ' · ' + fmtTime(j.createdAt);
-      jb.appendChild(el);
-    }
+    renderAdminJobs(jobs.jobs || [], new Set(jobs.running || []));
 
     const ab = $('admin-audit');
     ab.innerHTML = '';
@@ -960,6 +1047,343 @@ async function loadAdmin() {
     logLine(sb, '频控退避：基数 ' + sys.pk.rateLimitBaseMs + 'ms · 最多 ' + sys.pk.rateLimitMaxWait + ' 次', 'l-dim');
   } catch (err) { toast(err.message, 'err'); }
 }
+
+/* --------------------- 管理页：全部任务（可操控） --------------------- */
+/*
+ * ★ 2026-10-01：管理页原来只显示「#id 用户名 状态」，既看不出在刷局还是刷练习、
+ * 也看不到任何配置，更没有停止/暂停的入口 —— 管理员对别人的任务完全无能为力。
+ *
+ * 现在每条任务展示：归属用户 + 小猿账号名 + 任务类型 + 完整参数快照，
+ * 并提供「暂停 / 继续 / 停止 / 明细」，勾选后还能批量操作。
+ */
+
+/** 管理页里被勾选的任务 id。 */
+const adminJobSel = new Set();
+/** 管理页「明细」挂着的实时日志流（切任务时要关掉上一条）。 */
+let adminJobStream = null;
+
+function renderAdminJobs(jobs, runningSet) {
+  const box = $('admin-jobs');
+  box.innerHTML = '';
+  const onlyActive = $('admin-jobs-only-active') && $('admin-jobs-only-active').checked;
+  let shown = 0;
+  for (const j of jobs) {
+    if (onlyActive && !isActiveJob(j)) continue;
+    shown++;
+
+    const el = document.createElement('div');
+    el.className = 'item stack';
+
+    // 勾选框（批量操作用）
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'pick';
+    cb.checked = adminJobSel.has(j.id);
+    cb.addEventListener('change', () => {
+      if (cb.checked) adminJobSel.add(j.id); else adminJobSel.delete(j.id);
+      updateAdminJobCount();
+    });
+
+    const main = document.createElement('div');
+    main.className = 'main';
+    main.innerHTML = '<div class="title"></div><div class="meta"></div><div class="cfg"></div>';
+    const live = runningSet && runningSet.has(j.id) ? ' · 内存中运行中' : '';
+    main.querySelector('.title').textContent =
+      '#' + j.id + '  ' + (j.username || '(已删除用户)') + '  [' + kindText(j) + ']  ' + statusText(j.status) + live;
+    main.querySelector('.meta').textContent =
+      '小猿账号：' + (j.leoName || ('#' + j.leoAccountId)) +
+      ' · 进度 ' + (j.roundsDone || 0) + '/' + (j.roundsTotal || 0) +
+      ' · 失败 ' + (j.roundsFailed || 0) +
+      ' · 创建 ' + fmtTime(j.createdAt) +
+      (j.finishedAt ? ' · 结束 ' + fmtTime(j.finishedAt) : '');
+    main.querySelector('.cfg').textContent = jobConfigText(j);
+
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    // 暂停 / 停止：只对没结束的任务有意义
+    if (isActiveJob(j)) {
+      actions.appendChild(makeMiniButton('暂停', async () => {
+        await adminJobAction([j.id], 'pause');
+        await loadAdminJobsOnly();
+      }));
+      actions.appendChild(makeMiniButton('停止', async () => {
+        if (!confirm(`确定停止任务 #${j.id}（${j.username || '?'} 的${kindText(j)}）？`)) return;
+        await adminJobAction([j.id], 'stop');
+        await loadAdminJobsOnly();
+      }, 'danger'));
+    }
+    // 继续：暂停/停止且还有剩余轮次
+    if ((j.status === 'paused' || j.status === 'stopped') && (j.roundsDone || 0) < (j.roundsTotal || 0)) {
+      actions.appendChild(makeMiniButton('继续', async () => {
+        await adminJobAction([j.id], 'resume');
+        await loadAdminJobsOnly();
+      }));
+    }
+    actions.appendChild(makeMiniButton('明细', () => showAdminJobDetail(j.id)));
+
+    el.append(cb, main, actions);
+    box.appendChild(el);
+  }
+  if (shown === 0) {
+    box.innerHTML = '<p class="muted small">' + (jobs.length ? '（当前筛选下没有任务）' : '暂无任务') + '</p>';
+  }
+  updateAdminJobCount();
+}
+
+/** 更新「已选 N 个」提示。 */
+function updateAdminJobCount() {
+  const el = $('admin-jobs-count');
+  if (el) el.textContent = '已选 ' + adminJobSel.size + ' 个任务';
+}
+
+/** 只刷新任务列表（用户/审计不动，避免整页重绘丢勾选）。 */
+async function loadAdminJobsOnly() {
+  try {
+    const r = await api('/api/admin/jobs');
+    renderAdminJobs(r.jobs || [], new Set(r.running || []));
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+/** 管理页批量操作：stop / pause / resume。 */
+async function adminJobAction(ids, action) {
+  if (!ids.length) return toast('请先勾选任务', 'err');
+  const r = await api('/api/admin/jobs/action', { method: 'POST', body: { ids: ids, action: action } });
+  if (r.failed) {
+    // 部分失败时把每条的原因讲清楚，别只说「失败」
+    const bad = (r.results || []).filter((x) => !x.ok).map((x) => '#' + x.id + '：' + (x.message || '失败'));
+    toast(r.message + '｜' + bad.join('；'), 'err');
+  } else {
+    toast(r.message, 'ok');
+  }
+  return r;
+}
+
+/**
+ * 管理页「明细」：先打配置头，再把已落库的逐轮日志列出来，
+ * 最后挂上该任务的实时事件流（服务端已对管理员放行 /api/jobs/:id/stream）。
+ */
+async function showAdminJobDetail(id) {
+  const box = $('admin-job-detail');
+  box.innerHTML = '';
+  if (adminJobStream) { adminJobStream.close(); adminJobStream = null; }
+  try {
+    const r = await api('/api/admin/jobs/' + id);
+    const j = r.job;
+    logLine(box, `任务 #${j.id}  ${j.username || '(已删除用户)'}  [${kindText(j)}]  ${statusText(j.status)}`, 'l-dim');
+    logLine(box, '小猿账号：' + (j.leoName || ('#' + j.leoAccountId)) +
+      ' · 进度 ' + (j.roundsDone || 0) + '/' + (j.roundsTotal || 0) + ' · 失败 ' + (j.roundsFailed || 0), 'l-dim');
+    logLine(box, jobConfigText(j), 'l-dim');
+    logLine(box, '—— 逐轮明细 ——', 'l-dim');
+    for (const rd of r.rounds || []) {
+      logLine(box, '#' + rd.round_no + ' ' + (rd.ok ? 'OK' : 'FAIL') +
+        ' HTTP ' + (rd.http_code == null ? '-' : rd.http_code) + '  ' + (rd.message || ''),
+      rd.ok ? 'l-ok' : 'l-fail');
+      if (rd.detail) logLine(box, '    ' + String(rd.detail).slice(0, 300), 'l-dim');
+    }
+    logLine(box, '—— 实时日志 ——', 'l-dim');
+
+    const seen = new Set((r.rounds || []).map((x) => x.round_no));
+    const es = new EventSource('/api/jobs/' + id + '/stream');
+    adminJobStream = es;
+    es.onmessage = (ev) => {
+      let d;
+      try { d = JSON.parse(ev.data); } catch (e) { return; }
+      renderAdminJobEvent(d, box, seen);
+    };
+    es.onerror = () => { /* EventSource 自动重连 */ };
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+/** 管理页实时日志渲染（不碰「刷局」页的按钮状态，所以不复用 handleJobEvent）。 */
+function renderAdminJobEvent(d, box, seen) {
+  const t = fmtTime(d.at);
+  if (d.type === 'snapshot') {
+    for (const rd of d.rounds || []) {
+      if (seen.has(rd.round_no)) continue;
+      seen.add(rd.round_no);
+      logLine(box, `第 ${rd.round_no} 轮${rd.ok ? '成功' : '失败'}：${rd.message || ''}`, rd.ok ? 'l-ok' : 'l-fail');
+    }
+    return;
+  }
+  if (d.type === 'tick') { updateTickLine(box, `[${t}] ${d.message}`, 'l-dim'); return; }
+  let cls = 'l-dim';
+  if (d.type === 'ok' || d.type === 'match-ok' || d.type === 'encode-ok') cls = 'l-ok';
+  else if (d.type === 'fail') cls = 'l-fail';
+  else if (d.type === 'rate-limit' || d.type === 'warn' || d.type === 'gap') cls = 'l-warn';
+  if (d.type === 'ok' || d.type === 'fail') {
+    if (d.round != null) seen.add(d.round);
+    logLine(box, `[${t}] ${d.message || ''}`, cls);
+    if (d.detail) logLine(box, '    ' + String(d.detail).slice(0, 300), 'l-dim');
+  } else {
+    logLine(box, `[${t}] ${d.message || d.type}`, cls);
+  }
+  if (d.finished) loadAdminJobsOnly();
+}
+
+$('admin-jobs-refresh').addEventListener('click', loadAdminJobsOnly);
+$('admin-jobs-only-active').addEventListener('change', loadAdminJobsOnly);
+$('admin-jobs-sel-none').addEventListener('click', () => { adminJobSel.clear(); loadAdminJobsOnly(); });
+$('admin-jobs-sel-active').addEventListener('click', async () => {
+  try {
+    const r = await api('/api/admin/jobs');
+    adminJobSel.clear();
+    for (const j of r.jobs || []) if (isActiveJob(j)) adminJobSel.add(j.id);
+    renderAdminJobs(r.jobs || [], new Set(r.running || []));
+  } catch (err) { toast(err.message, 'err'); }
+});
+$('admin-jobs-pause').addEventListener('click', async () => {
+  await adminJobAction(Array.from(adminJobSel), 'pause');
+  await loadAdminJobsOnly();
+});
+$('admin-jobs-resume').addEventListener('click', async () => {
+  await adminJobAction(Array.from(adminJobSel), 'resume');
+  await loadAdminJobsOnly();
+});
+$('admin-jobs-stop').addEventListener('click', async () => {
+  const ids = Array.from(adminJobSel);
+  if (!ids.length) return toast('请先勾选任务', 'err');
+  if (!confirm(`确定停止选中的 ${ids.length} 个任务？`)) return;
+  await adminJobAction(ids, 'stop');
+  await loadAdminJobsOnly();
+});
+
+/* --------------------- 批量开任务（多个小猿账号） --------------------- */
+/*
+ * ★ 2026-10-01：用户场景「我登了 6 个账号，想按同样的配置一次性全开」。
+ *   这里在两个面板各放一份多选列表，勾谁就给谁开 —— 每个账号一个独立任务，
+ *   参数完全取自当前面板（也就是「同样的配置」）。
+ */
+
+const batchSel = { grind: new Set(), prac: new Set() };
+
+function renderBatchPicker(boxId, accounts, sel) {
+  const box = $(boxId);
+  if (!box) return;
+  box.innerHTML = '';
+  if (!accounts.length) {
+    box.innerHTML = '<p class="muted small">（还没有小猿账号，先去「小猿账号」页添加）</p>';
+    return;
+  }
+  for (const a of accounts) {
+    const label = document.createElement('label');
+    label.className = 'batch-item';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'pick';
+    cb.checked = sel.has(String(a.id));
+    cb.addEventListener('change', () => {
+      if (cb.checked) sel.add(String(a.id)); else sel.delete(String(a.id));
+      updateBatchLabel();
+    });
+    const span = document.createElement('span');
+    span.textContent = a.name + '（uid ' + (a.yfdU || '?') + '）';
+    const ks = (a.cookieNames || []).filter((n) => n.indexOf('ks_') === 0);
+    const sub = document.createElement('span');
+    sub.className = 'sub';
+    sub.textContent = ks.length ? '设备链✓' : '设备链✗';
+    label.append(cb, span, sub);
+    box.appendChild(label);
+  }
+  updateBatchLabel();
+}
+
+/** 刷新两个「批量开始」按钮上的数量。 */
+function updateBatchLabel() {
+  const g = $('grind-batch-start');
+  if (g) g.textContent = '批量开始刷局（' + batchSel.grind.size + '）';
+  const p = $('prac-batch-start');
+  if (p) p.textContent = '批量开始刷练习（' + batchSel.prac.size + '）';
+}
+
+/** 收集「刷局」面板当前这套参数（不含账号 id）。 */
+function collectPkBody() {
+  const strokeEl = document.querySelector('input[name="strokeMode"]:checked');
+  const body = {
+    pointId: Number($('grind-point').value || 1951),
+    rounds: Number($('grind-rounds').value || 10),
+    gapMinMs: Number($('grind-gapmin').value || 60000),
+    gapMaxMs: Number($('grind-gapmax').value || 65000),
+    submitDelayMinMs: Number($('grind-delaymin').value || 0),
+    submitDelayMaxMs: Number($('grind-delaymax').value || 0),
+    rateLimitBaseMs: Number($('grind-rlbase').value || 60000),
+    rateLimitMaxWait: Number($('grind-rlmax').value || 2),
+    matchRetryIntervalMs: Number(($('grind-mretry') || {}).value || 8000),
+    matchRetryMaxMs: Number(($('grind-mmax') || {}).value || 240000),
+    strokeMode: strokeEl ? strokeEl.value : 'ARC',
+  };
+  // costTime 留空 = 自动（服务端按题数 × 5ms 给下限）
+  const cost = $('grind-cost').value.trim();
+  if (cost !== '') body.costTimeMs = Number(cost);
+  return body;
+}
+
+/** 收集「刷练习」面板当前这套参数。 */
+function collectExerciseBody() {
+  return {
+    keypointId: Number($('prac-kp').value || 16),
+    limit: Number($('prac-limit').value || 100),
+    rounds: Number($('prac-rounds').value || 1),
+    gapMinMs: Number($('prac-gapmin').value || 0),
+    gapMaxMs: Number($('prac-gapmax').value || 0),
+  };
+}
+
+/**
+ * 批量开任务。
+ *
+ * @param {'pk'|'exercise'} kind
+ */
+async function batchStartJobs(kind) {
+  const sel = kind === 'exercise' ? batchSel.prac : batchSel.grind;
+  const ids = Array.from(sel).map(Number).filter((n) => n > 0);
+  if (!ids.length) return toast('先勾选至少一个小猿账号', 'err');
+  const btn = $(kind === 'exercise' ? 'prac-batch-start' : 'grind-batch-start');
+  btn.disabled = true;
+  btn.textContent = '启动中…';
+  try {
+    const body = kind === 'exercise'
+      ? Object.assign({ kind: 'exercise', leoAccountIds: ids }, collectExerciseBody())
+      : Object.assign({ kind: 'pk', leoAccountIds: ids }, collectPkBody());
+    const r = await api('/api/jobs/batch', { method: 'POST', body: body });
+    toast(r.message || '已启动', r.failed ? 'err' : 'ok');
+    // 逐条结果说清楚，失败的单独标出来（比如那个号没设备链）
+    const lines = (r.results || []).map((x) =>
+      (x.name || ('#' + x.leoAccountId)) + ' → ' +
+      (x.ok ? ('任务 #' + x.jobId) : ('失败：' + (x.message || '未知'))));
+    if (kind === 'exercise') {
+      const log = $('prac-runlog');
+      for (const l of lines) logLine(log, l, 'l-dim');
+    } else {
+      const log = $('log');
+      for (const l of lines) logLine(log, '[批量] ' + l, 'l-dim');
+    }
+    await loadJobs();
+  } catch (err) {
+    toast(err.message, 'err');
+  } finally {
+    btn.disabled = false;
+    updateBatchLabel();
+  }
+}
+
+$('grind-batch-start').addEventListener('click', () => { batchStartJobs('pk'); });
+$('prac-batch-start').addEventListener('click', () => { batchStartJobs('exercise'); });
+$('grind-batch-all').addEventListener('click', () => {
+  batchSel.grind = new Set((state.leoAccounts || []).map((a) => String(a.id)));
+  renderBatchPicker('grind-batch', state.leoAccounts || [], batchSel.grind);
+});
+$('grind-batch-none').addEventListener('click', () => {
+  batchSel.grind.clear();
+  renderBatchPicker('grind-batch', state.leoAccounts || [], batchSel.grind);
+});
+$('prac-batch-all').addEventListener('click', () => {
+  batchSel.prac = new Set((state.leoAccounts || []).map((a) => String(a.id)));
+  renderBatchPicker('prac-batch', state.leoAccounts || [], batchSel.prac);
+});
+$('prac-batch-none').addEventListener('click', () => {
+  batchSel.prac.clear();
+  renderBatchPicker('prac-batch', state.leoAccounts || [], batchSel.prac);
+});
 
 $('btn-admin-add').addEventListener('click', async () => {
   try {
@@ -1006,7 +1430,9 @@ function fillPracticeLeo(accounts) {
 async function loadPractice() {
   try {
     const r = await api('/api/leo/accounts');
+    state.leoAccounts = r.accounts || [];
     fillPracticeLeo(r.accounts || []);
+    renderBatchPicker('prac-batch', r.accounts || [], batchSel.prac);
     await loadPracticeSubs();
     if (!(r.accounts || []).length) {
       $('prac-status').textContent = '还没有导入小猿账号 —— 先去「小猿账号」页添加。';
@@ -1127,14 +1553,8 @@ async function runPractice() {
   try {
     const r = await api('/api/exercise/run', {
       method: 'POST',
-      body: {
-        leoAccountId: Number(id),
-        rounds: Number($('prac-rounds').value || 1),
-        limit: Number($('prac-limit').value || 100),
-        keypointId: Number($('prac-kp').value || 16),
-        gapMinMs: Number($('prac-gapmin').value || 0),
-        gapMaxMs: Number($('prac-gapmax').value || 0),
-      },
+      // 与「批量开练习」共用同一套参数解析
+      body: Object.assign({ leoAccountId: Number(id) }, collectExerciseBody()),
     });
     state.practiceJobId = r.jobId;
     try { localStorage.setItem('pknode.pracJobId', String(r.jobId)); } catch (e) { /* 隐私模式忽略 */ }

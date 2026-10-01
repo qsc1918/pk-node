@@ -62,11 +62,28 @@ function logout(token) {
   if (token) db.deleteSession(token);
 }
 
-/** 从 cookie 里解析当前登录用户。 */
+/**
+ * 从 cookie 里解析当前登录用户。
+ *
+ * ★ 2026-10-01：**已禁用的账号立即失效**（等于强制退出登录）。
+ *
+ *  原实现只透传 `getUserBySession` 的结果，而 `disabled` 只在**登录那一刻**检查 ——
+ *  于是管理员点「禁用」后，对方浏览器手里那张旧 token 完全不受影响：
+ *  页面照常显示、任务照常能开（正是用户反馈的「别人那边不会退出登录」）。
+ *
+ *  这里改成：发现 disabled 就顺手删掉这张会话并返回 null ⇒
+ *  该浏览器所有 `/api/*` 立刻 401，前端跳回登录页；重新登录也会被 `login()` 挡住。
+ */
 function currentUser(cookieHeader) {
   const token = readSessionCookie(cookieHeader);
   if (!token) return null;
-  return db.getUserBySession(token);
+  const u = db.getUserBySession(token);
+  if (!u) return null;
+  if (u.disabled) {
+    try { db.deleteSession(token); } catch (e) { /* 删不掉也不影响本次拒绝 */ }
+    return null;
+  }
+  return u;
 }
 
 /** 生成登录成功要写的 Set-Cookie 头。 */

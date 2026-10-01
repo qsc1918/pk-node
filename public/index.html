@@ -132,6 +132,20 @@
           <button id="btn-stop" class="danger" disabled title="立即中断当前任务（不等本轮跑完）">立即结束</button>
         </div>
         <p id="grind-hint" class="muted small"></p>
+
+        <details class="adv">
+          <summary>批量开任务（多个账号 · 同一套配置）</summary>
+          <p class="muted small">
+            勾上多个小猿账号再点「批量开始」—— <b>每个账号各起一个独立任务</b>，共用上面这套参数。
+            任务之间互不干扰：各自独立计数、可单独暂停 / 继续 / 停止，在「任务」页统一管理。
+          </p>
+          <div id="grind-batch" class="batch-picker"></div>
+          <div class="row">
+            <button id="grind-batch-all" class="ghost">全选</button>
+            <button id="grind-batch-none" class="ghost">清空</button>
+            <button id="grind-batch-start" class="primary grow">批量开始刷局（0）</button>
+          </div>
+        </details>
       </div>
 
       <div class="card">
@@ -258,6 +272,20 @@
         <button id="prac-stop" class="danger" disabled title="立即中断当前练习任务">停止</button>
         <button id="prac-exam">只看题（不提交）</button>
       </div>
+
+      <details class="adv">
+        <summary>批量开练习任务（多个账号 · 同一套配置）</summary>
+        <p class="muted small">
+          勾上多个小猿账号再点「批量开始」—— 每个账号各起一个练习任务，共用上面的
+          知识点 / 每轮题数 / 轮数 / 间隔。适合「六个号一起刷练习」。
+        </p>
+        <div id="prac-batch" class="batch-picker"></div>
+        <div class="row">
+          <button id="prac-batch-all" class="ghost">全选</button>
+          <button id="prac-batch-none" class="ghost">清空</button>
+          <button id="prac-batch-start" class="primary grow">批量开始刷练习（0）</button>
+        </div>
+      </details>
       <p id="prac-runhint" class="muted small">
         刷练习现在是<b>正经的后台任务</b>：切到别的页面、甚至关掉浏览器，服务端都会继续跑完；
         进度 / 逐轮明细也会出现在「任务」页（可随时回来接着看日志，或点「停止」中断）。
@@ -391,11 +419,37 @@
         <input id="admin-newpass" placeholder="密码（≥6 位）">
         <button id="btn-admin-add" class="primary">新增</button>
       </div>
+      <p class="muted small">
+        「禁用」会<b>立刻暂停该用户所有正在跑的任务</b>并把他<b>强制退出登录</b>（他手里的会话当场失效，
+        也无法再开新任务）。「删除」会连同他的小猿账号与历史任务一起清掉，<b>不可恢复</b>。
+      </p>
       <div id="admin-users" class="list"></div>
     </div>
     <div class="card">
-      <h2>全部任务</h2>
+      <h2>全部任务（所有用户）</h2>
+      <p class="muted small">
+        这里能看到<b>每个人</b>在跑什么：是刷局还是刷练习、用的哪个小猿账号、以及完整参数。
+        勾选后可<b>批量暂停 / 继续 / 停止</b>；「暂停」保留已刷轮数，之后可原地「继续」接着跑。
+      </p>
+      <div class="row">
+        <button id="admin-jobs-refresh" class="ghost">刷新</button>
+        <label class="muted small" style="display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="admin-jobs-only-active"> 只看没结束的
+        </label>
+        <button id="admin-jobs-sel-active" class="ghost">选中进行中</button>
+        <button id="admin-jobs-sel-none" class="ghost">清空选择</button>
+      </div>
+      <div class="row">
+        <button id="admin-jobs-pause" class="ghost">批量暂停</button>
+        <button id="admin-jobs-resume" class="ghost">批量继续</button>
+        <button id="admin-jobs-stop" class="danger">批量停止</button>
+        <span id="admin-jobs-count" class="muted small"></span>
+      </div>
       <div id="admin-jobs" class="list"></div>
+    </div>
+    <div class="card">
+      <h2>任务明细</h2>
+      <div id="admin-job-detail" class="log tall"></div>
     </div>
     <div class="card">
       <h2>审计日志</h2>
