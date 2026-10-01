@@ -148,6 +148,8 @@ const state = {
   streamErrorNotified: false,
   seenRounds: new Set(),
   practiceStream: null,
+  /** 当前正在看的「刷练习」任务 id（刷练习自 2026-10-01 起是正经后台任务）。 */
+  practiceJobId: null,
 };
 
 /* ------------------------------ 登录 ------------------------------ */
@@ -786,10 +788,13 @@ async function loadJobs() {
       const el = document.createElement('div');
       el.className = 'item';
       el.innerHTML = '<div><div class="title"></div><div class="meta"></div></div><div class="actions"></div>';
-      el.querySelector('.title').textContent = '#' + j.id + ' ' + statusText(j.status);
+      el.querySelector('.title').textContent =
+        '#' + j.id + ' [' + (j.kind === 'exercise' ? '刷练习' : '刷局') + '] ' + statusText(j.status);
       el.querySelector('.meta').textContent =
         '成功 ' + j.roundsDone + '/' + j.roundsTotal + ' · 失败 ' + j.roundsFailed +
-        ' · pointId ' + (j.config ? j.config.pointId : '?') +
+        (j.kind === 'exercise'
+          ? ' · 知识点 ' + (j.config ? j.config.keypointId : '?') + ' · 每轮 ' + (j.config ? j.config.limit : '?') + ' 题'
+          : ' · pointId ' + (j.config ? j.config.pointId : '?')) +
         ' · ' + fmtTime(j.createdAt);
       const btn = document.createElement('button');
       btn.className = 'mini';
@@ -827,6 +832,27 @@ $('prac-refresh').addEventListener('click', refreshPractice);
 $('prac-pump').addEventListener('click', pumpPractice);
 $('prac-exam').addEventListener('click', fetchPracticeExam);
 $('prac-run').addEventListener('click', runPractice);
+$('prac-stop').addEventListener('click', stopPractice);
+
+/**
+ * 「填入推荐值」：把刷局的每轮间隔填成贴着服务端出题冷却的值。
+ *
+ * 为什么要有这个按钮（2026-10-01）：服务端**确实**有 ≈60s 的账号级出题冷却，
+ * 但引擎被要求**不强制**替用户等待 —— 冷却只由用户填的「每轮间隔」体现。
+ * 而这两个输入框的值会被 bindPersist 存进 localStorage，改 HTML 默认值
+ * 对**已经存过值**的浏览器不生效，所以给一个显式按钮。
+ */
+$('grind-gap-recommend').addEventListener('click', () => {
+  const lo = $('grind-gapmin');
+  const hi = $('grind-gapmax');
+  lo.value = '60000';
+  hi.value = '65000';
+  // 触发 bindPersist 的 change 监听，把新值落进 localStorage
+  [lo, hi].forEach((el) => {
+    try { el.dispatchEvent(new Event('change')); } catch (e) { /* ignore */ }
+  });
+  toast('已填入推荐间隔 60000~65000ms（贴着服务端 ≈60s 出题冷却）', 'ok');
+});
 $('prac-leo').addEventListener('change', loadPracticeSubs);
 $('prac-switch').addEventListener('click', switchPracticeSub);
 $('dc-add').addEventListener('click', addDeviceChain);
@@ -985,6 +1011,8 @@ async function loadPractice() {
     if (!(r.accounts || []).length) {
       $('prac-status').textContent = '还没有导入小猿账号 —— 先去「小猿账号」页添加。';
     }
+    // 上次的练习任务可能还在后台跑（或留下了日志）→ 重新挂上日志流
+    restorePracticeJob();
   } catch (e) { toast(e.message, 'err'); }
 }
 
@@ -1084,7 +1112,10 @@ async function fetchPracticeExam() {
 
 /**
  * 开始自动刷练习：POST /api/exercise/run，然后订阅 /api/exercise/stream 看实时日志。
- * 与「刷局」共用 jobs 的事件总线（服务端 publish(0, {exercise:true,...})）。
+ *
+ * ★ 2026-10-01：刷练习返回的是**任务 id**（服务端把它当正经后台任务落库了），
+ *   所以：日志按 jobId 过滤、可在「任务」页看到、可随时「停止」，
+ *   切走再回来（甚至刷新页面）都能靠 SSE 的历史回放接着看。
  */
 async function runPractice() {
   const id = $('prac-leo').value;
@@ -1105,33 +1136,98 @@ async function runPractice() {
         gapMaxMs: Number($('prac-gapmax').value || 0),
       },
     });
+    state.practiceJobId = r.jobId;
+    try { localStorage.setItem('pknode.pracJobId', String(r.jobId)); } catch (e) { /* 隐私模式忽略 */ }
+    setPracticeHint(r.message || ('任务 #' + r.jobId + ' 已开始'), true);
     say(r.message || '已开始', 'l-ok');
+    $('prac-stop').disabled = false;
     attachPracticeStream();
+    loadJobs();
   } catch (e) {
     say('启动失败：' + e.message, 'l-warn');
     toast(e.message, 'err');
   }
 }
-/** 订阅练习事件流（服务端把所有练习事件 publish 到 id=0 的 exercise 通道）。 */
+
+/** 顶部提示行（把任务 id 写清楚，便于去「任务」页对照）。 */
+function setPracticeHint(text, ok) {
+  const el = $('prac-runhint');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = ok ? 'var(--ok)' : 'var(--danger)';
+}
+
+/** 「停止」练习任务（走与刷局相同的停止接口，立即中断在途请求与等待）。 */
+async function stopPractice() {
+  const jobId = state.practiceJobId;
+  if (!jobId) return toast('没有正在看的练习任务', 'err');
+  const btn = $('prac-stop');
+  btn.disabled = true;
+  btn.textContent = '正在中断…';
+  try {
+    const r = await api('/api/jobs/' + jobId + '/stop', { method: 'POST', body: { immediate: true } });
+    toast(r.message || '已停止', 'ok');
+  } catch (e) {
+    toast(e.message, 'err');
+    btn.disabled = false;
+  }
+  btn.textContent = '停止';
+}
+
+/** 练习事件渲染（type 形如 ex-match / ex-round-ok / ex-rate-limit …）。 */
+function renderPracticeEvent(d, log) {
+  let cls = '';
+  if (d.type === 'ex-ok' || d.type === 'ex-round-ok' || d.type === 'ex-match-ok' ||
+      d.type === 'ex-done' || d.type === 'ex-final') cls = 'l-ok';
+  else if (d.type === 'ex-fail' || d.type === 'ex-rate-limit' || d.type === 'ex-round-fail') cls = 'l-warn';
+  else if (d.type === 'ex-gap' || d.type === 'ex-round') cls = 'l-dim';
+  logLine(log, (d.message || d.type), cls);
+  if (d.finished) {
+    $('prac-stop').disabled = true;
+    setPracticeHint(d.message || '练习任务已结束', true);
+    loadJobs();
+  }
+}
+
+/** 订阅练习事件流（服务端把所有练习事件同时镜像到 id=0 的 exercise 通道）。 */
 function attachPracticeStream() {
   stopPracticeStream();
   const log = $('prac-runlog');
+  const jobId = state.practiceJobId;
   const es = new EventSource('/api/exercise/stream');
   state.practiceStream = es;
   es.onopen = () => logLine(log, '[已连接练习日志流…]', 'l-dim');
   es.onmessage = (ev) => {
     let d;
     try { d = JSON.parse(ev.data); } catch (e) { return; }
-    const cls = d.type === 'ex-ok' ? 'l-ok'
-      : (d.type === 'ex-fail' || d.type === 'ex-rate-limit') ? 'l-warn'
-      : (d.type === 'ex-done' || d.type === 'ex-final') ? 'l-ok' : '';
-    logLine(log, (d.message || d.type), cls);
+    // 只显示「当前这个任务」的事件（同一个人可能同时挂了好几个练习任务）
+    if (jobId && d.jobId != null && Number(d.jobId) !== Number(jobId)) return;
+    renderPracticeEvent(d, log);
   };
   es.onerror = () => { /* EventSource 自动重连 */ };
 }
 /** 关闭练习事件流。 */
 function stopPracticeStream() {
   if (state.practiceStream) { state.practiceStream.close(); state.practiceStream = null; }
+}
+
+/**
+ * 回到「刷练习」页时恢复上次的任务视图。
+ *
+ * ★ 2026-10-01：用户反馈「切到后台就不会再执行」——真因是以前练习日志
+ * 只活在页面内存里（SSE 断开就没了），且任务没落库、任务页看不到。
+ * 现在任务在服务端持续跑，这里按 localStorage 记住的 jobId 重新挂上日志流
+ * （服务端会回放最近的事件）。
+ */
+function restorePracticeJob() {
+  if (state.practiceJobId) { attachPracticeStream(); return; }
+  let saved = null;
+  try { saved = localStorage.getItem('pknode.pracJobId'); } catch (e) { /* ignore */ }
+  if (!saved) return;
+  state.practiceJobId = Number(saved);
+  attachPracticeStream();
+  $('prac-stop').disabled = false;
+  setPracticeHint('正在显示任务 #' + saved + ' 的日志（若是历史任务，这里显示的是回放）。', true);
 }
 /* ========================= 设备链池 ========================= */
 async function loadDeviceChains() {

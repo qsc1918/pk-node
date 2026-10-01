@@ -155,6 +155,20 @@ function clientIp(req) {
   return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
 }
 
+/**
+ * 轮数解析：**只挡非法值，不再悄悄截断用户填的大数字**。
+ *
+ * ★ 2026-10-01 用户反馈：「轮数即使填了大于 100 的数，也按 100 来算」。
+ * 真因就是这里原来的 `Math.min(99, …)` / `Math.min(999, …)` —— 用户填 500
+ * 会被无声改成 99。现在只保留一个足够大的安全上限（防误填天文数字把内存撑爆）。
+ */
+const MAX_ROUNDS = 100000;
+function clampRounds(v, def) {
+  const n = Math.floor(Number(v));
+  if (!Number.isFinite(n) || n < 1) return Math.max(1, Math.floor(Number(def) || 1));
+  return Math.min(n, MAX_ROUNDS);
+}
+
 /* ---------------------------- 静态文件 ---------------------------- */
 
 const MIME = {
@@ -580,25 +594,27 @@ async function handleApi(req, res, u, user) {
     const cfg = {
       pointId: Number(b.pointId || 1951),
       costTimeMs: b.costTimeMs == null || b.costTimeMs === '' ? null : Number(b.costTimeMs),
-      // 轮间隔只是「下限」：真正的节奏由出题冷却（≈61.6s/账号，实测）决定，
-// 引擎会自动等到「上次成功 + 冷却」再发车，所以这里给小值即可。
-      gapMinMs: b.gapMinMs == null ? 4000 : Number(b.gapMinMs),
-      gapMaxMs: b.gapMaxMs == null ? 8000 : Number(b.gapMaxMs),
+      // 轮间隔：**唯一的节奏旋钮**。服务端有 ≈60s 的账号级出题冷却（实测仍在），
+      // 但引擎按要求**不强制**替你等 —— 你填多少就按多少跑（默认取网页上的推荐值）。
+      gapMinMs: b.gapMinMs == null ? 60000 : Number(b.gapMinMs),
+      gapMaxMs: b.gapMaxMs == null ? 65000 : Number(b.gapMaxMs),
       // 出题成功 → 提交答案 之间的间隔（让节奏更像真人，也错开频控窗口）
       submitDelayMinMs: b.submitDelayMinMs == null ? 0 : Number(b.submitDelayMinMs),
       submitDelayMaxMs: b.submitDelayMaxMs == null ? 0 : Number(b.submitDelayMaxMs),
       rateLimitBaseMs: b.rateLimitBaseMs == null ? PK.rateLimitBaseMs : Number(b.rateLimitBaseMs),
       rateLimitMaxWait: b.rateLimitMaxWait == null ? PK.rateLimitMaxWait : Number(b.rateLimitMaxWait),
       // 出题被频控时的自动重试：间隔 / 总等待上限（见 pk-engine 第 2 步）
-      matchRetryIntervalMs: b.matchRetryIntervalMs == null ? 8000 : Number(b.matchRetryIntervalMs),
-      matchRetryMaxMs: b.matchRetryMaxMs == null ? 240000 : Number(b.matchRetryMaxMs),
+      matchRetryIntervalMs: b.matchRetryIntervalMs == null ? PK.matchRetryIntervalMs : Number(b.matchRetryIntervalMs),
+      matchRetryMaxMs: b.matchRetryMaxMs == null ? PK.matchRetryMaxMs : Number(b.matchRetryMaxMs),
       strokeMode: strokes.normalizeStrokeMode(b.strokeMode),
       subUserId: b.subUserId == null ? null : Number(b.subUserId),
     };
     if (cfg.costTimeMs != null && (!Number.isFinite(cfg.costTimeMs) || cfg.costTimeMs < 0)) {
       return sendJson(res, 400, { ok: false, message: 'costTime 必须是非负数字（留空=自动）' });
     }
-    const rounds = Math.max(1, Math.min(999, Number(b.rounds || 10)));
+    // ★ 2026-10-01：不再截断轮数（原来 Math.min(999, …) 会把大数字悄悄改小）。
+    //   只挡掉非数字/非正数；上限给一个足够大的安全值防止误填天文数字。
+    const rounds = clampRounds(b.rounds, 10);
     const jobId = db.createJob(user.id, leoId, cfg.subUserId, cfg, rounds);
     db.audit(user.id, 'job_create', `job=${jobId} rounds=${rounds} pointId=${cfg.pointId}`, clientIp(req));
 
@@ -732,38 +748,39 @@ async function handleApi(req, res, u, user) {
     const b = await readJson(req);
     const acc = db.getLeoAccount(Number(b.leoAccountId));
     if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '小猿账号不存在' });
-    const jar = jobs.jarOf(acc);
-    const rounds = Math.max(1, Math.min(99, Number(b.rounds) || 1));
+    const rounds = clampRounds(b.rounds, 1);
     const limit = Math.max(1, Math.min(200, Number(b.limit) || 100));
     const keypointId = Number(b.keypointId) || 235001;
-    const before = await exercise.readScore(jar);
 
-    // 后台跑，日志走 SSE（与刷局同一套 publish）
-    (async () => {
-      try {
-        const r = await exercise.practiceLoop(jar, {
-          rounds: rounds, limit: limit, keypointId: keypointId,
-          gapMinMs: Math.max(0, Number(b.gapMinMs) || 0),
-          gapMaxMs: Math.max(0, Number(b.gapMaxMs) || 0),
-          onEvent: (ev) => jobs.publish(0, Object.assign({ exercise: true, at: Date.now() }, ev)),
-        });
-        // 服务端记账有延迟：先读一次，若与 before 相同再等 3s 复读，避免显示「+0」误导
-        let after = await exercise.readScore(jar);
-        if (after != null && before != null && after === before) {
-          await new Promise((res) => setTimeout(res, 3000));
-          const again = await exercise.readScore(jar);
-          if (again != null) after = again;
-        }
-        jobs.publish(0, {
-          exercise: true, at: Date.now(), type: 'ex-final',
-          message: `练习收尾：成功 ${r.done}/${r.rounds}，失败 ${r.failed}；curWeekScore ${before} → ${after}（+${(after != null && before != null) ? after - before : '?'}）`,
-        });
-      } catch (e) {
-        jobs.publish(0, { exercise: true, at: Date.now(), type: 'ex-fail', message: '任务异常：' + (e && e.message) });
-      }
-    })();
-    db.audit(user.id, 'exercise_run', `leo=${acc.id} rounds=${rounds} limit=${limit} kp=${keypointId}`, clientIp(req));
-    return sendJson(res, 200, { ok: true, message: `已开始：${rounds} 轮 × ${limit} 题（score=${before}）`, rounds: rounds, limit: limit });
+    // ★★ 2026-10-01：刷练习改为**正经的后台任务**（跟刷局同一套）。
+    //
+    //  旧实现是裸的 async IIFE：不落库、不登记 running、不占并行名额，
+    //  于是「任务」页看不到它、切 tab 回来日志空白、也没法停止。
+    //  现在写一条 jobs 记录（config.kind='exercise'）再交给 jobs.startExerciseJob，
+    //  于是：任务页可见 / 逐轮明细落库 / 可停止 / 与刷局共用 SSE。
+    const cfg = {
+      kind: 'exercise',
+      keypointId: keypointId,
+      limit: limit,
+      gapMinMs: Math.max(0, Number(b.gapMinMs) || 0),
+      gapMaxMs: Math.max(0, Number(b.gapMaxMs) || 0),
+      costTimePerQuestionMs: b.costTimePerQuestionMs == null ? undefined : Number(b.costTimePerQuestionMs),
+      rounds: rounds,
+    };
+    const jobId = db.createJob(user.id, acc.id, null, cfg, rounds);
+    const start = jobs.startExerciseJob({ jobId: jobId });
+    db.audit(user.id, 'exercise_run', `job=${jobId} leo=${acc.id} rounds=${rounds} limit=${limit} kp=${keypointId}`, clientIp(req));
+    if (!start.ok) {
+      db.setJobStatus(jobId, 'failed', { finishedAt: Date.now(), error: start.message });
+      return sendJson(res, 400, { ok: false, jobId: jobId, message: start.message });
+    }
+    return sendJson(res, 200, {
+      ok: true,
+      jobId: jobId,
+      rounds: rounds,
+      limit: limit,
+      message: `已开始：${rounds} 轮 × ${limit} 题（任务 #${jobId}，可在「任务」页查看进度）`,
+    });
   }
 
   if (p === '/api/exercise/stream' && method === 'GET') {
@@ -774,8 +791,11 @@ async function handleApi(req, res, u, user) {
       'X-Accel-Buffering': 'no',
     });
     res.write(':ok\n\n');
+    // 只放行**当前用户**的练习事件（任务属于谁由 job.user_id 决定），
+    // 避免多用户环境下互相看到对方的日志。
     const unsub = jobs.subscribe(0, (ev) => {
       if (!ev || !ev.exercise) return;
+      if (ev.userId != null && Number(ev.userId) !== Number(user.id)) return;
       try { res.write('data: ' + JSON.stringify(ev) + '\n\n'); } catch (e) { /* 客户端已断 */ }
     });
     const hb = setInterval(() => { try { res.write(':ping\n\n'); } catch (e) { /* ignore */ } }, 15000);
@@ -898,13 +918,16 @@ function publicSubAccount(s) {
 }
 
 function publicJob(j) {
+  const cfg = safeParse(j.config_json);
   return {
     id: j.id,
     userId: j.user_id,
     username: j.username,
     leoAccountId: j.leo_account_id,
     status: j.status,
-    config: safeParse(j.config_json),
+    // 'exercise' = 刷练习（2026-10-01 起练习也是正经后台任务）；默认 'pk' = 刷局
+    kind: (cfg && cfg.kind) || 'pk',
+    config: cfg,
     roundsTotal: j.rounds_total,
     roundsDone: j.rounds_done,
     roundsFailed: j.rounds_failed,
@@ -979,6 +1002,10 @@ const server = http.createServer(async (req, res) => {
 function main() {
   db.init();
   db.purgeExpiredSessions();
+  // 「服务重启 = 任务中断」：清掉上次残留的 running/queued 僵尸任务，
+  // 否则「任务」页会永远显示「运行中」且停不掉。
+  const interrupted = db.markInterruptedJobs();
+  if (interrupted > 0) console.log('[pk-node] 已把 ' + interrupted + ' 个中断任务标记为失败（服务重启）');
 
   const nt = nativeLib.selfTest();
   const sg = signLib.verifyWithFixture();

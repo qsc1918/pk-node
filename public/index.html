@@ -74,7 +74,7 @@
         <div id="point-list" class="chips"></div>
 
         <div class="row">
-          <label class="grow">刷多少局<input id="grind-rounds" type="number" value="10" min="1" max="999"></label>
+          <label class="grow">刷多少局<input id="grind-rounds" type="number" value="10" min="1" max="100000"></label>
         </div>
         <details class="adv">
           <summary>高级参数（costTime / 画笔算法 / 频控 / 间隔）</summary>
@@ -93,16 +93,24 @@
           </div>
 
           <div class="row">
-            <label class="grow">每轮最小间隔 ms<input id="grind-gapmin" type="number" value="4000"></label>
-            <label class="grow">最大间隔 ms<input id="grind-gapmax" type="number" value="8000"></label>
+            <label class="grow">每轮最小间隔 ms<input id="grind-gapmin" type="number" value="60000"></label>
+            <label class="grow">最大间隔 ms<input id="grind-gapmax" type="number" value="65000"></label>
+            <button id="grind-gap-recommend" class="ghost" title="按服务端出题冷却（实测 ≈60s/账号）填 60000~65000">填入推荐值</button>
           </div>
 
           <div class="row">
-            <label class="grow">出题频控重试间隔 ms<input id="grind-mretry" type="number" value="8000"></label>
+            <label class="grow">出题频控重试间隔 ms<input id="grind-mretry" type="number" value="3000"></label>
             <label class="grow">出题最长等待 ms<input id="grind-mmax" type="number" value="240000"></label>
           </div>
-          <p class="muted small">出题撞频控（HTTP 400「请求过于频繁」）时会按上面的间隔自动重试。
-            所以轮间隔只需设个「下限」——引擎会自动等到「上次成功出题 + 冷却(≈61.6s/账号)」再发车，不必去猜窗口大小。</p>
+          <p class="muted small">
+            出题撞频控（HTTP 400「请求过于频繁」）时会按上面的间隔自动重试，累计超过「最长等待」才判该轮失败。<br>
+            <b>服务端有约 60 秒的账号级出题冷却</b>（实测仍在），所以<b>建议把「每轮间隔」设成 60000 左右</b>
+            —— 这正是上面那个「填入推荐值」按钮做的事。<br>
+            引擎<b>不会强制</b>替你再加 60 秒：你设多少就按多少跑。设得比冷却小也不会卡死，
+            只是等待会挪到「出题频控重试」里（日志里会出现一串「出题被频控…自动重试」），
+            实际耗时反而更长。<br>
+            <span class="muted">注：<b>刷练习没有这个冷却</b>（那边约 1 秒），两边的「每轮间隔」不要互相套用。</span>
+          </p>
 
           <div class="row">
             <label class="grow">答题间隔最小 ms<em class="hint">出题后等多久再提交</em>
@@ -115,7 +123,8 @@
             <label class="grow">频控退避基数 ms<input id="grind-rlbase" type="number" value="60000"></label>
             <label class="grow">最大退避次数<input id="grind-rlmax" type="number" value="2" min="0"></label>
           </div>
-          <p class="muted small">任务之间可并行（默认最多 3 个）；每个任务内部仍是逐轮串行。</p>
+          <p class="muted small">任务之间<b>没有并行数量限制</b>（可同时挂任意多个任务，都会出现在「任务」页）；
+            每个任务内部仍是逐轮串行。</p>
         </details>
 
         <div class="row">
@@ -162,8 +171,17 @@
         <label class="muted small" style="display:flex;align-items:center;gap:4px">
           <input type="checkbox" id="pkbot-next"> 自动下一局
         </label>
-        <span class="muted small">（勾选后点「打开 PK 页面」生效；页面内已不再显示悬浮窗）</span>
+        <span class="muted small">（勾选后点「打开 PK 页面」生效；页面内不再显示悬浮窗）</span>
       </div>
+      <p class="muted small">
+        <b>三个开关分别做什么：</b><br>
+        · <b>视为正确答案</b> —— 手写识别那一步直接回「本题的标准答案」，所以一定会判对。
+        <b>浏览器里没有手写 OCR</b>（那是 App 离线模型的能力），因此<b>不勾这个开关时，
+        手写任何符号都会判错</b>，别把它当 bug。<br>
+        · <b>自动提交画笔</b> —— 自动在画板上写一笔并抬手（等于替你交卷），配合上面的开关即「全自动答题」。<br>
+        · <b>自动下一局</b> —— 结算页自动点「继续PK / 再练一次」，一局接一局地刷。<br>
+        三个开关会随页面跳转一路带下去（pk → 对局 → 结算），不用每页重设。
+      </p>
       <p class="muted small" id="pkpage-hint"></p>
     </div>
     <div class="card" style="padding:0;overflow:hidden">
@@ -217,13 +235,14 @@
         完整闭环：<code>POST /leo-math/android/exams</code> 出题（每题自带 <code>answer</code>）→
         <code>PUT /leo-math/android/exams/{examId}</code> <b>JSON 明文</b>提交（含笔迹 <code>script</code>，服务端凭笔迹判卷）。
         经验 = <b>答对题数 × 2</b>（10 题 20 / 100 题 200）。<br>
-        出题冷却实测 <b>约 1 秒/账号</b>（2026-10-01 复测：连续出题 4 次全 200，旧的「62 秒硬限流」已作废）；
+        <b>练习链路的出题冷却实测约 1 秒/账号</b>（2026-10-01 复测：连续出题 4 次全 200）——
+        <b>注意「刷局（PK）」完全是另一回事：那边有 ≈60 秒的冷却</b>，别把这里的数字套过去；
         引擎<b>贴着冷却自动配速</b>，撞频控（429）会自动重试。建议 <code>limit=100</code>（一轮 200 经验，约 1.5 秒）。
       </p>
       <div class="row">
         <label class="grow">知识点 ID<input id="prac-kp" type="number" value="16"></label>
         <label class="grow">每轮题数 limit<input id="prac-limit" type="number" value="100" min="1" max="200"></label>
-        <label class="grow">轮数<input id="prac-rounds" type="number" value="1" min="1" max="99"></label>
+        <label class="grow">轮数<input id="prac-rounds" type="number" value="1" min="1" max="100000"></label>
       </div>
       <div class="row">
         <label class="grow">每轮最小间隔 ms<input id="prac-gapmin" type="number" value="0" min="0" step="1000"></label>
@@ -236,8 +255,14 @@
       </p>
       <div class="row">
         <button id="prac-run" class="primary grow">开始刷练习</button>
+        <button id="prac-stop" class="danger" disabled title="立即中断当前练习任务">停止</button>
         <button id="prac-exam">只看题（不提交）</button>
       </div>
+      <p id="prac-runhint" class="muted small">
+        刷练习现在是<b>正经的后台任务</b>：切到别的页面、甚至关掉浏览器，服务端都会继续跑完；
+        进度 / 逐轮明细也会出现在「任务」页（可随时回来接着看日志，或点「停止」中断）。
+        轮数<b>没有上限</b>（此前填 &gt;99 会被悄悄改成 99）。
+      </p>
       <pre id="prac-runlog" class="log tall" style="max-height:360px"></pre>
     </div>
   </main>

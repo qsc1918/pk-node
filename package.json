@@ -9,7 +9,7 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "start": "node server.js",
+    "start": "node bin/start.js",
     "start:lan": "PK_HOST=0.0.0.0 node server.js",
     "reset-admin": "node bin/reset-admin.js",
     "get-cloudflared": "sh bin/get-cloudflared.sh",

@@ -53,6 +53,12 @@ jobs:
           PK_SKIP_NATIVE: '1'
         run: node bin/selftest.js
 
+      - name: 注入脚本校验（H5 hook 语法 + 桥协议）
+        run: node tools/check-inject.js
+
+      - name: PK H5 自动能力回归测试（视为正确答案 / 自动交笔 / 自动下一局）
+        run: node tools/test-pk-h5-bot.js
+
       - name: 启动冒烟测试（起服务 → 探活 → 关掉）
         env:
           PK_SKIP_NATIVE: '1'

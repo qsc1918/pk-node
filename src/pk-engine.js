@@ -145,22 +145,25 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
     if (signal && signal.aborted) throw abortedError();
   };
 
-  // 1) 轮间隔（**下限**，不是「睡够就一定能出题」）
+  // 1) 轮间隔（**唯一的节奏旋钮**）
   //
   // ⚠️ 这段等待期间日志必须**有东西可看**，否则前端会以为卡死：
   // 长间隔里没有事件的话，用户看到的就是一片空白。所以每 5 秒发一个 tick。
   //
-  // ## 速度策略：贴着出题冷却的下沿跑
+  // ## 节奏由用户填，不由引擎强制（2026-10-01）
   //
-  // 出题接口的冷却实测 ≈ [PK.matchCooldownMs]（账号级，与请求形态无关，
-  // 见 config.js 的实测表）。「最快」不是把 gap 调大或调小，而是：
+  // 服务端**确实**有 ≈60s 的账号级出题冷却（见 config.js 的实测表），
+  // 但按要求引擎**不强制**替你等 —— 网页上「每轮最小/最大间隔」填多少就按多少跑
+  // （网页默认填 60000/65000，并写明「建议设 60 秒」）。
+  //
+  // 只有 [PK.matchCooldownMs] > 0 时才启用下面这段「贴冷却下沿」的自动配速：
   //
   //   等 = max(配置的轮间隔, 上次成功出题 + 冷却 - 现在)
   //
   // ctx 里带着**同账号**上一次成功出题的时刻（跨轮/跨任务共享），
-  // 所以连续刷局时不会每次都白撞窗口、也不会多等 —— 恰好贴着下沿发车。
-  const gapMin = num(cfg.gapMinMs, 4000);
-  const gapMax = num(cfg.gapMaxMs, 8000);
+  // 所以连续刷局时不会每次都白撞窗口、也不会多等。默认关闭（= 0）。
+  const gapMin = num(cfg.gapMinMs, 60000);
+  const gapMax = num(cfg.gapMaxMs, 65000);
   const gap = gapMin + Math.floor(Math.random() * Math.max(1, gapMax - gapMin));
 
   let cooldownWait = 0;
