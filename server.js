@@ -133,6 +133,75 @@ function sendText(res, status, text, contentType, extraHeaders) {
   res.end(body);
 }
 
+/**
+ * 开始一个 SSE（Server-Sent Events）响应，返回 `write(payload)`。
+ *
+ * ## ★★ 2026-10-02：「隧道地址下看不到日志」的修复
+ *
+ * 通过 Cloudflare 快速隧道（`*.trycloudflare.com`）访问时，日志区一条都刷不出来。
+ * 根因是 SSE 这条**长连接**被中间层破坏，有三处必须一起改：
+ *
+ *  1. **`Cache-Control: no-store` → `no-cache, no-transform`**
+ *     `no-store` 在 Cloudflare 边缘不被认作「禁压缩」标记，Edge 仍可能对
+ *     响应做压缩/改写；而 `no-transform` 是明确的「不许动 body」。
+ *     同一个文件里另一个 SSE 端点（`/api/exercise/stream`）原本就是对的，
+ *     只有任务日志流漏了 —— 这就是「练习日志能看、PK 日志看不到」的原因。
+ *  2. **`Content-Encoding: identity`**：显式声明不压缩。Cloudflare 会对
+ *     `text/event-stream` 尝试 gzip，缓冲一下再吐 ⇒ 前端 EventSource 等到
+ *     连接关闭才拿到内容（表现为「一直空白」）。
+ *  3. **`Connection: keep-alive` 用 `setHeader` 显式写**：WriteHead 的
+ *     `Connection` 在 HTTP/1.1 下容易被改为 `close`，长连接一断，
+ *     EventSource 反复重连、每次只拿到快照，看起来就是「没有实时日志」。
+ *
+ * 另外统一**首包立即 flush**：`res.flushHeaders()` + 立刻写一条注释行
+ * （`: ok`），让 Cloudflare / 浏览器都确定「这是一条已经开始的流」，
+ * 不会因为「首字节迟迟不来」而超时重试。
+ *
+ * @param {import('http').ServerResponse} res
+ * @param {{retryMs?: number, headers?: Record<string,string>}} [opts]
+ *        `retryMs` 会以 SSE 的 `retry:` **字段**（不是 data）原样发出，
+ *        告知浏览器断线后多久重连；`headers` 为额外响应头。
+ * @returns {(payload: string) => void} 写一行 SSE 数据（自动补 `data: ` 与空行）
+ */
+function sseStart(res, opts) {
+  const o = opts || {};
+  const headers = Object.assign({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    // no-transform：明示中间层不许压缩/改写（Cloudflare 认这个）
+    'Cache-Control': 'no-cache, no-transform',
+    // identity：不压缩。SSE 被 gzip 会整段缓冲，前端要等连接关才看到内容
+    'Content-Encoding': 'identity',
+    Connection: 'keep-alive',
+    // nginx / Cloudflare 的缓冲开关（两家都认这个头）
+    'X-Accel-Buffering': 'no',
+  }, o.headers || {});
+
+  // ⚠️ 必须**先** setHeader、**后** writeHead：
+  //   `res.writeHead()` 一旦调用，头部就已发出，此时再 `setHeader()` 会抛
+  //   `ERR_HTTP_HEADERS_SENT` → 整个请求处理中断、连接被掐断
+  //   （表现就是「日志区什么都没有」，连快照都收不到）。
+  for (const k of Object.keys(headers)) res.setHeader(k, headers[k]);
+  res.writeHead(200);
+
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+  // 首包立即发：让中间层确认「流已开始」，避免首字节超时。
+  // ⚠️ `retry:` 是 SSE 的**字段**，必须原样写，不能包进 `data:`。
+  try {
+    if (o.retryMs) res.write('retry: ' + Number(o.retryMs) + '\n\n');
+    res.write(': ok\n\n');
+  } catch (e) { /* 已断开 */ }
+
+  return function write(payload) {
+    // 允许直接传对象（内部序列化）——任务流就是传对象；也允许传已序列化的字符串。
+    const text = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    try {
+      res.write('data: ' + text + '\n\n');
+    } catch (e) {
+      /* 客户端已断开：由调用方的 req.on('close') 收尾 */
+    }
+  };
+}
+
 function clientIp(req) {
   return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
 }
@@ -711,19 +780,9 @@ async function handleApi(req, res, u, user) {
     // 管理员可以旁观任何人的任务日志（管理页「明细」要用）
     if (!job || !jobBelongsTo(job, user)) return sendJson(res, 404, { ok: false, message: '任务不存在' });
 
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-store',
-      Connection: 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    });
-    res.write('retry: 3000\n\n');
-
-    // 1) 先发「快照」：当前任务状态 + 已落库的轮次。
-    //    没有这一步的话，用户中途刷新页面就只能看到新事件，看不到已经跑完的部分。
-    const write = (obj) => {
-      try { res.write('data: ' + JSON.stringify(obj) + '\n\n'); } catch (e) { /* 已断开 */ }
-    };
+    // ★ 统一走 sseStart()：隧道（Cloudflare）下 no-store 会被边缘压缩/缓冲，
+    //   导致「一条日志都刷不出来」。详见 sseStart 的注释。
+    const write = sseStart(res, { retryMs: 3000 });
     write({
       type: 'snapshot',
       at: Date.now(),
@@ -832,19 +891,14 @@ async function handleApi(req, res, u, user) {
   }
 
   if (p === '/api/exercise/stream' && method === 'GET') {
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-cache, no-transform',
-      Connection: 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    });
-    res.write(':ok\n\n');
+    // ★ 与任务日志流共用 sseStart()：同样的隧道（Cloudflare）抗性。
+    const writeEx = sseStart(res, { retryMs: 3000 });
     // 只放行**当前用户**的练习事件（任务属于谁由 job.user_id 决定），
     // 避免多用户环境下互相看到对方的日志。
     const unsub = jobs.subscribe(0, (ev) => {
       if (!ev || !ev.exercise) return;
       if (ev.userId != null && Number(ev.userId) !== Number(user.id)) return;
-      try { res.write('data: ' + JSON.stringify(ev) + '\n\n'); } catch (e) { /* 客户端已断 */ }
+      writeEx(JSON.stringify(ev));
     });
     const hb = setInterval(() => { try { res.write(':ping\n\n'); } catch (e) { /* ignore */ } }, 15000);
     req.on('close', () => { clearInterval(hb); unsub(); });

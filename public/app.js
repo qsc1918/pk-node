@@ -135,6 +135,14 @@ const state = {
   practiceStream: null,
   /** 当前正在看的「刷练习」任务 id（后台任务）。 */
   practiceJobId: null,
+  /** 事件流心跳看门狗（隧道下判定「流是否还活着」）。 */
+  watchdogTimer: null,
+  /** 最近一次收到事件流数据的时间（看门狗用）。 */
+  lastEventAt: 0,
+  /** 最近一次往日志区写「流/轮询异常提示」的时间（做限频，避免刷屏）。 */
+  lastLoggedAt: 0,
+  /** 轮询兜底最近一次是否成功（用于区分「没日志」是没任务还是流断了）。 */
+  pollOk: null,
 };
 
 /* ------------------------------ 登录 ------------------------------ */
@@ -612,15 +620,19 @@ function attachJobStream(jobId) {
   const log = $('log');
   const seenRounds = new Set();   // 已渲染过的轮次号，防止 SSE 与轮询重复
   state.seenRounds = seenRounds;
+  state.lastEventAt = Date.now();
+  state.lastLoggedAt = 0;
 
   const es = new EventSource('/api/jobs/' + jobId + '/stream');
   state.jobStream = es;
 
   es.onopen = () => {
     logLine(log, '[连接已建立，等待事件…]', 'l-dim');
+    state.lastEventAt = Date.now();
   };
 
   es.onmessage = (ev) => {
+    state.lastEventAt = Date.now();
     let d;
     try { d = JSON.parse(ev.data); } catch (e) { return; }
     handleJobEvent(d, log, seenRounds, es);
@@ -631,19 +643,67 @@ function attachJobStream(jobId) {
     if (!state.streamErrorNotified) {
       state.streamErrorNotified = true;
       logLine(log, '[日志流中断，正在自动重连；同时已启用 3 秒轮询兜底]', 'l-warn');
+      // ★★ 2026-10-02：「隧道地址下看不到日志」的可诊断降级。
+      //   以前这里只提示一句「正在重连」，用户完全不知道**为什么**没日志
+      //  （隧道下最常见的是会话 cookie 被中间层丢掉 → 流 401）。
+      //   现在主动探测一次这个 SSE 地址的真实 HTTP 状态并写进日志区，
+      //   用户截一行就能定位问题。
+      probeStreamStatus(jobId, log);
     }
     startPollFallback(jobId);
   };
 
+  // ★ 心跳看门狗：15 秒没收到任何事件就提示一次（服务端每 15s 发 `:ping`）。
+  //   没有这个时，隧道被缓冲/半死连接的表现就是「一直空白、也不报错」。
+  if (state.watchdogTimer) clearInterval(state.watchdogTimer);
+  state.watchdogTimer = setInterval(() => {
+    if (!state.currentJobId) return;
+    const idle = Date.now() - (state.lastEventAt || 0);
+    if (idle > 20000) {
+      logLine(log, `[已 ${Math.round(idle / 1000)} 秒未收到事件流数据，轮询仍在补齐；` +
+        `若长期无日志请检查隧道地址是否仍有效]`, 'l-warn');
+      state.lastEventAt = Date.now();   // 每 20s 最多提示一次
+    }
+  }, 10000);
+
   // 双保险：3 秒轮询一次任务详情，补齐任何漏掉的轮次
   startPollFallback(jobId);
+}
+
+/**
+ * 探测 SSE 地址的真实 HTTP 状态（用于隧道下定位「为什么没有日志」）。
+ *
+ * EventSource 的 onerror **拿不到状态码**，所以用 fetch 再打一次同地址：
+ *  - 401/403 → 会话失效（隧道下 cookie 被丢/被改最常见）
+ *  - 200     → 流本身是通的，问题在别处（缓冲/代理）
+ *  - 其它    → 原样报出来
+ * 只读一小段（4KB）就中断，避免把整条流读进来。
+ */
+async function probeStreamStatus(jobId, log) {
+  try {
+    const res = await fetch('/api/jobs/' + jobId + '/stream', { credentials: 'same-origin' });
+    if (res.status === 401 || res.status === 403) {
+      logLine(log, `[日志流被拒绝：HTTP ${res.status}（登录会话失效）。请重新登录后再看日志]`, 'l-fail');
+      return;
+    }
+    if (!res.ok) {
+      logLine(log, `[日志流不可用：HTTP ${res.status}]`, 'l-fail');
+      return;
+    }
+    const ce = res.headers.get('content-encoding') || '(未声明)';
+    logLine(log, `[日志流可达：HTTP 200，content-encoding=${ce}；若仍不刷新多为代理缓冲]`, 'l-dim');
+  } catch (e) {
+    logLine(log, '[日志流不可达：' + (e.message || e) + ']', 'l-fail');
+  }
 }
 
 /** 停止当前任务的事件流与轮询。 */
 function stopJobStream() {
   if (state.jobStream) { state.jobStream.close(); state.jobStream = null; }
   if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+  if (state.watchdogTimer) { clearInterval(state.watchdogTimer); state.watchdogTimer = null; }
   state.streamErrorNotified = false;
+  state.lastLoggedAt = 0;
 }
 
 /** 轮询兜底：每 3 秒拉一次任务详情，把没渲染过的轮次补上。 */
@@ -653,6 +713,7 @@ function startPollFallback(jobId) {
     if (!state.currentJobId) return;
     try {
       const r = await api('/api/jobs/' + state.currentJobId);
+      state.pollOk = true;
       const log = $('log');
       for (const rd of r.rounds || []) {
         if (state.seenRounds.has(rd.round_no)) continue;
@@ -666,7 +727,24 @@ function startPollFallback(jobId) {
         finishJobUi(r.job ? r.job.status : '');
         stopJobStream();
       }
-    } catch (e) { /* 轮询失败不打扰用户，等下一次 */ }
+    } catch (e) {
+      // ★★ 2026-10-02：以前这里**完全静默**（`/* 轮询失败不打扰用户 */`）——
+      //   于是隧道断掉 / 会话失效时，日志区一条都没有、用户也看不到任何原因。
+      //   现在按错误类型区分：401/403 明确提示重新登录；其它错误每 30 秒提示一次。
+      state.pollOk = false;
+      if (e && (e.status === 401 || e.status === 403)) {
+        if (state.lastLoggedAt !== -1) {
+          state.lastLoggedAt = -1;
+          logLine($('log'), '[轮询失败：登录会话已失效（HTTP ' + e.status + '），请重新登录]', 'l-fail');
+        }
+        return;
+      }
+      const now = Date.now();
+      if (now - (state.lastLoggedAt || 0) > 30000) {
+        state.lastLoggedAt = now;
+        logLine($('log'), '[轮询失败（每 30 秒提示一次）：' + (e.message || e) + ']', 'l-warn');
+      }
+    }
   }, 3000);
 }
 
