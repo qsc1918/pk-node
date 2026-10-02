@@ -1,6 +1,6 @@
 {
   "name": "pk-node",
-  "version": "1.6.1",
+  "version": "1.7.0",
   "private": true,
   "description": "小猿口算 PK 局数刷分 · 本地 Node 服务（网页版，含可选 Cloudflare 临时穿透、SQLite、管理后台）",
   "type": "commonjs",
