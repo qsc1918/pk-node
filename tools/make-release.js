@@ -46,10 +46,10 @@ const INCLUDE = [
   'bin/pick-port.js',
   'bin/reset-admin.js',
   'bin/selftest.js',
-  // `bin/start.js` 是启动入口（package.json "start"、start.bat、start.sh 都指向它），必须打包。
   'bin/start.js',
   'bin/keystream.bin',        // 纯 JS 内容编码器的密钥流，必需
   'bin/native/lre.so',        // sign 纯 JS 模拟所需的「机器码数据」（约 0.9MB，不执行）
+  'bin/native/lre_pk.so',     //新版本PK算sgin
   'bin/get-cloudflared.sh',
   'public',
   'docs',
