@@ -1,0 +1,64 @@
+name: Cloudflare Worker Health
+
+# 诊断用：从 GitHub 的海外节点探测 Worker 各个端点。
+#
+# 为什么需要它：本机（国内网络）访问 *.workers.dev 会 ERR_CONNECTION_CLOSED，
+# 而 GitHub Actions 在海外能正常访问 —— 用它区分两种情况：
+#   ① Worker 代码/部署有问题（海外也失败）→ 修代码
+#   ② Worker 正常，只是国内网络到 workers.dev 不通（海外正常）→ 换访问入口
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    steps:
+      - name: DNS / TLS / 各端点探测
+        run: |
+          set -uo pipefail
+          URL="https://pk-node.sxdd.workers.dev"
+          echo "=== DNS 解析 ==="
+          getent hosts pk-node.sxdd.workers.dev || echo "(getent 无结果)"
+          echo
+          echo "=== 解析到的 IP ==="
+          python3 -c "import socket;print(socket.gethostbyname_ex('pk-node.sxdd.workers.dev'))" || true
+          echo
+          echo "=== 根路径 / ==="
+          code=$(curl -sS -m 30 -o /tmp/root.html -w '%{http_code}' "$URL/" || echo 000)
+          echo "HTTP $code"
+          echo "--- 前 400 字节 ---"
+          head -c 400 /tmp/root.html || true
+          echo
+          echo
+          echo "=== /api/status ==="
+          code2=$(curl -sS -m 30 -o /tmp/st.json -w '%{http_code}' "$URL/api/status" || echo 000)
+          echo "HTTP $code2"
+          head -c 500 /tmp/st.json || true
+          echo
+          echo
+          echo "=== /api/selftest（会算一次 sign，验证 CPU 预算）==="
+          code3=$(curl -sS -m 90 -o /tmp/st2.json -w '%{http_code}' "$URL/api/selftest" || echo 000)
+          echo "HTTP $code3"
+          head -c 800 /tmp/st2.json || true
+          echo
+          echo
+          echo "=== /api/tick 无 token（应 403）==="
+          curl -sS -m 30 -o /dev/null -w 'HTTP %{http_code}\n' "$URL/api/tick" || true
+          echo
+          echo "=== 汇总 ==="
+          echo "root=$code status=$code2 selftest=$code3"
+
+      - name: 写入汇总
+        if: always()
+        run: |
+          {
+            echo "### Worker Health"
+            echo ''
+            echo '```'
+            echo "root="$(curl -sS -m 30 -o /dev/null -w '%{http_code}' https://pk-node.sxdd.workers.dev/ || echo 000)
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
