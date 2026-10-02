@@ -215,6 +215,40 @@ export default {
       return json({ ok: true, accounts: list, state: state });
     }
 
+    // ★ 外部定时触发入口（给 GitHub Actions / cron-job.org 这类外部调度器用）。
+    //
+    // 为什么需要它：实测该账号的 Cloudflare 原生 cron **不执行**（详见 README/提交说明），
+    // 所以用外部调度器定时打这个端点来驱动「跑一轮」。
+    // 鉴权：`X-Token` 必须等于 secret TRIGGER_TOKEN（未配置时该端点禁用）。
+    if (p === '/api/tick') {
+      const need = env.TRIGGER_TOKEN;
+      if (!need) return json({ ok: false, message: '未配置 TRIGGER_TOKEN，/api/tick 已禁用' }, 403);
+      const got = request.headers.get('X-Token') || url.searchParams.get('token') || '';
+      if (got !== need) return json({ ok: false, message: 'token 不对' }, 403);
+
+      const state = await getJson(env, 'state', { autoRun: false, rounds: 0 });
+      const stamp = new Date().toISOString();
+      // 记录触发时间，便于外部健康检查
+      await env.KV.put('lastTick', stamp);
+      if (!state.autoRun) {
+        return json({ ok: true, skipped: 'autoRun 关闭', at: stamp });
+      }
+      const accts = await getJson(env, 'accts', []);
+      if (!accts.length) return json({ ok: true, skipped: '没有账号', at: stamp });
+
+      const a = await getJson(env, 'acct:' + accts[0], null);
+      const r = await runOneRound(env, a, {});
+      state.rounds = (state.rounds || 0) + (r.ok ? 1 : 0);
+      state.lastRunAt = stamp;
+      await env.KV.put('state', JSON.stringify(state));
+      await pushLog(env, '[tick] ' + (r.ok ? '✅ 成功' : '❌ 失败') + ' ' + JSON.stringify(r.stages)
+        + (r.error ? ' ' + r.error : ''));
+      await env.KV.put('lastTickNote', stamp + ' ' + (r.ok ? 'ok' : 'fail: ' + (r.error || '')));
+
+      // 返回完整结果：外部调度器的日志里就能直接看到成败与耗时
+      return json({ ok: r.ok, at: stamp, result: r });
+    }
+
     if (p === '/api/log') {
       return json({ ok: true, log: await getJson(env, 'log', []) });
     }

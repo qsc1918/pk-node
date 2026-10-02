@@ -1,0 +1,66 @@
+name: Cloudflare Worker Tick
+
+# 为什么用 GitHub Actions 而不是 Cloudflare 原生 cron：
+#
+#   实测（2026-10-02）该账号的 Cloudflare 原生 cron **不执行** ——
+#   新建的探测 Worker（配置与曾经成功触发过的完全相同）也不再触发，
+#   schedule 在 API 上存在但 scheduled() 从不运行。
+#   而 GitHub Actions 对 public 仓库的定时任务**完全免费**，且能顺便当验证通道：
+#   本机沙箱访问不到 *.workers.dev，但 Actions 能，其运行日志可通过 API 读回。
+#
+# ⚠️ GitHub 的 schedule 在高峰期会延迟（常见 5~20 分钟），不保证准点。
+#   对「刷 PK 局数」这种低频任务够用；要更准可换 cron-job.org 等外部调度。
+
+on:
+  schedule:
+    # 每 10 分钟一次（GitHub 最短间隔是 5 分钟，取 10 以降低无谓调用）
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      note:
+        description: '备注（可空）'
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cf-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 调用 Worker /api/tick
+        env:
+          TRIGGER_TOKEN: ${{ secrets.TRIGGER_TOKEN }}
+          WORKER_URL: ${{ vars.WORKER_URL || 'https://pk-node.sxdd.workers.dev' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TRIGGER_TOKEN:-}" ]; then
+            echo "::error::缺少 secret TRIGGER_TOKEN（仓库 Settings → Secrets and variables → Actions）"
+            exit 1
+          fi
+          echo "Worker: $WORKER_URL"
+          echo "--- 调用 /api/tick ---"
+          code=$(curl -sS -m 120 -o /tmp/tick.json -w '%{http_code}' \
+            -H "X-Token: $TRIGGER_TOKEN" \
+            "$WORKER_URL/api/tick" || echo 000)
+          echo "HTTP $code"
+          echo "--- 响应 ---"
+          cat /tmp/tick.json || true
+          echo
+          if [ "$code" != "200" ]; then
+            echo "::error::/api/tick 返回 HTTP $code"
+            exit 1
+          fi
+
+      - name: 汇总结果
+        if: always()
+        run: |
+          echo "### Worker Tick 结果" >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/tick.json >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo '(无响应)' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
