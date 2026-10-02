@@ -90,6 +90,20 @@ async function request(url, opts) {
   return { status: r.status, buf: buf, headers: r.headers };
 }
 
+/** 试着把字节当普通 JSON 解（含 gzip 自动解压由 fetch 完成；这里兼容明文）。 */
+function tryPlainJson(buf) {
+  try {
+    const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    // 明文 JSON（可能被 gzip 过，fetch 已解）
+    if (bytes[0] === 0x7b || bytes[0] === 0x5b) {
+      return JSON.parse(new TextDecoder().decode(bytes));
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
 /** PK 出题（v2，加密响应）。 */
 export async function pkMatchV2(jar, pointId, shepherdDid) {
   const url = buildUrl(PATH.matchV2, { pointId: String(pointId), triggerPeakMatch: '0' });

@@ -62,12 +62,23 @@ export async function encodeBody(obj) {
 export async function decodeBody(buf) {
   try {
     const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-    // 有的接口（如普通 JSON）并未加密：先看是不是 gzip 明文
+    if (!bytes.length) return null;
+
+    // ★ 0) 明文 JSON 直接返回。
+    //   ⚠️ 踩坑：`history/detail` 这类接口返回的是**普通 JSON**，不走 XOR 加密；
+    //   如果先 XOR 再判断，明文会被异或成乱码 → 解析失败（线上曾出现 settled=null）。
+    //   判据：首字节是 `{` 或 `[`（JSON 开头）或 `<`（HTML，直接算失败）。
+    if (bytes[0] === 0x7b || bytes[0] === 0x5b) {
+      return JSON.parse(new TextDecoder().decode(bytes));
+    }
+
+    // 1) 已经是 gzip 明文（未加密）
     if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
       return JSON.parse(new TextDecoder().decode(await gunzip(bytes)));
     }
+
+    // 2) 加密响应：XOR 密钥流 → gunzip → JSON
     const gz = xorWithKeystream(bytes);
-    // XOR 之后仍可能是明文 JSON（少数接口）
     if (!(gz[0] === 0x1f && gz[1] === 0x8b)) {
       const asText = new TextDecoder().decode(gz);
       if (asText.trim().startsWith('{') || asText.trim().startsWith('[')) return JSON.parse(asText);
