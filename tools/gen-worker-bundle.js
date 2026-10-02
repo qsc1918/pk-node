@@ -159,6 +159,37 @@ w(
   ].join('\n'),
 );
 
+// ---------- 6) keystream.js（内容编码用的密钥流，128KB → base64） ----------
+{
+  const ks = fs.readFileSync(path.join(ROOT, 'bin', 'keystream.bin'));
+  w(
+    'ks.js',
+    '// 自动生成：bin/keystream.bin（' + ks.length + ' 字节）。\n'
+    + '// 内容编码 = gzip(json) 与它逐字节 XOR；服务端按位解码，不需要与真机逐字节相同。\n'
+    + 'export const KEYSTREAM = "' + ks.toString('base64') + '";\n',
+  );
+}
+
+// ---------- 7) strokes.js（笔迹生成；无外部依赖，直接转 ESM） ----------
+{
+  let s = fs.readFileSync(path.join(ROOT, 'src', 'strokes.js'), 'utf8');
+  s = s.replace(/module\.exports\s*=\s*\{/, 'export {');
+  // 原来结尾是 `};`，export 语句同样以 `};` 收尾，可直接用
+  w('strokes.js', s);
+}
+
+// ---------- 8) 复制运行时源码（deploy/wsrc/ → deploy/w/） ----------
+// 运行时（业务逻辑 / HTTP 入口）以源码形式放在 deploy/wsrc/，便于阅读与维护；
+// 生成器只负责「拷贝 + 保证同目录」，这样部署目录始终是自洽的。
+const WSRC = path.join(ROOT, 'deploy', 'wsrc');
+if (fs.existsSync(WSRC)) {
+  for (const f of fs.readdirSync(WSRC).sort()) {
+    if (!f.endsWith('.js')) continue;
+    const src = fs.readFileSync(path.join(WSRC, f), 'utf8');
+    w(f, src);
+  }
+}
+
 // ---------- 报告 ----------
 console.log('已生成 ' + path.relative(ROOT, OUT) + '/：');
 let total = 0;

@@ -1,0 +1,16 @@
+{
+  "name": "pk-node",
+  "main": "deploy/w/index.js",
+  "compatibility_date": "2026-10-02",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "kv_namespaces": [
+    { "binding": "KV", "id": "239b1e3f174a40bab35460cdae59db8c" }
+  ],
+
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+
+  "observability": { "enabled": true }
+}
