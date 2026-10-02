@@ -6,9 +6,8 @@
 #   PK_PORT=9000 ./start.sh     # 指定端口（被占也会自动往后找，并给出提示）
 #   PK_HOST=0.0.0.0 ./start.sh  # 局域网可访问
 #
-# ★ 2026-10-01：本脚本现在只做「找到 node 并交给 bin/start.js」。
-#   版本校验 / 端口挑选 / 横幅打印全在 bin/start.js —— Windows 的 start.bat
-#   走同一个入口，两个平台共用一份逻辑，不会再出现「一边能跑一边不能跑」。
+# 本脚本只做「找到 node 并交给 bin/start.js」；版本校验/端口挑选/横幅全在 bin/start.js，
+# Windows 的 start.bat 走同一入口，两平台共用一份逻辑。
 #
 # 零依赖：不需要 npm install（只用 Node 内置模块）。
 # 要求：Node >= 22（用到内置 node:sqlite）。

@@ -1,44 +1,39 @@
 'use strict';
 /**
- * 纯 JS 的 arm64 模拟器 —— 在任意平台（含 Windows/x86）上算出主域签名所需的 T。
+ * 纯 JS 的 arm64 模拟器 —— 在任意平台算出主域签名所需的 T。
  *
- * ## 背景：为什么需要它（417 的根因）
+ * 主域端点要求 URL 带 32 位 MD5 的 `sign`，否则一律 417 `x-block-by: solar-encoder`。
+ * T 由 `libRequestEncoder.so`（bin/native/lre.so）生成，只依赖 `time()/60`。
+ * 老实现需 arm64 原生跑，Windows/x86 跑不了 → 练习链路必然 417。
  *
- * 主域（`xyks.yuanfudao.com`）业务端点要求 URL 带 32 位 MD5 的 `sign`，否则一律
- * 417 `x-block-by: solar-encoder`。而 `sign` 的链条里有一段设备相关的 T：
+ * 两套签名资产（用错会 417）：
  *
- * ```
- * s = path + salt
- * d1 = md5(s); s += d1 + path
- * d2 = md5(s); s += d2 + T
- * d3 = md5(s); sign = md5(s + d3 + salt)
- * ```
+ * | variant | so | 指令表 | 用于 |
+ * |---|---|---|---|
+ * | `exercise` | `bin/native/lre.so` | `lre-insns.js` | 练习（version=3.140.1） |
+ * | `pk` | `bin/native/lre_pk.so` | `lre-insns-pk.js` | PK（version=3.143.1） |
  *
- * T 由 `libRequestEncoder.so`（就是 `bin/native/lre.so`）里的函数生成，**只依赖
- * `time()/60`**。老实现用 `bin/native/linker64 + dump7` 跑它 —— 那是 arm64，
- * Windows / x86 上跑不了，于是练习链路必然 417。
+ * 不改写混淆代码，而是直接执行：指令表由 tools/gen-lre-insns.py 用 capstone 离线反汇编后
+ * 固化在 lre-insns.js，这里只做「取指 → 执行」。对外暴露 calcT，返回 78 个 unsigned 的十进制拼接。
  *
- * ## 本模块的做法
+ * 正确性：src/sign.js 的 fixture（真机 T/sign）可作验收，模拟器输出逐字节一致（410/410）。
  *
- * 不改写那段混淆代码，而是**直接执行它**：指令表由 `tools/gen-lre-insns.py` 用
- * capstone 离线反汇编后固化在 `lre-insns.js`，这里只做「取指 → 执行」。
- * 对外暴露 [calcT]，拿到 78 个 `std::ostream::operator<<(unsigned int)` 参数
- * 的十进制拼接，即 T。
- *
- * ## 正确性
- *
- * `src/sign.js` 里的 fixture（真机抓包的 T / sign）可作为验收标准：模拟器在
- * `M = 29839199` 处的输出与该 fixture **逐字节一致**（410/410）。见 README。
- *
- * ## 为什么用 BigInt
- *
- * 64 位乘除法（`smulh` / `umulh`）与 128 位 NEON 无法用 Number 精确表示；
- * 一次 T 生成只跑几千条指令、且结果按分钟缓存，BigInt 的开销可以忽略。
+ * 为什么用 BigInt：64 位乘除法（smulh/umulh）与 128 位 NEON 无法用 Number 精确表示；
+ * 一次 T 生成只跑几千条指令且结果按分钟缓存，开销可忽略。
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
-const D = require('./lre-insns');
+
+/**
+ * 两套签名资产：`D`（指令表）与 `SO_PATH` 做成模块级可变变量，`calcT` 进入时按 variant 切换。
+ * 类内部有十几处 `D.segs` 引用，改 `this.D` 改动面大；而 `Emu.run()` 全程同步（无 await），
+ * 不存在两次 calcT 交错，切换安全。
+ */
+const EX_INSNS = require('./lre-insns');
+const PK_INSNS_PATH = './lre-insns-pk';
+let PK_INSNS = null;
+let D = EX_INSNS;
 
 const PAGE_SHIFT = 12;
 const PAGE_SIZE = 1 << PAGE_SHIFT;
@@ -48,7 +43,9 @@ const MASK32 = (1n << 32n) - 1n;
 const MASK64 = (1n << 64n) - 1n;
 const MASK128 = (1n << 128n) - 1n;
 
-const SO_PATH = path.join(__dirname, '..', 'bin', 'native', 'lre.so');
+const EX_SO_PATH = path.join(__dirname, '..', 'bin', 'native', 'lre.so');
+const PK_SO_PATH = path.join(__dirname, '..', 'bin', 'native', 'lre_pk.so');
+let SO_PATH = EX_SO_PATH;
 
 /** 「函数已返回」的哨兵 pc（不落在任何映射区间）。 */
 const RET_SENTINEL = 0x0F0000000;
@@ -1093,14 +1090,32 @@ class Emu {
   }
 }
 
+/** so 内容按路径缓存（两套各读一次即可，避免每轮都读 900KB）。 */
+const soCache = new Map();
+function soBufferFor(p) {
+  let b = soCache.get(p);
+  if (!b) { b = fs.readFileSync(p); soCache.set(p, b); }
+  return b;
+}
+
 /**
  * 算出给定时刻的 T 串（78 个 unsigned 的十进制拼接）。
  *
  * @param {number} epochSec Unix 秒（模拟 `time()`；同一分钟内结果相同）
- * @returns {string} T（长度 410）
+ * @param {'exercise'|'pk'} [variant] 用哪套签名资产，默认 `exercise`（见文件头表格）
+ * @returns {string} T
  */
-function calcT(epochSec) {
-  const emu = new Emu(Emu._soBuffer || (Emu._soBuffer = fs.readFileSync(SO_PATH)));
+function calcT(epochSec, variant) {
+  // 切换模块级的指令表与 so 路径（同步执行，安全 —— 见上方 require 处注释）
+  if (variant === 'pk') {
+    if (!PK_INSNS) PK_INSNS = require(PK_INSNS_PATH);
+    D = PK_INSNS;
+    SO_PATH = PK_SO_PATH;
+  } else {
+    D = EX_INSNS;
+    SO_PATH = EX_SO_PATH;
+  }
+  const emu = new Emu(soBufferFor(SO_PATH));
   emu.timeValue = BigInt(Math.floor(epochSec));
   emu.x[8] = BigInt(D.sretBuf);   // sret 缓冲（std::string 返回值）
   emu.x[1] = 0n;                  // ts 参数

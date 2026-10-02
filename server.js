@@ -28,19 +28,8 @@ const PUBLIC_DIR = path.join(config.root, 'public');
 
 /**
  * 给 PK H5 代理注册「取用户信息」的实现。
- *
- * ## 为什么必须（2026-09-30：「PK 界面一直刷新」的真因）
- *
- * H5 的登录态 isLogin 完全来自桥的 getUserInfo：
- *   index-legacy.CHYoHfC0.js  r("i", ...)：
- *     $t("getUserInfo") → n = r[0] → at("webviewLogin", n)
- *   useHomeModel：isLogin = 上面那个函数的结果
- * 返回空对象时 isLogin=false，pk-legacy 就会：
- *     await dialog({loginTitle:"登录后开始PK"}); window.location.reload();
- *   → 页面无限刷新。
- *
- * 所以每个 H5 页面都要带上该账号的真实 userId/昵称/头像（window.__PK_USER）。
- * 优先用 /math/pk/home 响应里的 baseUserInfoVO（一次调用拿全）；
+ * H5 的 isLogin 完全来自桥的 getUserInfo，返回空对象时 pk-legacy 会弹「登录后开始PK」
+ * 并 location.reload() 死循环。优先用 /math/pk/home 的 baseUserInfoVO，
  * 拿不到再退到 ytk 的 /accounts/api/current。
  */
 pkH5.setUserInfoProvider(async (leoAccountId) => {
@@ -65,15 +54,8 @@ pkH5.setUserInfoProvider(async (leoAccountId) => {
         };
       }
     }
-    // ★★ 2026-09-30：兜底 —— 服务端 `baseUserInfoVO` 可能为 null。
-    //
-    //  实测（账号 7）：POST 请求 `math/pk/home` 返回 200，但 baseUserInfoVO=null
-    //  （该账号在 PK 侧没有用户资料，totalWinCount=0 / title=null）。
-    //  而 rewriteHtml 只在这个函数返回非空时才注入 window.__PK_USER，
-    //  于是 H5 的 getUserInfo 回 `{}` → isLogin=false → 界面显示「未登录」。
-    //
-    //  兜底：用 cookie 里的 `userid`（真实的 小猿 userId）构造最小可用信息，
-    //  保证 isLogin 成立；昵称/头像缺失时由 H5 用占位图，不影响功能。
+    // 兜底：baseUserInfoVO 可能为 null（账号在 PK 侧无资料）→ 不注入则 isLogin=false
+    // 显示「未登录」。故用 cookie 里的 userid 构造最小信息，保证 isLogin 成立。
     const uid = Number(readCookieFromAccount(acc, 'userid') || 0);
     if (uid) {
       console.log('[pk-h5] baseUserInfoVO 为空，用 cookie userid 兜底：' + uid);
@@ -224,13 +206,7 @@ function clientIp(req) {
   return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
 }
 
-/**
- * 轮数解析：**只挡非法值，不再悄悄截断用户填的大数字**。
- *
- * ★ 2026-10-01 用户反馈：「轮数即使填了大于 100 的数，也按 100 来算」。
- * 真因就是这里原来的 `Math.min(99, …)` / `Math.min(999, …)` —— 用户填 500
- * 会被无声改成 99。现在只保留一个足够大的安全上限（防误填天文数字把内存撑爆）。
- */
+/** 轮数解析：只挡非法值，不截断用户填的大数字（仅保留一个安全上限防内存爆）。 */
 const MAX_ROUNDS = 100000;
 function clampRounds(v, def) {
   const n = Math.floor(Number(v));
@@ -239,23 +215,19 @@ function clampRounds(v, def) {
 }
 
 /* ---------------------- 任务参数构造（单个 / 批量共用） ---------------------- */
-//
-// 2026-10-01：批量开任务要求「N 个账号用同一套参数」，所以把参数解析抽成纯函数，
-// 「单开」与「批量」走同一份代码 —— 避免两边漂移（一边改了另一边忘了）。
-// 出错时不抛异常，而是返回 `{ error: '…' }`，由调用方决定回什么状态码。
+// 「单开」与「批量」共用同一份解析，避免两边漂移；出错返回 { error } 由调用方定状态码。
 
 /** 刷局（PK）参数。 */
 function makePkConfig(b) {
   const cfg = {
     pointId: Number(b.pointId || 1951),
     costTimeMs: b.costTimeMs == null || b.costTimeMs === '' ? null : Number(b.costTimeMs),
-    // 轮间隔：**唯一的节奏旋钮**。服务端有 ≈60s 的账号级出题冷却（实测仍在），
-    // 但引擎按要求**不强制**替你等 —— 你填多少就按多少跑（默认取网页上的推荐值）。
-    gapMinMs: b.gapMinMs == null ? 60000 : Number(b.gapMinMs),
-    gapMaxMs: b.gapMaxMs == null ? 65000 : Number(b.gapMaxMs),
+    // 轮间隔：默认 0/0，引擎不强制等冷却（见 [PK.matchCooldownMs]）。
+    gapMinMs: b.gapMinMs == null ? 0 : Number(b.gapMinMs),
+    gapMaxMs: b.gapMaxMs == null ? 0 : Number(b.gapMaxMs),
     // 出题成功 → 提交答案 之间的间隔（让节奏更像真人，也错开频控窗口）
-    submitDelayMinMs: b.submitDelayMinMs == null ? 0 : Number(b.submitDelayMinMs),
-    submitDelayMaxMs: b.submitDelayMaxMs == null ? 0 : Number(b.submitDelayMaxMs),
+    submitDelayMinMs: b.submitDelayMinMs == null ? 8000 : Number(b.submitDelayMinMs),
+    submitDelayMaxMs: b.submitDelayMaxMs == null ? 12000 : Number(b.submitDelayMaxMs),
     rateLimitBaseMs: b.rateLimitBaseMs == null ? PK.rateLimitBaseMs : Number(b.rateLimitBaseMs),
     rateLimitMaxWait: b.rateLimitMaxWait == null ? PK.rateLimitMaxWait : Number(b.rateLimitMaxWait),
     // 出题被频控时的自动重试：间隔 / 总等待上限（见 pk-engine 第 2 步）
@@ -267,8 +239,7 @@ function makePkConfig(b) {
   if (cfg.costTimeMs != null && (!Number.isFinite(cfg.costTimeMs) || cfg.costTimeMs < 0)) {
     return { error: 'costTime 必须是非负数字（留空=自动）' };
   }
-  // ★ 2026-10-01：不再截断轮数（原来 Math.min(999, …) 会把大数字悄悄改小）。
-  //   只挡掉非数字/非正数；上限给一个足够大的安全值防止误填天文数字。
+  // 只挡非法值，上限给足够大的安全值（见 clampRounds）
   cfg.rounds = clampRounds(b.rounds, 10);
   return cfg;
 }
@@ -332,20 +303,9 @@ function serveStatic(res, urlPath) {
 /** 需要登录的路径前缀。 */
 function needAuth(pathname) {
   if (pathname === '/api/auth/login' || pathname === '/api/auth/register' || pathname === '/api/auth/me') return false;
-  // PK H5 诊断回传：页面本身不需要登录（登录态在 Node 侧注入），
-  // 所以这条也免鉴权，否则 hook 的诊断会被 401 挡掉。
-  // 同样：H5 hook 的响应解密委托（dataDecrypt 桥），不能要求管理后台会话。
-  // ★★ 2026-09-30：PK H5 的出站代理（/api/pk/h5/api）也必须免鉴权！
-  //
-  //  现象：H5 主页面「登录态没了」、练习/好友PK 进不去、控件变少。
-  //  真因：H5 页面发的所有业务请求都经 /api/pk/h5/api 转发，
-  //        但 H5 页面**不带管理后台会话 cookie** → 被这里 401
-  //        （响应体是 {"ok":false,"message":"未登录"}，不是远端返回的）。
-  //        之前测试时我本人浏览器登录着管理后台，所以没暴露。
-  //
-  //  安全性：代理本身不做鉴权 —— 它用「URL 里 leoAccountId 对应的那个小猿账号」
-  //  的 cookie 出站（见 proxyApi），与访问者是不是管理后台用户无关。
-  //  这与 /pk-h5/ 页面本身免鉴权的设计一致。
+  // PK H5 的 diag/decrypt/encrypt 与出站代理 /api/pk/h5/api 一律免鉴权：
+  // H5 页面不带管理后台会话 cookie，鉴权会把它自己的业务请求全 401。
+  // 代理本身不做鉴权，它用 URL 里 leoAccountId 对应账号的 cookie 出站。
   if (pathname === '/api/pk/h5/api' || pathname.startsWith('/api/pk/h5/api/')) return false;
   if (pathname === '/api/pk/h5/diag' || pathname === '/api/pk/h5/decrypt' || pathname === '/api/pk/h5/encrypt') return false;
   if (pathname.startsWith('/api/')) return true;
@@ -398,10 +358,7 @@ async function handleApi(req, res, u, user) {
     return sendJson(res, r.ok ? 200 : 400, r);
   }
 
-  // ★ 2026-10-01：被禁用的账号在此一律拦下。
-  //   `auth.currentUser` 已经会让禁用用户的会话立刻失效（返回 null → 401），
-  //   这里是**纵深防御**：万一有请求抢在会话清理之前进来（或前端还拿着旧 token），
-  //   也不允许开任务 / 加账号 / 启穿透等任何写操作。退出登录在上面已放行。
+  // 被禁用的账号一律拦下（纵深防御：防请求抢在会话清理前进来）。
   if (user && user.disabled) {
     return sendJson(res, 403, { ok: false, message: '账号已被管理员禁用' });
   }
@@ -571,18 +528,9 @@ async function handleApi(req, res, u, user) {
   }
 
   /* -------------------------- PK H5 诊断（浏览器回传） -------------------------- */
-  //
-  // H5 页面里注入的 hook 会把「JS 报错 / 未捕获 rejection / 每个被代理请求的结果」
-  // 用 sendBeacon 回传到这里，落到服务端日志。这样「点击没反应」这类
-  // 纯前端问题也能在无头环境里看到真相，不用开 F12。
-  // H5 的响应解密委托端点（2026-09-30）。
-  //
-  // 为什么需要它：H5 的响应拦截器对 arraybuffer 响应会调桥
-  // LeoSecure.dataDecrypt（见 exercise-legacy 的 u/l 函数），而**浏览器里没有
-  // keystream**（解密密钥在 Android so 里）。所以桥必须把密文转发到 Node 侧解密：
-  //   1) 浏览器 hook：dataDecrypt → fetch 本端点
-  //   2) 本端点：keystream XOR + gunzip → 明文 JSON
-  //   3) 返回 { result: base64(明文JSON) }，与真机桥协议一致
+  // H5 hook 用 sendBeacon 把 JS 报错 / 请求结果回传到这里（落服务端日志）。
+  // 解密委托端点：H5 的 dataDecrypt 桥把密文转发过来（浏览器无 keystream），
+  // 本端点 keystream XOR + gunzip → 明文，回 { result: base64(明文JSON) }。
   if (p === '/api/pk/h5/decrypt') {
     const txt = await new Promise((resolve) => {
       const chunks = [];
@@ -617,12 +565,8 @@ async function handleApi(req, res, u, user) {
     res.end(buf);
     return;
   }
-  // ★ 2026-09-30：dataEncrypt 桥的 Node 侧（「局数不增加」的正解）。
-  //
-  //   H5 提交一局时：明文 JSON --base64--> 桥 dataEncrypt --> 本端点
-  //   本端点：明文 --gzip(level6,mtime0)+keystream XOR--> 密文
-  //   返回 { result: base64(密文) }，与真机桥协议一致（H5 用 Uint8Array(result) 当 body）。
-  //   与真机 libContentEncoder 逐字节一致（复用刷分链路的 native.encodeSubmitBody）。
+  // dataEncrypt 桥的 Node 侧：明文 → gzip + keystream XOR → { result: base64(密文) }，
+  // 复用 native.encodeSubmitBody（与真机 libContentEncoder 逐字节一致）。
   if (p === '/api/pk/h5/encrypt') {
     const txt = await new Promise((resolve) => {
       const chunks = [];
@@ -682,15 +626,8 @@ async function handleApi(req, res, u, user) {
   if (p === '/api/pk/h5/api') {
     const leoId = Number(u.searchParams.get('leoAccountId') || 0);
     const acc = db.getLeoAccount(leoId);
-    // ★★ 2026-09-30 修正：**不再要求「小猿账号属于当前管理后台用户」**。
-    //
-    //  原来的 `acc.user_id !== user.id` 判定导致：
-    //    H5 页面（/pk-h5/pk.html）不带管理后台会话 → user=undefined →
-    //    所有业务请求被拒（401/404）→ 主页面「登录态没了」、练习/好友PK 进不去。
-    //
-    //  这里与「/pk-h5/ 页面本身免鉴权」的设计保持一致：页面与出站代理都不需要
-    //  管理后台登录；代理只是**用选定小猿账号的 cookie 出站**。
-    //  只要该账号在库中存在（用户自己配置的），就允许代理。
+    // 不要求「小猿账号属于当前管理后台用户」：H5 页面不带后台会话，否则业务请求全被拒。
+    // 代理只用选定小猿账号的 cookie 出站，账号在库中存在即可。
     if (!acc) return sendJson(res, 404, { ok: false, message: '账号不存在' });
     return pkH5.proxyApi(req, res, u, { jar: jobs.jarOf(acc) });
   }
@@ -723,12 +660,8 @@ async function handleApi(req, res, u, user) {
     });
   }
 
-  /* ---- 批量开任务：多个小猿账号，同一套配置，各起一个任务 ---- */
-  //
-  // ★ 2026-10-01：用户场景「我登了 6 个账号，想按同样配置一次性全开」。
-  //   逐个点 6 次「开始刷局」既慢又容易填错参数 —— 这里一次请求搞定：
-  //   每个账号**各建一条 jobs 记录**（各自独立计数、独立可停），
-  //   共用的只是同一份参数快照。某个账号失败（比如没设备链）不影响其它账号。
+  /* ---- 批量开任务：多个小猿账号用同一套配置，各建一条独立 jobs 记录 ---- */
+  // 每个账号独立计数/可停，共用同一份参数快照；某个账号失败不影响其它。
   if (p === '/api/jobs/batch' && method === 'POST') {
     const b = await readJson(req);
     const ids = (Array.isArray(b.leoAccountIds) ? b.leoAccountIds : [])
@@ -938,12 +871,8 @@ async function handleApi(req, res, u, user) {
     const acc = db.getLeoAccount(Number(b.leoAccountId));
     if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '小猿账号不存在' });
 
-    // ★★ 2026-10-01：刷练习改为**正经的后台任务**（跟刷局同一套）。
-    //
-    //  旧实现是裸的 async IIFE：不落库、不登记 running、不占并行名额，
-    //  于是「任务」页看不到它、切 tab 回来日志空白、也没法停止。
-    //  现在写一条 jobs 记录（config.kind='exercise'）再交给 jobs.startExerciseJob，
-    //  于是：任务页可见 / 逐轮明细落库 / 可停止 / 可暂停继续 / 与刷局共用 SSE。
+    // 刷练习走正经后台任务：写一条 jobs 记录（kind='exercise'）再交给 startExerciseJob，
+    // 于是任务页可见、逐轮落库、可停止、与刷局共用 SSE。
     const cfg = makeExerciseConfig(b);
     const jobId = db.createJob(user.id, acc.id, null, cfg, cfg.rounds);
     const start = jobs.startExerciseJob({ jobId: jobId });
@@ -1004,7 +933,7 @@ async function handleApi(req, res, u, user) {
 
   if (p === '/api/admin/users' && method === 'GET') {
     if (user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
-    // 带上「有几个小猿账号 / 有几个任务还在跑」—— 删除前要给管理员看清楚要删掉什么
+    // 带上账号数与运行中任务数（删除前给管理员看清要删什么）
     const users = db.listUsers().map((u) => Object.assign({}, u, {
       leoAccounts: db.countLeoAccountsOfUser(u.id),
       activeJobs: db.listActiveJobsByUser(u.id).length,
@@ -1045,18 +974,8 @@ async function handleApi(req, res, u, user) {
     const disable = !!b.disabled;
     db.setUserDisabled(target.id, disable);
 
-    // ★★ 2026-10-01：禁用 = **立刻暂停他的全部任务 + 强制退出登录**。
-    //
-    //  原实现只改了 users.disabled 一个字段，而 `disabled` 只在**登录时**校验，
-    //  于是对方浏览器那张旧会话 token 完全不受影响 —— 页面照常显示、任务照常能开，
-    //  「禁用」形同虚设（这正是用户反馈的问题）。
-    //
-    //  现在三件事一起做：
-    //   1) 把他名下所有 running/queued 任务**暂停**（不是直接 stopped —— 保留已刷轮数，
-    //      重新启用后他自己可以点「继续」接着跑，不浪费）；
-    //   2) 删掉他**所有**会话 ⇒ 现有页面立刻 401 被踢回登录页；
-    //   3) `auth.currentUser` 对 disabled 返回 null（见 services/auth.js），
-    //      所以就算他还有别的设备在线，下一个请求也会被挡。
+    // 禁用 = 暂停他全部任务（mode:'pause' 保留已刷轮数）+ 删掉所有会话（页面立刻 401）。
+    // auth.currentUser 对 disabled 返回 null，其它设备的下一个请求也会被挡。
     let paused = 0, kicked = 0;
     if (disable) {
       paused = jobs.stopJobsByUser(target.id, { mode: 'pause' });
@@ -1073,14 +992,9 @@ async function handleApi(req, res, u, user) {
     });
   }
 
-  /* ------------------------ 删除账号（2026-10-01 新增） ------------------------ */
-  //
-  // 之前只有「禁用」，没有删除。这里补上，并遵守三条保护：
-  //   · 不能删自己（否则管理员会把自己锁死在门外）；
-  //   · 不能删掉最后一个管理员（否则系统再也没有管理员）；
-  //   · 删之前先停掉他的任务、清掉会话。
-  // 数据级联：users 删掉后，由外键 ON DELETE CASCADE 连带清掉
-  //   sessions / leo_accounts / jobs / job_rounds / sub_accounts（见 db.js SCHEMA）。
+  /* ------------------------ 删除账号 ------------------------ */
+  // 三条保护：不能删自己、不能删最后一个管理员、删前先停任务清会话。
+  // 级联：users 删除后由外键 ON DELETE CASCADE 连带清掉 sessions/leo_accounts/jobs 等。
   const adminUserDelete = /^\/api\/admin\/users\/(\d+)$/.exec(p);
   if (adminUserDelete && method === 'DELETE') {
     if (user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
@@ -1092,8 +1006,7 @@ async function handleApi(req, res, u, user) {
       return sendJson(res, 400, { ok: false, message: '这是最后一个管理员，不能删除' });
     }
     const leoCount = db.countLeoAccountsOfUser(id);
-    // 删除前先把任务停下来（级联删除会连 jobs 一起删，但那只是「记录消失」，
-    // 正在跑的循环还在内存里 —— 必须先中断，否则进程还会继续替他刷局）。
+    // 删除前先停任务：级联只删记录，内存里的循环还在跑。
     const stopped = jobs.stopJobsByUser(id, { mode: 'stop' });
     const kicked = db.deleteSessionsByUser(id);
     db.deleteUser(id);
@@ -1240,8 +1153,7 @@ function safeParse(s) {
 /* ------------------------------ 服务器 ------------------------------ */
 
 const server = http.createServer(async (req, res) => {
-  // ★ 全量访问日志（2026-09-30）：定位「浏览器没到服务端」类问题。
-  // 只打印非静态资源的关键路径，避免刷屏。
+  // 关键路径访问日志（定位「浏览器没到服务端」类问题；不打印静态资源，避免刷屏）。
   try {
     const _p = String(req.url || '');
     if (_p.indexOf('/pk-h5') === 0 || _p.indexOf('/pk-h5-cdn') === 0 || _p.indexOf('/api/pk') === 0) {
@@ -1263,9 +1175,7 @@ const server = http.createServer(async (req, res) => {
     // 在 Node 侧注入。
     if (u.pathname === '/pk-h5' || u.pathname.startsWith('/pk-h5/') ||
         u.pathname.startsWith('/pk-h5-cdn/') ||
-        // ★ 2026-09-30：H5 有入口直接拼 `${location.origin}/bh5/...`
-        //   （如「好友挑战」→ /bh5/leo-web-oral-pk/invite-friend.html），
-        //   这里一并交给 PK H5 代理处理，否则 404「未提供」。
+        // H5 有入口直接拼 `${location.origin}/bh5/...`，一并交给 PK H5 代理，否则 404。
         u.pathname.indexOf('/bh5/') === 0) {
       try {
         const handled = await pkH5.serve(req, res, u);
@@ -1297,8 +1207,7 @@ const server = http.createServer(async (req, res) => {
 function main() {
   db.init();
   db.purgeExpiredSessions();
-  // 「服务重启 = 任务中断」：清掉上次残留的 running/queued 僵尸任务，
-  // 否则「任务」页会永远显示「运行中」且停不掉。
+  // 服务重启 = 任务中断：清掉残留的 running/queued 僵尸任务，否则任务页永远显示「运行中」。
   const interrupted = db.markInterruptedJobs();
   if (interrupted > 0) console.log('[pk-node] 已把 ' + interrupted + ' 个中断任务标记为失败（服务重启）');
 

@@ -3,18 +3,12 @@
 /**
  * 校验 H5_INJECT 注入脚本的语法与运行期正确性。
  *
- * ## 为什么需要它（2026-09-29 的惨痛教训）
- *
- * 注入脚本是**内嵌在 Node 模板字符串里**的一段 JS，这带来两个隐蔽陷阱：
+ * 注入脚本内嵌在 Node 模板字符串里，有两个隐蔽陷阱：
  *  1. 模板字符串里**不能出现反引号**（会提前结束字符串）；
  *  2. 里面的**正则字面量会被外层处理**（`\/` → `/`，导致正则提前结束；
  *     `${` 会被当插值）。
- *
- * 我因为它连续翻了三次车：写注释用了反引号、正则里写了 `\/`、`\?` ——
- * 每次都是「语法错误 → 整段 hook 失效 → 页面 API 不被代理、桥不存在」，
- * 而现象只是「按钮点不动/加载不出来」，极难从表象定位。
- *
- * 所以把校验固化下来：每次改注入脚本后跑一次 `node tools/check-inject.js`。
+ * 任一都会让整段 hook 失效却只表现为「按钮点不动/加载不出来」。
+ * 每次改注入脚本后跑一次 `node tools/check-inject.js`。
  */
 const fs = require('node:fs');
 const path = require('node:path');
@@ -119,7 +113,7 @@ if (missing.length) { console.error('✗ 缺少桥：' + missing.join(', ')); pr
 
 // --- 5) 桥协议检查（严格按 H5 的真实调用方式）---
 //
-// ## H5 实际怎么调（逐行读 index-legacy.CHYoHfC0.js 得出，2026-09-29）
+// ## H5 实际怎么调（逐行读 H5 得出）
 //
 //   payload = base64(JSON.stringify({ arguments:[{trigger:'<m>_<ts>_<n>', ...}], callback:'...' }))
 //   window.CommonWebView.<method>(payload)          // 路径 A
@@ -216,9 +210,8 @@ try {
   }
   console.log('✓ openSchema 跳转正确:', captured.href.slice(0, 80));
 
-  // (b2) ★ 外部 H5 地址必须被折回本机同源（2026-09-30 的真 bug）
+  // (b2) 外部 H5 地址必须被折回本机同源，
   //      否则跳过去脱离代理 → 没有 hook 与桥 → 下级页面完全哑掉。
-  //      下面这条 URL 就是日志里实测到的。
   captured.href = '';
   const ext = 'https://xyks.yuanfudao.com/bh5/leo-web-oral-pk/exercise.html?pointId=22&jumpTime=1';
   ctx.openSchema_9_10 = () => {};
@@ -231,7 +224,7 @@ try {
   }
   console.log('✓ 外部 H5 折回同源:', captured.href.slice(0, 80));
 
-  // (c2) ★ requestConfig：H5 在 App UA 下靠它替换 {client}（2026-09-30 真 bug）
+  // (c2) requestConfig：H5 在 App UA 下靠它替换 {client}，
   //      走 LeoSecure 模块。回 { wrappedUrl } 才行，回 METHOD_NOT_SUPPORT
   //      会让 H5 用**原样 URL**（含 %7Bclient%7D）→ 所有接口 404。
   let rcOut = null;
@@ -265,23 +258,16 @@ try {
   process.exit(1);
 }
 
-// --- 6) ★ 模板渲染检查（2026-09-30 新增，这次事故的直接产物）---
+// --- 6) 模板渲染检查 ---
 //
-// ## 为什么必须做（血的教训）
-//
-// 上面第 3 步的 `new vm.Script(code)` 检查的是**源码文本**。而 `code` 是
+// 第 3 步的 `new vm.Script(code)` 检查的是**源码文本**。而 `code` 是
 // 模板字符串里的字面内容 —— 在源码里写 `\/` 是**合法**的 JS，
 // 但模板字符串求值时 `\/` 会变成 `/`，**服务端真正吐给浏览器的 JS 就坏了**：
 //
 //     var m = low.match(/^https?:\/\/([^\/]+)/);   ← 源码（合法）
 //     var m = low.match(/^https?://([^/]+)/);      ← 实际输出（语法错误！）
 //
-// 结果是**整段 hook 在浏览器里一行都不执行**：没有桥、没有 XHR 改写、
-// 没有 diag 上报 —— 现象就是「页面变回最初的模样、且服务端看不到任何日志」，
-// 极难从表象定位。
-//
 // 所以这一步直接**跑真实的模板求值**，再对结果做语法检查。
-// ---
 try {
   const tplStart = start + 'const H5_INJECT = '.length;   // 含反引号
   const render = new Function('return ' + src.slice(tplStart, end + 1) + ';');

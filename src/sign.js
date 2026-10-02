@@ -1,27 +1,14 @@
 'use strict';
 // sign 算法（纯 JS 实现 + 离线自校验）。
 //
-// ## 权威公式（已用原版真实请求逐字节验证）
-//
-//   s1 = path + salt
-//   d1 = md5(s1)
-//   s2 = s1 + d1 + path
-//   d2 = md5(s2)
-//   s3 = s2 + d2 + T
-//   d3 = md5(s3)
+//   s1 = path + salt; d1 = md5(s1)
+//   s2 = s1 + d1 + path; d2 = md5(s2)
+//   s3 = s2 + d2 + T; d3 = md5(s3)
 //   sign = md5(s3 + d3 + salt)
+// salt = "wdi4n2t8edr"，path = URL 编码路径（不含 query）。
 //
-// salt = "wdi4n2t8edr"，path = URL.encodedPath()（**不含 query**）。
-//
-// ## ⚠️ T 是「随当前分钟变化」的设备常量
-//
-// T 由 so 里一个 4.6KB 的函数生成（含 `time()`），**没有**用纯 JS 复现它。
-// 因此线上计算 sign 统一走 native harness（`native.calcSign`，见 native.js），
-// 本文件只负责：
-//   1. 保存公式本身（可读、可审计、可离线验证）；
-//   2. `verifyWithFixture()` 用一份固定的 (T, path, sign) 三元组自证公式正确。
-//
-// 这样即使将来 native 资产换了设备，公式仍然是对的，出问题只需重取 T。
+// T 是随分钟变化的设备常量，由 so 生成，线上计算走 native.calcSign（见 native.js）；
+// 本文件只保存公式本身，并用固定样本 verifyWithFixture() 自证。
 
 const crypto = require('node:crypto');
 

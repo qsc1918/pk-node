@@ -1,16 +1,9 @@
 'use strict';
 // 小猿口算协议层：URL 组装（公共参数 + sign）+ PK 接口调用 + 子账号接口。
 //
-// ## 为什么公共参数要「逐参数补齐」而不是整体覆盖
-//
-// PK 端点要求 `_productId=631&_appId=6`，其余主域端点要 `_productId=611`。
-// 调用方显式给的参数**必须原样保留**，缺的才补默认值 —— 整体覆盖会把
-// 631 冲成 611，PK 直接 401（SolarAuthFilter）。这是原项目的真实教训。
-//
-// ## sign 的口径
-//
-// `sign` 的输入是 **encodedPath（不含 query）**，且在 URL 完全定稿后计算。
-// 本项目里路径都是写死的常量，因此 sign 可在发请求前算好。
+// 公共参数「逐参数补齐」而非整体覆盖：PK 端点要 `_productId=631&_appId=6`，
+// 其余主域要 `_productId=611`；整体覆盖会把 631 冲成 611 → PK 直接 401。
+// `sign` 的输入是 encodedPath（不含 query），在 URL 定稿后计算。
 
 const { URL, URLSearchParams } = require('node:url');
 const { config, PK } = require('./config');
@@ -19,10 +12,8 @@ const nativeLib = require('./native');
 const zlib = require('node:zlib');
 const keystream = require('./keystream');
 
-/** 默认公共参数（顺序固定，便于比对真机抓包）。 */
-/** 主域（leo-gateway / leo-profile / leo-auth / leo-star / leo-math）用的公共参数。
- *  ★ 2026-09-28：和练习同源 —— 必须 version=3.140.1 + platform=android37，
- *  否则 switch / batchGet 这类主域端点会被 solar-encoder 拦（400/417）。 */
+/** 主域（leo-gateway / leo-profile / leo-auth / leo-star / leo-math）公共参数：
+ *  必须 version=3.140.1 + platform=android37，否则主域端点被 solar-encoder 拦（400/417）。 */
 const MAIN_COMMON_QUERY = [
   ['platform', PK.exercise.platform],
   ['version', PK.exercise.version],
@@ -42,7 +33,7 @@ const COMMON_QUERY = [
   ['deviceCategory', PK.commonQuery.deviceCategory],
   ['webviewVersion', PK.commonQuery.webviewVersion],
   ['whRatio', PK.commonQuery.whRatio],
-  ['isBackground', PK.commonQuery.isBackground],
+  // 真机 PK 出题 URL 没有 isBackground（抓包逐字），故不补。
 ];
 
 /** 风控头（真机抓包逐字）——**PK/H5 系**（`leo-game-pk`）用这套即可。 */
@@ -59,10 +50,7 @@ function riskHeaders() {
 
 /**
  * App 原生 UA：`Leo/<版本名> (<BRAND><MODEL>; Android <sdkInt>; Scale/<density>)`。
- *
- * ⚠️ 这不是 H5 的 Chrome UA。主域（`leo-gateway` / `leo-profile`）的 417 风控
- * 会核对它 —— 用 H5 UA 打 `accounts/switch` 会直接被 solar-encoder 拦成
- * `417 No message available`（实测）。
+ * ⚠️ 不是 H5 的 Chrome UA：主域 417 风控会核对它，用 H5 UA 打 accounts/switch 会被拦成 417。
  */
 function leoUserAgent() {
   const d = config.device;
@@ -89,14 +77,9 @@ function sw8Header(traceId) {
 }
 
 /**
- * 主域 App 原生请求头（对齐原版 `HeaderInterceptor`）。
- *
- * 这一组是 **417 的解药**：缺 `x-shepherd-did` / `leo-client-trace-id` /
- * `default-namespace-sw8` 时，主域端点（尤其 `accounts/switch`）会 417。
- *
- * 只给**主域**（`xyks.yuanfudao.com`）用；账号域（ape-api）实测不需要，
- * 加了反而可能干扰 —— 与公共参数同一纪律。
- *
+ * 主域 App 原生请求头（对齐原版 HeaderInterceptor）。这是 417 的解药：
+ * 缺 `x-shepherd-did` / `leo-client-trace-id` / `default-namespace-sw8` 时主域端点会 417。
+ * 只给主域用；账号域（ape-api）不需要，加了反而干扰。
  * @param {object} [extra] 额外/覆盖的 header
  */
 function mainDomainHeaders(extra) {
@@ -130,8 +113,7 @@ function mainDomainHeaders(extra) {
 function buildUrl(urlPath, params = {}, opts = {}) {
   const q = new URLSearchParams();
 
-  // ★ _productId 必须放**最前**（2026-09-28 实测）：原版真机 URL 就是
-  //   ?_productId=611&platform=...&sign=...；放到最后时 accounts/switch 直接 400。
+  // _productId 必须放最前（原版真机 URL 顺序）；放到最后时 accounts/switch 直接 400。
   q.set('_productId', opts.productId || PK.productIdDefault);
   if (opts.appId) q.set('_appId', opts.appId);
 
@@ -153,14 +135,10 @@ function buildUrl(urlPath, params = {}, opts = {}) {
 }
 
 /**
- * 按 [config.signMode] 决定是否计算 sign。
- *
- * 计算需要 arm64 原生库（`libRequestEncoder` 的 T 段随分钟变化，已确认无法纯 JS 复现）。
- * 因此：
- *  - `off`（默认）：直接返回 null，**完全不碰原生库** → x86/Windows 可用；
- *  - `auto`：能算就算，算不了返回 null（不抛）；
- *  - `on`：算不出来就抛错（明确失败，而不是静默降级）。
- *
+ * 决定是否计算 sign：按端点判断「要不要签名 / 用哪套签名资产」。
+ *  - PK v1（`/leo-game-pk/android/math/pk/match`）：不需要签名；
+ *  - PK v2 与提交等新端点：需要签名，用 `variant:'pk'` 资产（套练习版会 417）；
+ *  - 其余主域端点：沿用练习版资产。
  * @param {string} urlPath 只含路径
  * @returns {string|null} 32 位 hex 或 null
  */
@@ -168,8 +146,12 @@ function maybeSign(urlPath) {
   const mode = String(config.signMode || 'off').toLowerCase();
   if (mode === 'off') return null;
 
+  const p = String(urlPath);
+  if (p === '/leo-game-pk/android/math/pk/match') return null;   // v1 不需要签名
+
+  const variant = p.indexOf('/leo-game-pk') === 0 ? 'pk' : 'exercise';
   try {
-    return nativeLib.calcSign(urlPath);
+    return nativeLib.calcSign(p, { variant });
   } catch (e) {
     if (mode === 'on') throw e;
     return null;                       // auto：静默降级
@@ -178,78 +160,73 @@ function maybeSign(urlPath) {
 
 /* ------------------------------ PK 接口 ------------------------------ */
 
-/** PK 端点统一带的固定参数。 */
+/** PK 端点统一带的固定参数。真机实测：只有 `_productId=611`，**没有 `_appId`**。 */
 function pkOpts(extra = {}) {
-  return Object.assign({ productId: PK.productIdPk, appId: PK.appIdPk }, extra);
+  return Object.assign({ productId: PK.productIdPk }, extra);
+}
+
+/**
+ * PK 出题用的 H5 WebView UA（真机抓包逐字）。
+ * ⚠️ 与主域「App 原生」UA（`Leo/...`）不是一套：PK 出题由 H5 页面发起，用错 UA 会被判异常。
+ */
+const PK_WEBVIEW_UA =
+  'Mozilla/5.0 (Linux; Android 15; DCO-AL00 Build/V417IR; wv) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Version/4.0 Chrome/110.0.5481.154 Mobile Safari/537.36 ' +
+  'YuanSouTiKouSuan/' + PK.commonQuery.version;
+
+/** PK H5 请求头（真机抓包逐字）。 */
+function pkH5Headers(refererPage) {
+  return {
+    'User-Agent': PK_WEBVIEW_UA,
+    Accept: 'application/json, text/plain, */*',
+    'Accept-Encoding': 'gzip, deflate',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Content-Type': 'application/x-www-form-urlencoded',
+    Origin: config.leoBase,
+    'X-Requested-With': 'com.fenbi.android.leo',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Dest': 'empty',
+    Referer: config.leoBase + '/bh5/leo-web-oral-pk/' + (refererPage || 'exercise.html'),
+  };
 }
 
 /**
  * 出题：`POST /leo-game-pk/android/math/pk/match?pointId=N`（明文 JSON）。
- *
- * 为什么不用 `match/v2`：v2 返回 arraybuffer 加密，服务端 solar-encoder 拦（417）；
- * 旧版明文 match 返回 200 明文 JSON（已在本地 Python 跑通）。
- *
+ * 不用 `match/v2`：v2 返回 arraybuffer 加密，服务端 solar-encoder 拦（417）。
  * @returns {Promise<{status:number, json:object|null, text:string, headers:object}>}
  */
 async function pkMatch(jar, pointId, opts) {
   const path = '/leo-game-pk/android/math/pk/match';
-  // ★ version 必须是**主域协议版**（3.140.1）。
-  //   /leo-game-pk 不在 MAIN_DOMAIN_PREFIXES 里，buildUrl 会用 COMMON_QUERY 的
-  //   App 版 3.141.1 → solar-encoder 直接 417（2026-09-30 A/B 实测）。
-  const url = buildUrl(path, { pointId: String(pointId), version: PK.exercise.version }, pkOpts());
+  // version/platform/vendor 用 PK.commonQuery 的真机值（android35 / 3.143.1 / fenbi）。
+  const url = buildUrl(path, { pointId: String(pointId) }, pkOpts());
   const r = await request({
     url,
     method: 'POST',
     jar,
     signal: opts && opts.signal,
-    headers: Object.assign(
-      {
-        'Content-Type': 'application/json',
-        Referer: config.leoBase + '/bh5/leo-web-oral-pk/pk.html',
-      },
-      riskHeaders(),
-    ),
+    headers: pkH5Headers('exercise.html'),
   });
   return { status: r.status, json: safeJson(r.text), text: r.text, headers: r.headers };
 }
 
 /**
- * 出题 v2：`POST /leo-game-pk/android/math/pk/match/v2?pointId=N`（**加密响应**）。
- *
- * ## 为什么要改成 v2（2026-09-30）
- *
- * 旧版 `match`（明文）风控极严、且容易被判异常；v2 是原版 App 正在用的接口，
- * 服务端返回 `keystream XOR(gzip(json))`。真机由原生 dataDecrypt 解，
- * 我们这里用 keystream 纯 JS 解（见 src/keystream.js，已与真机逐字节对齐）。
- *
- * ## 请求要点（逐行读 H5 的 exercise-legacy.C5DFMay0.js 得出）
- *
- *       a.post(url, null, { responseType: 'arraybuffer' })
- *                     ^^^^ body 必须是**空**，传 {} 会被服务端判 400。
- *
- * ## 解密链路
- *
- *       body(密文) --keystream XOR--> gzip 字节 --gunzip--> 明文 JSON
- *
+ * 出题 v2：`POST /leo-game-pk/android/math/pk/match/v2?pointId=N`（加密响应）。
+ * 请求 body 必须是**空**，传 {} 会被服务端判 400。
+ * 解密链路：密文 --keystream XOR--> gzip 字节 --gunzip--> 明文 JSON。
  * @returns {Promise<{status:number, json:object|null, text:string, headers:object}>}
  */
 async function pkMatchV2(jar, pointId, opts) {
   const path = '/leo-game-pk/android/math/pk/match/v2';
-  // ★ 同理：version 必须覆盖成协议版，否则 417。
-  const url = buildUrl(path, { pointId: String(pointId), version: PK.exercise.version }, pkOpts());
+  // 业务参数在最前、公共参数在后、sign 夹中间（顺序不影响 sign，sign 只对 encodedPath 计算）。
+  const url = buildUrl(path, { pointId: String(pointId), triggerPeakMatch: '0' }, pkOpts());
   const r = await request({
     url,
     method: 'POST',
     jar,
     signal: opts && opts.signal,
     rawBody: true,                       // 加密字节，别当 gzip 解码
-    headers: Object.assign(
-      {
-        'Content-Type': 'application/json',
-        Referer: config.leoBase + '/bh5/leo-web-oral-pk/exercise.html',
-      },
-      riskHeaders(),
-    ),
+    headers: pkH5Headers('exercise.html'),
   });
   const out = decodeEncryptedResponse(r.body);
   return {
@@ -263,10 +240,7 @@ async function pkMatchV2(jar, pointId, opts) {
 
 /**
  * 解密「加密响应」：密文 -> keystream XOR -> gunzip -> JSON 字节。
- *
- * 与 pk-h5-proxy 的 decodeEncrypted 同一套逻辑（那边服务 H5，这边服务刷局引擎）。
- * 保持两份是因为模块职责不同；若改动务必同步。
- *
+ * 与 pk-h5-proxy 的 decodeEncrypted 同一套逻辑，改动务必同步。
  * @param {Buffer} buf
  * @returns {Buffer|null} 明文；不是密文时返回 null
  */
@@ -285,12 +259,8 @@ function decodeEncryptedResponse(buf) {
 }
 
 /**
- * 提交一局：`PUT /leo-game-pk/android/math/pk/submit`，body 为**已加密的密文**。
- *
- * 为什么要单独暴露这一层：加密会起 native 进程（80~250ms），调用方
- * （pk-engine）需要在这两步之间往日志里写「开始加密 / 加密完成」，
- * 否则用户只看到「提交」一闪而过、以为没在跑。
- *
+ * 提交一局：`PUT /leo-game-pk/android/math/pk/submit`，body 为已加密密文。
+ * 单独暴露这一层是因为加密会起 native 进程（80~250ms），调用方需在其间写日志。
  * @param {Buffer} cipher 已经过 `c = c(gzip(json))` 的密文
  * @returns {Promise<{status:number, text:string, headers:object}>}
  */
@@ -317,21 +287,8 @@ async function pkSubmitRaw(jar, cipher, opts) {
 
 /**
  * 结算查询：`GET /leo-game-pk/android/math/pk/history/detail?pkIdStr=X`
- *
- * ## 为什么要有这一步（对齐结算页）
- *
- * 结算页 `result.html?pkIdStr=X` 的**主数据源就是它**（从 H5 bundle
- * `Result-legacy` 里逐行读出：`getPkExerciseResult(pkIdStr)` →
- * `GET /leo-game-pk/{client}/math/pk/history/detail?pkIdStr=`）。
- *
- * 提交返回 200 只代表「服务端收下了」，**不代表这局已结算**。
- * 用历史 pkIdStr 实测过两种情况：
- *   - 提交成功的局 → `{correctCnt:20, questions:[...]}`（有逐题明细）
- *   - 提交被 403 的局 → `{correctCnt:0, questions:null}`（服务端仍留占位记录）
- *
- * 所以引擎在提交成功后额外拉一次本接口，**以结算结果为准**判断这局是否真的算上。
- * 这样「日志说成功、实际没结算」这种最难查的情况不会再出现。
- *
+ * 提交返回 200 只代表「服务端收下」，不代表已结算；提交成功后额外拉本接口
+ * **以结算结果为准**判断这局是否真的算上（避免「日志成功、实际没结算」）。
  * @returns {Promise<{status:number, json:object|null, text:string}>}
  */
 async function pkHistoryDetail(jar, pkIdStr, opts) {
@@ -395,9 +352,7 @@ async function userInfosContext(jar) {
 
 /**
  * 子账号详情（名字/头像/年级）：`GET /leo-profile/android/user-infos/batchGet`。
- *
- * ⚠️ 原版是**无参**接口（按当前 cookie 返回列表）；需要设备链，可能 401/417。
- * 失败不致命 —— 上层会退化显示 `账号 {uid}`。
+ * ⚠️ 原版无参接口（按当前 cookie 返回）；需要设备链，可能 401/417，失败不致命。
  */
 async function subAccountsBatchGet(jar) {
   const path = '/leo-profile/android/user-infos/batchGet';
@@ -416,9 +371,7 @@ async function ytkUserProfile(jar) {
 
 /**
  * 切换到子账号：`POST /leo-gateway/android/accounts/switch`，`targetUserId`。
- *
- * 成功后服务端会下发新的 `userid` cookie —— 必须让 [CookieJar] 吸收，
- * 否则后续请求仍带旧身份。
+ * 成功后服务端下发新的 `userid` cookie，必须让 [CookieJar] 吸收，否则后续仍带旧身份。
  */
 async function switchSubAccount(jar, targetUserId) {
   const path = '/leo-gateway/android/accounts/switch';
@@ -439,11 +392,8 @@ async function switchSubAccount(jar, targetUserId) {
 /* ---------------------------- 账号域：登录 ---------------------------- */
 
 /**
- * 账号域请求的公共头。
- *
- * **这里刻意不带主域那套公共参数（platform/vendor/sign…）**：
- * 登录接口在 `ape-api.yuanfudao.com`，不吃主域的 sign，也不需要设备链
- * （实测发码、密码登录都是裸 form 就通）。
+ * 账号域请求的公共头：刻意不带主域公共参数（platform/vendor/sign…），
+ * 登录接口在 ape-api，不吃 sign 也不需要设备链。
  */
 function ytkHeaders(extra) {
   return Object.assign({ 'User-Agent': 'okhttp/4.9.2' }, extra || {});
@@ -475,14 +425,8 @@ async function ytkSmsVerify(jar, phoneEncrypted) {
 
 /**
  * 短信验证码登录：`POST /accounts/android/safe/login`。
- *
- * 参数口径（逐行来自原版 `wo/d.smali`，**不是**注解推断）：
- *  - `phone` **RSA 密文**
- *  - `verification` **RSA 密文**（验证码也要加密，容易漏）
- *  - `autoRegister` 原版硬编码 `true`
- *
- * 成功响应是**平铺账号对象**（没有 code/body 信封），并下发
- * `sess` / `userid` / `g_sess` / `persistent` cookie —— 由 [CookieJar] 自动收下。
+ * ⚠️ `phone` 与 `verification` 都是 RSA 密文（验证码也要加密，容易漏）；`autoRegister` 原版硬编码 true。
+ * 成功响应是平铺账号对象（无 code/body 信封），并下发 sess/userid/g_sess/persistent cookie。
  */
 async function ytkSmsLogin(jar, phoneEncrypted, verificationEncrypted, autoRegister) {
   const body = new URLSearchParams({
@@ -502,13 +446,8 @@ async function ytkSmsLogin(jar, phoneEncrypted, verificationEncrypted, autoRegis
 
 /**
  * 密码登录：`POST /accounts/android/safe/login`。
- *
- * ⚠️ 与手机号不同，这里 **`phone` 是明文**、**`password` 要 RSA 密文**
- * （实测：明文密码 → 401「密码错误」；RSA 密文 → 200 并下发 cookie）。
- * 不要把两者统一加密，这是服务端的实际口径。
- *
- * 为什么不用主域网关版 `/leo-gateway/android/auth/password`：实测该接口
- * 无论明文还是密文一律 401 `unauthorized`，拿不到任何语义化错误。
+ * ⚠️ 与手机号登录不同：`phone` 是明文、`password` 要 RSA 密文（明文密码→401）；不要把两者统一加密。
+ * 不用主域网关版 `/leo-gateway/android/auth/password`：该接口明文/密文一律 401，拿不到语义化错误。
  */
 async function ytkPasswordLogin(jar, phonePlain, passwordEncrypted) {
   const body = new URLSearchParams({

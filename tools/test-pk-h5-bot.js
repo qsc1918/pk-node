@@ -1,19 +1,12 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * PK H5「三个自动能力」的离线回归测试（2026-10-01）。
+ * PK H5「三个自动能力」的离线回归测试。
  *
- * ## 它守的是什么（三个真 bug，都已实测复现过）
- *
- * 1. **能力参数丢失**：`?pkbot=` 只挂在入口页（pk.html）的 URL 上，
- *    H5 跳到 exercise.html / result.html 后就丢了 → 子页面三个开关全部回到「关」
- *    → `recognize` 桥回空串 → **手写正确符号也判错**（用户原话：
- *    「即使写的是正确符号，也完全没有用，根本做不了」）。
- * 2. **模拟笔迹的事件类型错了**：手写板是 `forceUseTouch: true` 建的，
- *    只绑 mousedown（+ 支持触摸时再绑 touchstart），**从不绑 pointerdown**；
- *    而注入脚本原来只发 PointerEvent → 一笔都进不去 → 自动交笔无效。
- * 3. **「自动下一局」找按钮的文案漏了「再练一次」**，却把「返回首页」也算进来
- *    （点它等于直接离开结算页）。
+ * 守三个真 bug：
+ *  1. 能力参数丢失：`?pkbot=` 只挂入口页，跳到子页面后开关全关 → recognize 回空串 → 手写正确符号也判错。
+ *  2. 模拟笔迹事件类型错：手写板只绑 mouse/touch，注入脚本原来只发 PointerEvent → 一笔都进不去。
+ *  3. 「自动下一局」找按钮漏了「再练一次」，却把「返回首页」也算进来（点了等于离开）。
  *
  * 用法：`node tools/test-pk-h5-bot.js`
  */
@@ -127,7 +120,7 @@ console.log('1) recognize 桥（「视为正确答案」是否生效）');
     String(sb.__pkStore['pk-bot-cfg'] || '').indexOf('"answer":true') >= 0, sb.__pkStore['pk-bot-cfg']);
 }
 
-// 1b. ★ 子页面（exercise.html）URL 没有 pkbot —— 这正是原来失效的场景
+// 1b. 子页面（exercise.html）URL 没有 pkbot —— 这正是原来失效的场景
 {
   const sb = makeSandbox({
     href: 'http://127.0.0.1:8792/pk-h5/exercise.html?pointId=16&leoAccountId=6',

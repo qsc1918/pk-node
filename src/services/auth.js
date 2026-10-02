@@ -5,7 +5,7 @@
 //   - 本服务账号 = 谁能登进这个网页（users 表）；
 //   - 小猿账号 = 用哪个小猿身份去刷局（leo_accounts 表，一个本服务用户可绑多个）。
 //
-// 默认管理员 `admin/admin` 在 db.init() 时写入（用户要求）。
+// 默认管理员 admin/admin 在 db.init() 时写入。
 
 const db = require('../db');
 const { config } = require('../config');
@@ -64,15 +64,8 @@ function logout(token) {
 
 /**
  * 从 cookie 里解析当前登录用户。
- *
- * ★ 2026-10-01：**已禁用的账号立即失效**（等于强制退出登录）。
- *
- *  原实现只透传 `getUserBySession` 的结果，而 `disabled` 只在**登录那一刻**检查 ——
- *  于是管理员点「禁用」后，对方浏览器手里那张旧 token 完全不受影响：
- *  页面照常显示、任务照常能开（正是用户反馈的「别人那边不会退出登录」）。
- *
- *  这里改成：发现 disabled 就顺手删掉这张会话并返回 null ⇒
- *  该浏览器所有 `/api/*` 立刻 401，前端跳回登录页；重新登录也会被 `login()` 挡住。
+ * 已禁用账号立即失效（强制退出）：发现 disabled 就删掉该会话返回 null，
+ * 浏览器所有 /api/* 立刻 401，重新登录也会被 login() 挡住。
  */
 function currentUser(cookieHeader) {
   const token = readSessionCookie(cookieHeader);

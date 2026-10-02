@@ -16,8 +16,7 @@ async function api(path, options) {
   let data = null;
   try { data = await res.json(); } catch (e) { data = null; }
   if (!res.ok) {
-    // ★ 2026-10-01：会话被服务端判失效（被管理员禁用 / 改密 / 过期）→ 别让用户
-    //   对着一堆「未登录」报错干瞪眼，直接告诉他并退回登录页。
+    // 会话失效（被禁用 / 改密 / 过期）→ 直接提示并退回登录页。
     if (res.status === 401 && state.user) {
       toast('登录已失效（账号可能被管理员禁用），正在返回登录页…', 'err');
       setTimeout(() => location.reload(), 1200);
@@ -41,32 +40,12 @@ function toast(msg, kind) {
 }
 
 /**
- * ★ 2026-09-30：日志容器的「自动跟随滚动」——与 Android 端 [AutoFollowScroll] 同一语义。
- *
- * 用户要求：
- *   「当到达底部时会介入自动滚动，当用户上滑后关闭自动滚动，
- *     当下滑到底后又介入自动滚动，接着滚动要有丝滑的动画」
- *   「滚动的速度应该和日志输出的速度匹配，做到连贯性下滑，看起来很快」
- *
- * 做法：
- *  - 给容器挂一次 `scroll` 监听（幂等，用 dataset 标记）；
- *  - 每次滚动后判断「是否（近）到底」→ 记录到 `dataset.autoFollow`；
- *  - 追加内容时若 autoFollow 为真 → 平滑滚到底。
- *
- * ⚠️ 为什么不用 `behavior:'smooth'`：浏览器对 smooth 用**固定时长**（约 300~500ms），
- *    日志每 100ms 来一条时，上一条动画还没完就被下一条打断 → 看起来「一顿一顿」。
- *    所以这里自己算时长（恒定线速度 ~3.2px/ms，钳制 80~600ms）。
- *
- * ⚠️ 不用 `scrollIntoView`：它会把**外层页面**也一起滚，导致整页跳动。
- *
- * ★★ 2026-09-30 v2：改用 **二阶阻尼弹簧引擎**（对齐 dsh-smooth-stream
- *    的「弹簧跟随引擎」，也对齐 Android 端 [AutoFollowScroll]）：
- *
- *     a = (k*(target - x) - c*v) / m ;  v += a*dt ;  x += v*dt
- *
- *    参数 k=130, c=24, m=1；每帧 rAF 积分，掉帧时 dt 钳位 ≤ 32ms。
- *    新日志到达只是抬高 target，速度 v **连续**（不像 tween 每次重启归零），
- *    因此是「连贯下滑」而不是一顿一顿。
+ * 日志容器自动跟随滚动（对齐 Android 端 [AutoFollowScroll]）：
+ *  - 挂一次 scroll 监听（幂等），判断是否在底部 → 开关 autoFollow；
+ *  - 追加内容时若 autoFollow 则平滑滚到底。
+ * 不用 behavior:'smooth'（固定时长，高频日志会一顿一顿）；
+ * 不用 scrollIntoView（会把外层页面一起滚）。
+ * 二阶阻尼弹簧逐帧积分：a=(k*(target-x)-c*v)/m，速度连续 → 连贯下滑。
  */
 const SPRING_K = 130, SPRING_C = 24, SPRING_M = 1;
 const SPRING_MAX_DT = 0.032;   // 掉帧钳位（秒，对齐 dsh）
@@ -154,7 +133,7 @@ const state = {
   streamErrorNotified: false,
   seenRounds: new Set(),
   practiceStream: null,
-  /** 当前正在看的「刷练习」任务 id（刷练习自 2026-10-01 起是正经后台任务）。 */
+  /** 当前正在看的「刷练习」任务 id（后台任务）。 */
   practiceJobId: null,
   /** 事件流心跳看门狗（隧道下判定「流是否还活着」）。 */
   watchdogTimer: null,
@@ -297,10 +276,8 @@ function openPkPage() {
   const id = $('pkpage-leo').value;
   if (!id) return toast('先导入小猿账号', 'err');
   const frame = $('pkpage-frame');
-  // 带上 leoAccountId：hook 会把它拼进 API 代理 URL，Node 用它选账号 jar
-  //
-  // ★ 2026-09-30：悬浮窗已下线，自动能力改由 URL 参数驱动。
-  //   这里按当前勾选拼出 pkbot=... 传进去；没勾就传 off（显式全关）。
+  // 带上 leoAccountId：hook 拼进 API 代理 URL，Node 用它选账号 jar。
+  // 自动能力由 URL 参数 pkbot=... 驱动；没勾就传 off（显式全关）。
   const caps = [];
   if ($('pkbot-answer') && $('pkbot-answer').checked) caps.push('answer');
   if ($('pkbot-stroke') && $('pkbot-stroke').checked) caps.push('autoStroke');
@@ -834,8 +811,7 @@ function updateTickLine(log, text, cls) {
     const div = logLine(log, text, cls);
     div.dataset.tick = '1';
   }
-  // ★ 2026-09-30：改为「跟随中才平滑滚到底」（原为无条件瞬移）。
-  //   logLine 内部已处理过追加路径；这里是**原地更新心跳行**的路径，也要遵守同一语义。
+  // 原地更新心跳行也要遵守「跟随中才平滑滚到底」语义（避免上滑后被强制滚动）。
   ensureAutoFollow(log);
   if (log.dataset.autoFollow === '1') smoothScrollToBottom(log);
 }
@@ -867,7 +843,7 @@ async function loadJobs() {
       el.querySelector('.meta').textContent =
         '成功 ' + j.roundsDone + '/' + j.roundsTotal + ' · 失败 ' + j.roundsFailed +
         (j.leoName ? ' · ' + j.leoName : '') + ' · ' + fmtTime(j.createdAt);
-      // 完整配置（原来只显示 pointId，看不到画笔/间隔/耗时等）
+      // 完整配置（含画笔 / 间隔 / 耗时等）
       el.querySelector('.cfg').textContent = jobConfigText(j);
       const actions = el.querySelector('.actions');
       if (isActiveJob(j)) {
@@ -930,11 +906,7 @@ function kindText(j) {
 }
 
 /**
- * 把任务的完整参数拼成人能读的一段文字。
- *
- * ★ 2026-10-01：管理页原来只有「用户名 + 运行中」，看不出对方在刷局还是刷练习、
- * 更看不到配置。这里把 config_json 里**所有**关键参数摊开（刷局与刷练习字段不同，
- * 所以分两路拼），管理员一眼就能判断这个任务在干什么、节奏合不合理。
+ * 把任务的完整参数拼成人能读的一段文字（刷局与刷练习字段不同，分两路拼）。
  */
 function jobConfigText(j) {
   const c = j.config || {};
@@ -991,23 +963,35 @@ $('prac-run').addEventListener('click', runPractice);
 $('prac-stop').addEventListener('click', stopPractice);
 
 /**
- * 「填入推荐值」：把刷局的每轮间隔填成贴着服务端出题冷却的值。
+ * 「填入推荐值」：把刷局节奏一键填成惯用配置（每轮 0、答题 8~12s、
+ * 出题重试 10s / 最长等 2 分钟、退避 10s×2）。
  *
- * 为什么要有这个按钮（2026-10-01）：服务端**确实**有 ≈60s 的账号级出题冷却，
- * 但引擎被要求**不强制**替用户等待 —— 冷却只由用户填的「每轮间隔」体现。
- * 而这两个输入框的值会被 bindPersist 存进 localStorage，改 HTML 默认值
- * 对**已经存过值**的浏览器不生效，所以给一个显式按钮。
+ * 因 bindPersist 会把输入框值存进 localStorage，所以这个按钮本质是给
+ * 旧版默认下进站的浏览器一个一键迁移的入口 —— 新用户首屏直接看到这套。
  */
+const GRIND_RECOMMENDED = {
+  'grind-gapmin': 0,
+  'grind-gapmax': 0,
+  'grind-mretry': 10000,
+  'grind-mmax': 120000,
+  'grind-delaymin': 8000,
+  'grind-delaymax': 12000,
+  'grind-rlbase': 10000,
+  'grind-rlmax': 2,
+};
 $('grind-gap-recommend').addEventListener('click', () => {
-  const lo = $('grind-gapmin');
-  const hi = $('grind-gapmax');
-  lo.value = '60000';
-  hi.value = '65000';
+  const els = [];
+  for (const [id, v] of Object.entries(GRIND_RECOMMENDED)) {
+    const el = $(id);
+    if (!el) continue;
+    el.value = String(v);
+    els.push(el);
+  }
   // 触发 bindPersist 的 change 监听，把新值落进 localStorage
-  [lo, hi].forEach((el) => {
+  els.forEach((el) => {
     try { el.dispatchEvent(new Event('change')); } catch (e) { /* ignore */ }
   });
-  toast('已填入推荐间隔 60000~65000ms（贴着服务端 ≈60s 出题冷却）', 'ok');
+  toast('已填入推荐值：每轮 0、答题 8~12s、出题重试 10s/最长 2 分钟、退避 10s×2', 'ok');
 });
 $('prac-leo').addEventListener('change', loadPracticeSubs);
 $('prac-switch').addEventListener('click', switchPracticeSub);
@@ -1087,7 +1071,7 @@ async function loadAdmin() {
           toast(r.message || '已更新', 'ok');
           await loadAdmin();
         }),
-        // ★ 2026-10-01：新增删除账号（原先只能禁用，删不掉）
+        // 删除账号（原先只能禁用）
         makeMiniButton('删除', async () => {
           const tip = u.id === state.user.id
             ? '不能删除自己。'
@@ -1127,13 +1111,7 @@ async function loadAdmin() {
 }
 
 /* --------------------- 管理页：全部任务（可操控） --------------------- */
-/*
- * ★ 2026-10-01：管理页原来只显示「#id 用户名 状态」，既看不出在刷局还是刷练习、
- * 也看不到任何配置，更没有停止/暂停的入口 —— 管理员对别人的任务完全无能为力。
- *
- * 现在每条任务展示：归属用户 + 小猿账号名 + 任务类型 + 完整参数快照，
- * 并提供「暂停 / 继续 / 停止 / 明细」，勾选后还能批量操作。
- */
+// 管理页任务：归属用户 + 小猿账号 + 类型 + 完整配置，支持暂停/继续/停止/明细 + 批量勾选。
 
 /** 管理页里被勾选的任务 id。 */
 const adminJobSel = new Set();
@@ -1326,11 +1304,7 @@ $('admin-jobs-stop').addEventListener('click', async () => {
 });
 
 /* --------------------- 批量开任务（多个小猿账号） --------------------- */
-/*
- * ★ 2026-10-01：用户场景「我登了 6 个账号，想按同样的配置一次性全开」。
- *   这里在两个面板各放一份多选列表，勾谁就给谁开 —— 每个账号一个独立任务，
- *   参数完全取自当前面板（也就是「同样的配置」）。
- */
+// 批量开任务：两个面板各一份多选列表，勾谁就给谁开（每个账号一个独立任务，参数取自当前面板）。
 
 const batchSel = { grind: new Set(), prac: new Set() };
 
@@ -1379,14 +1353,14 @@ function collectPkBody() {
   const body = {
     pointId: Number($('grind-point').value || 1951),
     rounds: Number($('grind-rounds').value || 10),
-    gapMinMs: Number($('grind-gapmin').value || 60000),
-    gapMaxMs: Number($('grind-gapmax').value || 65000),
-    submitDelayMinMs: Number($('grind-delaymin').value || 0),
-    submitDelayMaxMs: Number($('grind-delaymax').value || 0),
-    rateLimitBaseMs: Number($('grind-rlbase').value || 60000),
+    gapMinMs: Number($('grind-gapmin').value || 0),
+    gapMaxMs: Number($('grind-gapmax').value || 0),
+    submitDelayMinMs: Number($('grind-delaymin').value || 8000),
+    submitDelayMaxMs: Number($('grind-delaymax').value || 12000),
+    rateLimitBaseMs: Number($('grind-rlbase').value || 10000),
     rateLimitMaxWait: Number($('grind-rlmax').value || 2),
-    matchRetryIntervalMs: Number(($('grind-mretry') || {}).value || 8000),
-    matchRetryMaxMs: Number(($('grind-mmax') || {}).value || 240000),
+    matchRetryIntervalMs: Number(($('grind-mretry') || {}).value || 10000),
+    matchRetryMaxMs: Number(($('grind-mmax') || {}).value || 120000),
     strokeMode: strokeEl ? strokeEl.value : 'ARC',
   };
   // costTime 留空 = 自动（服务端按题数 × 5ms 给下限）
@@ -1561,7 +1535,7 @@ async function pumpPractice() {
   out.textContent = '';
   const say = (s) => {
     out.textContent += s + '\n';
-    // ★ 2026-09-30：同「自动跟随」语义（跟随中才平滑滚，上滑后不打扰）。
+    // 同「自动跟随」语义（跟随中才平滑滚，上滑后不打扰）。
     ensureAutoFollow(out);
     if (out.dataset.autoFollow === '1') smoothScrollToBottom(out);
   };
@@ -1616,10 +1590,7 @@ async function fetchPracticeExam() {
 
 /**
  * 开始自动刷练习：POST /api/exercise/run，然后订阅 /api/exercise/stream 看实时日志。
- *
- * ★ 2026-10-01：刷练习返回的是**任务 id**（服务端把它当正经后台任务落库了），
- *   所以：日志按 jobId 过滤、可在「任务」页看到、可随时「停止」，
- *   切走再回来（甚至刷新页面）都能靠 SSE 的历史回放接着看。
+ * 返回任务 id（服务端落库），日志按 jobId 过滤、可在「任务」页看到、可随时停止。
  */
 async function runPractice() {
   const id = $('prac-leo').value;
@@ -1710,12 +1681,8 @@ function stopPracticeStream() {
 }
 
 /**
- * 回到「刷练习」页时恢复上次的任务视图。
- *
- * ★ 2026-10-01：用户反馈「切到后台就不会再执行」——真因是以前练习日志
- * 只活在页面内存里（SSE 断开就没了），且任务没落库、任务页看不到。
- * 现在任务在服务端持续跑，这里按 localStorage 记住的 jobId 重新挂上日志流
- * （服务端会回放最近的事件）。
+ * 回到「刷练习」页时恢复上次的任务视图：按 localStorage 记住的 jobId 重新挂上日志流
+ * （服务端会回放最近的事件，任务在服务端持续跑）。
  */
 function restorePracticeJob() {
   if (state.practiceJobId) { attachPracticeStream(); return; }
@@ -1818,15 +1785,7 @@ async function switchPracticeSub() {
 /* ========================= 配置持久化 ========================= */
 /*
  * 把「刷局 / 刷练习」面板里的配置存进 localStorage。
- *
- * ★★ 2026-09-30：用户反馈「网页版的刷练习的冷却间隔没法改」。
- *
- * 真因：本文件此前**完全没用 localStorage** —— 「每轮最小/最大间隔」这类输入框
- * 一刷新页面 / 切到别的 tab 再回来，就恢复成 HTML 里的默认值（练习的默认是 0），
- * 用户改完回来发现还是 0，看起来就是「改不了」。
- *
- * 做法：对下面这些输入框统一「改即存、启动即回填」。只存字符串，
- * 语义校验仍由各表单自己负责（这里不越权）。
+ * 对下面这些输入框统一「改即存、启动即回填」。只存字符串，语义校验仍由各表单自己负责。
  */
 const PERSIST_IDS = [
   // 刷 PK 局

@@ -93,34 +93,33 @@
           </div>
 
           <div class="row">
-            <label class="grow">每轮最小间隔 ms<input id="grind-gapmin" type="number" value="60000"></label>
-            <label class="grow">最大间隔 ms<input id="grind-gapmax" type="number" value="65000"></label>
-            <button id="grind-gap-recommend" class="ghost" title="按服务端出题冷却（实测 ≈60s/账号）填 60000~65000">填入推荐值</button>
+            <label class="grow">每轮最小间隔 ms<input id="grind-gapmin" type="number" value="0"></label>
+            <label class="grow">最大间隔 ms<input id="grind-gapmax" type="number" value="0"></label>
+            <button id="grind-gap-recommend" class="ghost" title="把刷局节奏填成惯用配置：每轮 0、答题 8~12s、出题重试 10s / 最长等 2 分钟、退避 10s×2">填入推荐值</button>
           </div>
 
           <div class="row">
-            <label class="grow">出题频控重试间隔 ms<input id="grind-mretry" type="number" value="3000"></label>
-            <label class="grow">出题最长等待 ms<input id="grind-mmax" type="number" value="240000"></label>
+            <label class="grow">出题频控重试间隔 ms<input id="grind-mretry" type="number" value="10000"></label>
+            <label class="grow">出题最长等待 ms<input id="grind-mmax" type="number" value="120000"></label>
           </div>
           <p class="muted small">
             出题撞频控（HTTP 400「请求过于频繁」）时会按上面的间隔自动重试，累计超过「最长等待」才判该轮失败。<br>
-            <b>服务端有约 60 秒的账号级出题冷却</b>（实测仍在），所以<b>建议把「每轮间隔」设成 60000 左右</b>
-            —— 这正是上面那个「填入推荐值」按钮做的事。<br>
-            引擎<b>不会强制</b>替你再加 60 秒：你设多少就按多少跑。设得比冷却小也不会卡死，
-            只是等待会挪到「出题频控重试」里（日志里会出现一串「出题被频控…自动重试」），
-            实际耗时反而更长。<br>
+            <b>服务端有约 60 秒的账号级出题冷却</b>（实测仍在）——
+            「每轮间隔」默认填 <b>0</b>，意为<b>不等</b>，改由「出题频控重试」在背景里蹲冷却。<br>
+            实际耗时由「<b>出题频控重试间隔 × 默认出发题轮数</b>」决定（默认 10s×最长 12 次左右），
+            比硬等 60s 短得多 —— 这正是上面那个「填入推荐值」按钮做的事。<br>
             <span class="muted">注：<b>刷练习没有这个冷却</b>（那边约 1 秒），两边的「每轮间隔」不要互相套用。</span>
           </p>
 
           <div class="row">
             <label class="grow">答题间隔最小 ms<em class="hint">出题后等多久再提交</em>
-              <input id="grind-delaymin" type="number" value="0" min="0"></label>
+              <input id="grind-delaymin" type="number" value="8000" min="0"></label>
             <label class="grow">答题间隔最大 ms<em class="hint">留 0 = 不等待</em>
-              <input id="grind-delaymax" type="number" value="0" min="0"></label>
+              <input id="grind-delaymax" type="number" value="12000" min="0"></label>
           </div>
 
           <div class="row">
-            <label class="grow">频控退避基数 ms<input id="grind-rlbase" type="number" value="60000"></label>
+            <label class="grow">频控退避基数 ms<input id="grind-rlbase" type="number" value="10000"></label>
             <label class="grow">最大退避次数<input id="grind-rlmax" type="number" value="2" min="0"></label>
           </div>
           <p class="muted small">任务之间<b>没有并行数量限制</b>（可同时挂任意多个任务，都会出现在「任务」页）；

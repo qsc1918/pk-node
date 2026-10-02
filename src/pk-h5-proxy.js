@@ -1,35 +1,6 @@
 'use strict';
-// 真·PK 页面（H5）服务端代理。
-//
-// ## 为什么要在 Node 里代理 H5，而不是直接用原版页面
-//
-// PK 的交互全在原版 H5 里（`leo.fbcontent.cn/bh5/leo-web-oral-pk/pk.html`）。
-// 但把它原样嵌进来有**两个跨域死结**：
-//
-//  1. **API 请求跨域**：H5 的 axios `baseURL = https://xyks.yuanfudao.com/`，
-//     从我们的页面发出去就是跨域 → 浏览器 CORS 直接拦掉。而正确请求还必须
-//     带 `sign` + 风控头（`x-shepherd-did` / `leo-client-trace-id` /
-//     `default-namespace-sw8`）+ `_productId=631&_appId=6` —— 这些是
-//     [leo.buildUrl] / [leo.riskHeaders] 的活，H5 自己不会加。
-//
-//  2. **无法注入 hook**：跨域 iframe 的 contentDocument 取不到，没法在
-//     H5 启动前改写它的请求层。
-//
-// 解法：**把 H5 整套（HTML + 它引用的资产）都代理到本机**，让 H5 与我们的
-// 页面**同源**。同源之后两件事都成立了：
-//  - 注入一段 `XMLHttpRequest` hook（见 [H5_INJECT]），把发往
-//    `xyks` / `xyst` 的请求**改写到本机 `/api/pk/h5/api`**；
-//  - Node 侧拿到改写后的请求，复用 [leo] 的签名/风控头/公共参数，用**该账号的
-//    cookie** 发真请求，再把响应（含 Set-Cookie 吸收）回给 H5。
-//
-// ## 资产来源与缓存
-//
-// 资产从 CDN（`leo.fbcontent.cn`）按需拉取并**内存缓存**，所以 H5 版本升级
-// 会自动跟随上游（我们只改写 HTML 里的 URL，不改写资产内容）。
-//
-// 资产 URL 形如 `https://leo.fbcontent.cn/bh5/leo-web-oral-pk/assets/xxx.js`，
-// 本机路径统一为 `/pk-h5/assets/xxx.js`；其它 CDN 目录（`leo-common-bundle`）
-// 走 `/pk-h5/<相对路径>`。
+// 真·PK 页面（H5）服务端代理：把 H5（HTML+资产）代理到本机同源，注入 XHR hook 改写请求，
+// 由 Node 用该账号 cookie 补签名/风控头/公共参数后转发。资产从 CDN 内存缓存。
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -51,18 +22,8 @@ const H5_BASE_PATH = '/bh5/leo-web-oral-pk';
 const LOCAL_PREFIX = '/pk-h5';
 
 /**
- * 允许被代理的 API host。
- *
- * ## 为什么是这几个（2026-09-29 由浏览器诊断实测得出）
- *
- *  - `xyks` —— 主域（PK：`/leo-game-pk/*`）
- *  - `xyst` —— solar 域（banner `/solar-activity/*`、配置中心）
- *  - `ape-api` —— 账号域（登录相关）
- *  - `oapi` —— 埋点/配置（`/orion-hubble-config/*`）
- *  - `ytk` —— **登录态查询**（`/accounts/api/current`）。
- *    这条最初漏了，导致 H5 判不出登录态 → 点 PK 没反应。
- *
- * 不在名单里的 host 会被 400 拒绝（见 [proxyApi]）。
+ * 允许被代理的 API host（不在名单里的会被 400 拒绝，见 [proxyApi]）。
+ * ytk 的 /accounts/api/current 是登录态查询，漏掉会导致 H5 判不出登录态。
  */
 const API_HOSTS = [
   'xyks.yuanfudao.com',
@@ -73,25 +34,8 @@ const API_HOSTS = [
 ];
 
 /**
- * 是否允许代理该 host。
- *
- * ## 为什么要通配（2026-09-30）
- *
- * 起初用的是**硬编码白名单**（xyks/xyst/ape-api/oapi/ytk）。但原版 H5 的各
- * 子页面会打**不同**的业务域，实测遇到过的有：
- *
- *   - `leo-homework/*`      → PK 榜（daily-practice/rank/info）
- *   - `leo-activity/*`      → 道具 / 背包
- *   - `leo-alchemy-account/*` → 好友 / 头像挂件
- *   - `leo-star/*`          → 胜率 / 任务
- *   - `leo-reward/*`        → 积分兑换
- *
- * 漏一个域 → 那个页面的数据请求**根本不走代理**（既没带 sign/公共参数，
- * 也不会被记进诊断日志）→ 页面「渲染出来但内容空白」。
- *
- * 所以改成通配：只要是 `*.yuanfudao.com`（含 .biz 测试域）就允许。
- * 安全性：代理只转发到这些自有域，且 host 由**我们注入的 hook** 写入，
- * 页面脚本无法借它访问任意第三方。
+ * 是否允许代理该 host：通配 *.yuanfudao.com（含 .biz）。
+ * 原版 H5 各子页面会打不同业务域，漏一个则该页数据请求不走代理 → 渲染空白。
  */
 function isAllowedHost(host) {
   const h = String(host || '').toLowerCase();
@@ -176,32 +120,13 @@ function normalizeContentType(ct, pathname) {
 /* ------------------------------ HTML 改写 ------------------------------ */
 
 /**
- * 要在 H5 之前注入的 hook 脚本。
- *
- * ## 它做什么
- *
- * H5 用 axios（基于 XMLHttpRequest）。这里在**所有脚本执行之前**包一层 XHR：
- *   - 只要请求的绝对/相对地址落在 `xyks.yuanfudao.com` / `xyst.yuanfudao.com` /
- *     `ape-api.yuanfudao.com`，就把 host 换成**本机同源**的 `/api/pk/h5/api`；
- *   - 原始目标 host 放进 `X-PK-Target` 头，Node 侧据此还原真实 URL；
- *   - `withCredentials` 打开时 cookie 同源自动带（我们自己就是同源）。
- *
- * 于是 H5 完全无感：它以为在发跨域请求，实际打到了本机代理，由 Node 补上
- * sign / 风控头 / 公共参数后转发。
- *
- * ## 为什么包 XHR 而不是 fetch
- *
- * H5 的 axios 适配器用的是 `XMLHttpRequest`（见 request-legacy 里的
- * `"adapter"` 函数体），不是 fetch。包 fetch 无效。
+ * 在 H5 脚本执行前注入的 hook：包一层 XMLHttpRequest，把落到名单 host 的请求改写成本机
+ * 同源 /api/pk/h5/api（原始 host 放入 X-PK-Target，Node 侧还原）。H5 的 axios 基于 XHR。
  */
 const H5_INJECT = `(function () {
   var TARGET_HOSTS = ['xyks.yuanfudao.com', 'xyst.yuanfudao.com', 'ape-api.yuanfudao.com', 'oapi.yuanfudao.com', 'ytk.yuanfudao.com'];
-  /* 允许代理的 host 判定（与 Node 侧 isAllowedHost 保持一致）。
-   *
-   * 原先是硬编码白名单，会漏掉各子页面的业务域（leo-homework / leo-activity
-   * / leo-alchemy-account / leo-star / leo-reward 等）→ 那些请求根本不走代理，
-   * 页面「渲染出来但内容空白」（PK 榜就是典型）。改成通配 *.yuanfudao.com。
-   */
+  /* 允许代理的 host 判定（与 Node 侧 isAllowedHost 一致）：通配 *.yuanfudao.com，
+     原版 H5 各子页面会打不同业务域（leo-homework/leo-activity/...），漏掉则空白。 */
   function pkIsAllowedHost(h) {
     var x = String(h || '').toLowerCase();
     if (!x) return false;
@@ -209,33 +134,11 @@ const H5_INJECT = `(function () {
     return /\.yuanfudao\.(com|biz)$/.test(x);
   }
   var LOCAL = '/api/pk/h5/api';
-  // 稳定的伪设备 id：同一会话内必须一致，否则 H5 会反复重渲染（表现是界面抖/闪）。
+  // 稳定的伪设备 id：同一会话内必须一致，否则 H5 反复重渲染（界面抖/闪）。
   var DEVICE_ID = 'pknode-' + Math.random().toString(36).slice(2, 10);
 
-  /* ---- 伪装成小猿 App 的 WebView UA（2026-09-30）----
-   *
-   * H5 用 UA 判断「是不是在 App 里」，而这个判断决定了**大量入口是否渲染**：
-   *
-   *   Utils-legacy:
-   *     ct = () => UA 含 "YuanSouTiKouSuan"
-   *     st = () => UA 含 "YuanSouTi"
-   *   pk-legacy（8 人 PK 按钮）:
-   *     O = isLogin && (ct() || st())        // ← 不满足则整个按钮不渲染
-   *   pk-legacy（巅峰赛入口）:
-   *     D = isLogin && ct() && ...
-   *   useHomeModel:
-   *     v() = isAppUA → 影响大量 App-only 分支
-   *
-   * 真机 WebView 的 UA 末尾会追加 App 标识，例如：
-   *     ... Safari/537.36 YuanSouTiKouSuan/3.141.1
-   * 我们跑在普通浏览器里没有这个后缀 → 「8人PK」「巅峰赛」等入口全都不出现。
-   *
-   * 这里在 H5 脚本执行**之前**改写 navigator.userAgent（追加后缀）。
-   * 只追加、不替换，保留原有 Android/Chrome 信息，避免其它 UA 检测失效。
-   *
-   * ⚠️ 副作用：productId 计算会从兜底 131 变成 611，但我们已在代理侧强制
-   *    _productId=631（pk-node 的 PK 端点硬要求），所以不受影响。
-   */
+  /* 伪装成小猿 App 的 WebView UA：H5 靠 UA 是否含 "YuanSouTiKouSuan" 判断是否 App 内，
+     决定 8人PK/巅峰赛等入口是否渲染。只追加不替换。 */
   (function patchUserAgent() {
     try {
       var SUFFIX = ' YuanSouTiKouSuan/3.141.1';
@@ -255,24 +158,8 @@ const H5_INJECT = `(function () {
     } catch (e) { diag('ua-patch-err', { msg: String(e && e.message) }); }
   })();
 
-  /* ---- 预置 H5 的 localStorage 标记：跳过「新手引导」遮罩 ---- */
-  //
-  // ## 为什么必须做（2026-09-29 由页面快照诊断确证）
-  //
-  // useHomeModel 首屏执行：
-  //     w.value = !s.getItem('oral-pk-guide')     // showGuide = 取反
-  // 而 StorageUtil 实际读写的是 localStorage 的 __local_<key>（Base64 编码值）。
-  //
-  // 首次打开时该键不存在 → showGuide = true → **弹出一层全屏新手引导浮层**，
-  // 把「开始PK / PK榜 / 好友挑战」全盖住 → 用户点击全部落在遮罩上 → 「点了没反应」。
-  //
-  // 快照诊断的原始证据（diag snapshot）：
-  //     guide: "dHJ1ZQ=="            ← Base64("true")，即引导标记为空 / 放行
-  //     overlays: ["pk 364x471", "content 364x471", ...]   ← 全屏层压在按钮上
-  //     clickable: ["开始PK [pk-btn]", "PK榜 [rank]", ...]  ← 按钮本身是存在的
-  //
-  // 这里在 H5 脚本执行前把标记写进去（值按 StorageUtil 的格式做 Base64），
-  // 于是 showGuide = false，浮层不弹，按钮可点。
+  /* 预置 H5 localStorage 标记（Base64 格式），跳过「新手引导」全屏遮罩
+     （oral-pk-guide 缺省时浮层会盖住按钮导致点了没反应）。 */
   (function presetStorage() {
     try {
       var M = window.__PK_STORAGE_PRESET || {};
@@ -285,18 +172,8 @@ const H5_INJECT = `(function () {
     } catch (e) { diag('storage-preset-err', { msg: String(e && e.message) }); }
   })();
 
-  /* ---- 最小 Buffer polyfill（关键，2026-09-30）----
-   *
-   * H5 自己的**回调解析器**是 Node 风格写法：
-   *     pt = t => new Buffer(t, 'base64').toString()
-   * 真机 WebView 里有 Buffer polyfill，浏览器里**没有** →
-   *     bridge-reply-err: "Buffer is not defined"
-   * → 桥回调直接抛错 → H5 侧 Promise 永远不 resolve → 下级页面完全哑掉
-   *   （日志里 getWebViewInfo 的回调就报这个错）。
-   *
-   * 这里只实现 H5 实际用到的部分：base64 解码 + toString()。
-   * 只在全局缺失时定义，不覆盖 H5 自己可能加载的 polyfill。
-   */
+  /* 最小 Buffer polyfill：H5 回调解析器用 new Buffer(t,'base64').toString()，浏览器无 Buffer
+     → 抛错、Promise 永不 resolve。仅实现 base64 解码 + toString()。 */
   (function installBuffer() {
     if (typeof window.Buffer !== 'undefined') { diag('buffer-ready', { existed: true }); return; }
     function mk(bytes) {
@@ -337,13 +214,7 @@ const H5_INJECT = `(function () {
     diag('buffer-ready', { existed: false });
   })();
 
-  /* ---- 点击链路诊断：定位「点了有反馈但不跳转」到底断在哪一环 ---- */
-  //
-  // 2026-09-29：用户报「点按钮有反馈但不跳转」。已知 API 全 200、桥已挂载，
-  // 但日志里**没有 openWebView / schema-other** → 断点在「点击 → 桥调用」之间。
-  //
-  // 这里在 document 上用**捕获阶段**监听全部 click（这样能先于 Vue 的处理跑），
-  // 把命中的元素文案/class 回传；同时监听 hashchange（H5 是 SPA，跳转必然是 hash）。
+  /* 点击链路诊断：捕获阶段监听 click + hashchange，定位「点了有反馈但不跳转」断点。 */
   (function installClickDiag() {
     try {
       document.addEventListener('click', function (ev) {
@@ -406,58 +277,12 @@ const H5_INJECT = `(function () {
     });
   });
 
-  /* ==================== 原生桥模拟（关键！） ====================
-   *
-   * ## 为什么必须有这一段（2026-09-29「点 PK 没反应」的真因）
-   *
-   * PK H5 的**所有跳转**都不是页面内跳转，而是让原生开新 WebView：
-   *
-   *   useNavigation-legacy.js:
-   *     gotoPkExercisePage / gotoSchoolSeasonMatchPage / gotoPkResultPage …
-   *     -> n({ schemas: ['native://openWebView?url=...&keepScreenOn=true...'] })
-   *
-   * 这个 n 就是桥调用器（index-legacy.CHYoHfC0.js 里的 Lt），它的检测链：
-   *
-   *   const St = window;
-   *   const g = (module ? 首字母大写(module) : '') + 'WebView';  // common -> CommonWebView
-   *   if (St[g] && St[g][method])  -> St[g][method](json)         // App 里走这条
-   *   else if (St.LeoWebView && St.LeoWebView.callNative) -> callNative(...)
-   *   else -> 用隐藏 iframe 发 async:<module>_<method>:<json>    // 浏览器落到这里，无人接收
-   *
-   * 浏览器里 CommonWebView / LeoWebView 都不存在 -> 走 iframe 兜底 -> 没有原生
-   * 去处理 -> **点了完全没反应**。
-   *
-   * 所以这里把桥补上，并把 native://openWebView 转成**真实跳转**：
-   * H5 的每张页面都是独立 html（exercise.html / result.html / …），
-   * 所以「开新 WebView」在本机等价于**iframe 内导航到该 url**。
-   */
-  /* ==================== 原生桥模拟（关键） ==================== */
+  /* 原生桥模拟：PK H5 的跳转都让原生开新 WebView（native://openWebView?url=…），浏览器里
+     CommonWebView/LeoWebView 不存在 → 点了没反应。故补桥，并转为同窗口导航。 */
   (function installBridge() {
-    /* ---- H5 桥协议（逐行读 index-legacy.CHYoHfC0.js 得出，2026-09-29）----
-     *
-     * 调用（两条路径，payload 都是 base64）：
-     *   A) window.CommonWebView.<method>(payloadB64)
-     *   B) window.LeoWebView.callNative(payloadB64)      payload = {method:'common_xxx', params:{...}}
-     *
-     *   payload 解开后形如：
-     *     { arguments: [ { trigger: 'getWebViewInfo_<ts>_<n>', ...业务参数 } ],
-     *       callback:  '<method>_callback_<ts>_<n>' }
-     *
-     *   —— H5 传 trigger 时**不会**注册 callback（源码里 d = !(i||a) && u），
-     *      所以必须用 trigger 当回调方法名。
-     *
-     * 回调（关键，之前就是这里写错了）：
-     *     window[<trigger 或 callback>]( base64( JSON.stringify([err, ...data]) ) )
-     *     err === null 表示成功。
-     *
-     *   源码依据：
-     *     Nt = window
-     *     Nt[t] = function (t) { e.apply(null, t ? JSON.parse(pt(t)) : [null]) }
-     *     pt = t => new Buffer(t, 'base64').toString()
-     *
-     *   ★ 旧实现直接 cb(JSON.stringify(out)) —— 既没走 window[trigger]、
-     *     也不是 base64，所以 Promise 永不 resolve → 点击静默无反应。
-     */
+    /* 桥协议（payload 为 base64）：window.CommonWebView.<method>(b64) 或
+       window.LeoWebView.callNative(b64)。回调形态 window[<trigger|callback>](base64([err,...data]))，
+       err===null 为成功；H5 传 trigger 时不注册 callback，须用 trigger 当回调名。 */
     function b64decode(s) {
       var t = String(s).replace(/-/g, '+').replace(/_/g, '/').replace(/[^A-Za-z0-9+/=]/g, '');
       try { return decodeURIComponent(escape(atob(t))); }
@@ -487,38 +312,8 @@ const H5_INJECT = `(function () {
     }
 
     /**
-     * ★★ 不能回调 trigger 的桥方法（setter 语义）—— 2026-09-30 的关键真 bug。
-     *
-     * ## 为什么（排行榜「打开又自己退回」的根因）
-     *
-     * H5 的 trigger 字段有**两种语义**：
-     *
-     *  1. **查询类**（getUserInfo / getWebViewInfo / requestConfig …）
-     *     trigger 是「回执回调」：页面注册 window[trigger]，
-     *     我们必须 unshift 结果把 Promise resolve 掉。
-     *
-     *  2. **setter 类**（setLeftButton / setOnVisibilityChange / refreshStateView …）
-     *     trigger 是**事件处理器**，页面把它**登记**进原生侧，
-     *     等用户**真正按下**时才回调。我们若在登记时立刻回调，
-     *     等于**替用户按下了这个键**！
-     *
-     * 实测证据（motivation-honor-roll 荣誉榜，2026-09-30）：
-     *
-     *     // 页面代码
-     *     f = () => {
-     *       m.postMessage({eventName:'exercise_motivation_back_pk', ...});
-     *       s();                      // s() = closeWebView()
-     *     };
-     *     setLeftButton({ trigger: () => { f() } });   // 返回键处理器
-     *
-     *     // 我们的日志（间隔 2ms，页面加载 4ms 后）
-     *     341994 setLeftButton    cb=setLeftButton_..._24
-     *     341996 sendEventToNative exercise_motivation_back_pk   ← 「返回键被按下」
-     *     341996 closeWebView      → 'OK'
-     *
-     * → 页面一打开就自己关闭，用户看到的就是「排行榜打开又退回 PK 主页」。
-     *
-     * 所以这些方法**只回复执、不动 trigger**。
+     * 不能回调 trigger 的桥方法（setter 语义）：其 trigger 是「事件处理器」，登记后等用户
+     * 真正操作才回调，登记时立即回调等于替用户按键。这些方法只回复执（obj.callback）。
      */
     var NO_TRIGGER_METHODS = {
       setLeftButton: 1,
@@ -526,19 +321,12 @@ const H5_INJECT = `(function () {
       refreshStateView: 1,
       setForceBounceEnable: 1,
       observeTabChange: 1,
-      // ★ 2026-09-30：ShowPracticeDialogIfNeeded 移到 HANDLERS（它其实是**查询**，
-      //   H5 要读 {dialogNeedToShow}），故从此处移除。
-      // setOnInteractivePopped：trigger 是「原生稍后回调」的一次性处理器，
-      //   登记时回调 = 立刻触发融合打卡 → 页面乱跳。只登记。
+      // setOnInteractivePopped：trigger 是原生稍后回调的一次性处理器，只登记不回调（避免立即触发融合打卡致页面乱跳）。
       setOnInteractivePopped: 1,
     };
 
-    /** 把结果按 H5 的协议回给页面：window[cbName](base64([err, ...data]))。
-     *
-     *  - p.cbName 为空 → 无事可做（有些方法 H5 不传回调）。
-     *  - p.skipTrigger 为真 → **只回复执**（obj.callback），
-     *    绝不触碰 trigger（见 NO_TRIGGER_METHODS 的说明）。
-     */
+    /** 把结果按协议回给页面：window[cbName](base64([err, ...data]))。
+     *  p.skipTrigger 为真时只回复执（obj.callback），不触碰 trigger。 */
     function reply(p, out) {
       var s = b64encode(JSON.stringify(out));
       // ① 回执回调：H5 用 payload.callback 指定（有才回）
@@ -577,35 +365,14 @@ const H5_INJECT = `(function () {
           }
           if (target) {
             var local = addLeoId(toLocalH5(target));
-            // ★★ 2026-09-30 重大修正（推翻 ebc0451 的错误）：**绝不往 result.html 注入 isFromHistory**。
-            //
-            //  结算页 Result-legacy.loadData(he) 有两条分支：
-            //    ① ve()=B.search().isFromHistory 为真 → 这是「查看历史战绩」：
-            //         getPkExerciseResult(pkIdStr) → GET math/pk/history/detail
-            //         只填 examVO，correctCnt/selfWinCount/costTime **硬编码 0**
-            //         ★ 且此分支**完全不提交**（既不读 localStorage，也不 PUT submit）
-            //    ② 为假 → 这是「真机打完一局的结算」：
-            //         Kt(3,1000) 读 localStorage 'exerciseResult'（对局页 saveLocalResult 写的）
-            //         → se(o) = postPkExerciseResult → **PUT /math/pk/submit（这才是提交！）**
-            //         → 成功后 Zt() 清 localStorage、写入页面
-            //
-            //  真机对局结束跳转 = useNavigation f()，URL **不带** isFromHistory。
-            //  只有「查看历史战绩」I() 才带 isFromHistory=true。
-            //
-            //  我 ebc0451 自作聪明给所有 result.html 补了 isFromHistory=true →
-            //  结算页永远走分支① → 提交被彻底跳过 → 「局数不增加」。
-            //  这里必须保持原样，不做任何注入。
+            // 绝不往 result.html 注入 isFromHistory：结算页靠它区分「看历史」（不提交）与
+            // 「真机结算」（PUT /math/pk/submit），误注入 =true 会导致提交被跳过。
             if (local.indexOf('result.html') >= 0 && local.indexOf('isFromHistory') < 0) {
               diag('result-no-history', { local: local.slice(0, 160) });
             }
             diag('openWebView', { url: target.slice(0, 300), local: local.slice(0, 300) });
-            // 本机把「开新 WebView」实现为同窗口导航（H5 每页都是独立 html）。
-            //
-            // ★ 2026-09-30：置「刚开过 WebView」标记。
-            //   真机上 openWebView 打开新页后，调用方常紧接着 closeWebView 关掉**自己**
-            //   （即用新页替换旧页）。但我们这里是同窗口导航 —— 一导航旧页就没了，
-            //   再来一个 closeWebView 的 history.back() 会把**刚打开的页面顶掉**
-            //   （用户看到的「答完题直接返回主界面」）。故此处标记，供 closeWebView 判断。
+            // 本机把「开新 WebView」实现为同窗口导航。置「刚开过 WebView」标记：
+            // 真机 openWebView 后常紧接着 closeWebView 关自己，同窗口下会 history.back() 误伤新页。
             pkJustOpenedWebView = Date.now();
             location.href = local;
             return 'OK';
@@ -619,31 +386,15 @@ const H5_INJECT = `(function () {
       return 'OK';
     }
 
-    /** 给同源地址补上 leoAccountId（下级页靠它找账号，缺了就 404「账号不存在」）。
-     *
-     *  ★ 2026-09-30：这是「下级页匹配不了」的根因。
-     *    H5 自己拼的跳转 URL 只带业务参数：
-     *      /bh5/leo-web-oral-pk/exercise.html?pointId=22&isFromInvite=undefined&jumpTime=...
-     *    我们自己注入的 leoAccountId 只存在于**上一页**的 URL 上，跳转就丢了 → 下级页
-     *    所有 API 都 404「账号不存在」（日志里 match/v2 重试了 380 次）。
-     *
-     *    所以跳转前把账号补回去（放在 ? 之后、# 之前，避免破坏 hash 路由）。
-     */
+    /** 给同源地址补上 leoAccountId（下级页靠它找账号，缺了 404）。跳转前补回，
+     *  放在 ? 之后、# 之前以免破坏 hash 路由。 */
     function addLeoId(u) {
       var id = window.__PK_LEO_ID || '';
       if (!u) return u;
       var add = [];
       if (id && u.indexOf('leoAccountId=') < 0) add.push('leoAccountId=' + encodeURIComponent(id));
-      // ★★ 2026-10-01 真 bug：「自动能力」在子页面统统失效的根因。
-      //
-      //  ?pkbot= 只挂在**入口页**（pk.html）的 URL 上。H5 跳到 exercise.html /
-      //  result.html 时是自己拼 URL 的（只带业务参数），addLeoId 又只补
-      //  leoAccountId —— 于是子页面 pkBotCfg() 读不到 URL、localStorage 里也没存过，
-      //  三个开关**全部回到默认「关」**：
-      //     · recognize 桥回 ''      → 手写识别永远判错（「写了正确符号也没用」）
-      //     · autoStroke 不跑        → 没有人自动交笔
-      //     · autoNext 不跑          → 结算页不会自己开下一局
-      //  修法两条（互为保险）：① 跳转时把 pkbot 带上；② pkBotCfg 读到就写进 localStorage。
+      // ?pkbot= 只挂在入口页 URL，H5 跳到 exercise/result 时自拼 URL 不带 → 开关全回「关」，
+      // 故跳转时一并带上。
       if (u.indexOf('pkbot=') < 0) add.push('pkbot=' + encodeURIComponent(pkBotCurrentRaw()));
       if (!add.length) return u;
       var hashIdx = u.indexOf('#');
@@ -653,32 +404,15 @@ const H5_INJECT = `(function () {
       return base + sep + add.join('&') + hash;
     }
 
-    /** 把任意外部 H5 地址折成本机同源地址（否则下级页面没有 hook 与桥）。
-     *
-     *  ★ 2026-09-30：这是「进入下级页面后没反应」的根因。
-     *    H5 的跳转目标是 https://xyks.yuanfudao.com/bh5/leo-web-oral-pk/exercise.html
-     *    —— 直接跳过去就脱离了本机代理，那边没有注入 → 整页哑掉。
-     *
-     *  规则（与 rewriteHtml 的同源化保持一致）：
-     *    <任意源>/bh5/<目录>/<页面>            -> /pk-h5-cdn/<目录>/<页面>
-     *    https://leo.fbcontent.cn/bh5/leo-web-oral-pk/<x> -> /pk-h5/<x>
-     *    同源地址（已是本机）                    -> 原样
-     *    data:/blob:/javascript:                -> 原样
-     */
+    /** 把任意外部 H5 地址折成本机同源地址（否则下级页没有 hook 与桥）。
+     *  <任意源>/bh5/<目录>/<页面> → /pk-h5-cdn/<目录>/<页面>；主目录 → /pk-h5/<x>。 */
     function toLocalH5(url) {
       var u = String(url || '');
       if (!u) return u;
       var low = u.toLowerCase();
       if (low.indexOf('data:') === 0 || low.indexOf('blob:') === 0 ||
           low.indexOf('javascript:') === 0) return u;
-      // 已经是本机同源 —— ★ 但仍需归一化 /bh5/ 前缀！
-      //
-      // ★★ 2026-09-30 真 bug（用户实测「好友挑战显示未提供」）：
-      //   pk-legacy 里有些入口直接拼 location.origin + '/bh5/leo-web-oral-pk/xxx.html'
-      //   （见 pk-legacy 的 gotoSimpleInvitePage / english-words 等），
-      //   URL 已经是本机 origin，于是走这条 early-return。
-      //   但本机**没有** /bh5/ 路由 → 404「未提供」。
-      //   正解：把同源的 /bh5/<任意目录>/ 也归一到 /pk-h5-cdn/<目录>/。
+      // 同源 /bh5/<目录>/ 也归一到 /pk-h5-cdn/<目录>/（本机无 /bh5/ 路由）。
       if (u.indexOf(location.origin) === 0) {
         var samePath = u.slice(location.origin.length);
         var bhp2 = '/bh5/';
@@ -709,18 +443,8 @@ const H5_INJECT = `(function () {
     }
 
     /** 把密文交给 Node 侧解密（浏览器里没有 keystream）。
-     *
-     * ★★ 2026-09-30：这是「PK 一直匹配中」的真正最后一层。
-     *
-     * H5 的响应拦截器（exercise-legacy 的 u / l 函数）对 arraybuffer 响应：
-     *     r = btoa(String.fromCharCode.apply(null, new Uint8Array(resp)));
-     *     l(r)  →  桥 LeoSecure.dataDecrypt({base64: r, trigger:(err, res) => {
-     *                  resolve(JSON.parse(Base64.decode(res.result))) })}
-     * 即：**H5 自己会解密**，只是解密要调原生桥。
-     *
-     * 所以桥必须实现 dataDecrypt：把密文 POST 给 /api/pk/h5/decrypt，
-     * 拿回明文 JSON 的 base64，再按协议回调。
-     */
+     *  H5 响应拦截器对 arraybuffer 响应会调桥 LeoSecure.dataDecrypt 自行解密，
+     *  故桥把密文 POST 给 /api/pk/h5/decrypt 拿回明文 JSON 的 base64，再按协议回调。 */
     function nodeDecrypt(b64) {
       return new Promise(function (resolve) {
         try {
@@ -737,12 +461,8 @@ const H5_INJECT = `(function () {
         } catch (e) { resolve(null); }
       });
     }
-    /** 把明文交给 Node 侧加密（浏览器里没有 keystream）。
-     *
-     *  ★ 2026-09-30：dataEncrypt 桥用 —— 这是「局数不增加」的正解。
-     *  加密 = gzip(level6,mtime0) + keystream XOR（见 src/native.js encodeSubmitBody），
-     *  与真机 libContentEncoder 逐字节一致（本项目已在刷分链路验证过）。
-     */
+    /** 把明文交给 Node 侧加密（浏览器无 keystream）。加密 = gzip + keystream XOR
+     *  （见 src/native.js encodeSubmitBody）。 */
     function nodeEncrypt(b64) {
       return new Promise(function (resolve) {
         try {
@@ -767,15 +487,7 @@ const H5_INJECT = `(function () {
       'leoShowPreschool': 'false',
       // useNavigation：对局页用 oral-merge.html(true) 还是 exercise.html(false)。
       'leoOralPKExerciseUseMerge': 'false',
-// ★★ 2026-09-30 重要修正（用户实测「结算页点返回就直接继续PK」）：
-        //  inUse 是**融合荣誉榜开关**，useMotivation.exerciseMotivation = content.inUse。
-        //  而 Result-legacy 的「返回」按钮：
-        //      ht = () => c.value||u() ? (M.value ? onBackClick
-        //                                : F.value ? toFusionClockIn()   // ← F=exerciseMotivation
-        //                                : T())
-        //                              : (c.value = true)
-        //  所以 inUse=true 会让「返回」变成「继续 PK 打卡流程」而不是返回！
-        //  真机常规（非融合）环境该值是 false。
+        // 融合荣誉榜开关：inUse=true 会让结算页「返回」变「继续 PK 打卡」而非返回，真机常规环境为 false。
         'leo.fusion.honor.ranking.config': { content: { inUse: false } },
       // pk-legacy：校园赛季入口 → e.content.enable
       'leo.oral.pk.schoolSeason.entry': { content: { enable: false } },
@@ -800,16 +512,8 @@ const H5_INJECT = `(function () {
       // 两条都接住，避免漏一种写法。
       openWebView: function (args) { return handleOpenSchema({ schemas: ['native://openWebView?' + (args && args.url ? 'url=' + encodeURIComponent(args.url) : '')] }); },
       closeWebView: function () {
-        // ★ 2026-09-30：「答完题直接返回主界面」的真凶。
-        //
-        //  真机语义：openWebView 打开新 WebView 后，调用方常紧接着 closeWebView
-        //  关掉**调用方自己**（即「用新页替换旧页」，新页仍在）。
-        //
-        //  我们这里是**同窗口导航**：openWebView 已经用 location.href 顶掉了旧页，
-        //  旧页的 closeWebView 属于「已被替换者发来的迟到消息 → 本该丢弃」。
-        //  以前一律 history.back() → 把**刚打开的结算页顶掉** → 退到主 PK 页。
-        //
-        //  规则：若 3 秒内刚 openWebView（导航）过，则忽略本页的 closeWebView。
+        // 同窗口导航下，旧页的 closeWebView 是「已被替换者发来的迟到消息」本该丢弃；
+        // 否则 history.back() 会把刚打开的结算页顶掉 → 答完题返回主界面。故 3 秒内刚 openWebView 则忽略。
         if (Date.now() - pkJustOpenedWebView < 3000) {
           diag('closeWebView-ignored', { sinceOpenMs: Date.now() - pkJustOpenedWebView });
           return 'OK';
@@ -826,58 +530,17 @@ const H5_INJECT = `(function () {
       jsLoadComplete: function () { return 'OK'; },
       getImmerseStatusBarHeight: function () { return 0; },
       getDeviceInfo: function () { return { platform: 'android', appVersion: BRIDGE_VERSION }; },
-      // H5 头像 / 胜场 / 昵称的**首选来源**就是这里。
-      // 不实现的话 H5 只能等服务端接口兜底 —— 表现就是
-      // 「头像要切换年级后才显示、胜场显示 0」。数据由 Node 侧注入 window.__PK_USER。
-      //
-      // ★★ 2026-09-30：这里就是「isLogin 永远为 false → 无限刷新」的根因！
-      //
-      // H5 的登录态判定链（index-legacy.CHYoHfC0.js 的 r("i", ...)）：
-      //     $t("getUserInfo", {V1:Gt, validParams:{params:{trigger:true}}})
-      //     n = r[0]                 // ← 桥返回数组的第一个元素
-      //     at("webviewLogin", n)    // ← 写进 store
-      //     ...
-      //     return n
-      // 而 useHomeModel 的 isLogin 就是 setter v = e.i（即这个函数）的执行结果。
-      // 返回 {} 时 isLogin 恒为 false。
-      //
-      // 后果（pk-legacy 里三个入口都有这段）：
-      //     if (!isLogin && !unloginPkEnable) {
-      //       await dialog({ loginTitle: "登录后开始PK" });
-      //       window.location.reload();      // ← 死循环，页面一直刷新
-      //       return;
-      //     }
-      //
-      // 所以必须返回**真实的** userId（非 0 即视为已登录）。
-      // 数据由 Node 侧注入 window.__PK_USER（见 server.js 的 /pk-h5 分支）。
+      // H5 头像/胜场/昵称首选来源；必须返回真实 userId，否则 isLogin 恒 false →
+      // pk-legacy 弹「登录后开始PK」并 location.reload() 死循环。数据由 Node 注入 window.__PK_USER。
       getUserInfo: function () { return window.__PK_USER || {}; },
-      /* ★★ 2026-09-30：getBasicInfo —— 桥调用器里的 r("B")（index-legacy.CHYoHfC0）。
-       *
-       * H5 调 Zt("getBasicInfo", {trigger})，未实现时会走 callNative 兜底 → 回
-       * undefined → await 到 undefined 可能让初始化提前结束（页面停「0 胜 / 胜率 0%」）。
-       * 契约：resolve 出基础信息对象，字段未被硬依赖，回对象即可。
-       */
+      /* getBasicInfo（桥调用器里的 r("B")）：未实现会走 callNative 兜底回 undefined →
+         初始化提前结束（页面停「0 胜 / 胜率 0%」）。回基础信息对象即可。 */
       getBasicInfo: function () {
         var u = window.__PK_USER || {};
         return { userId: u.userId || 0, gradeId: u.gradeId || 0 };
       },
-      /* ★★ 2026-09-30：补齐两个「练习入口」必需的能力桥。
-       *
-       *  现象：H5 主页面登录态拿不到、练习/好友 PK 进不去。
-       *  日志实证：bridge-miss leo/getExerciseInfo → H5 reject(METHOD_NOT_SUPPORT)。
-       *
-       *  契约（读 oral-pk-legacy.CoJN1ZvA.js 得到）：
-       *    w() = new Promise((resolve, reject) => {
-       *      p() ? 走接口 : callNative('getExerciseInfo', {
-       *        trigger: (err, r) => err ? reject(err) : resolve(r) }, 'leo')
-       *    })
-       *    // 期望 r = { exerciseGradeId, exerciseSemesterId }
-       *    //   调用方 b(): r.exerciseGradeId 用作 grade
-       *  另一处（useUserInfo-legacy）：能力 >= 3.81.0 时调
-       *    leo/getExerciseConfig → 期望 { grade, semester, bookMath, bookChinese, bookEnglish }
-       *
-       *  两者都返回当前账号的真实年级（来自 window.__PK_USER.gradeId / window.__PK_GRADE）。
-       */
+      /* 练习入口能力桥：getExerciseInfo 回 {exerciseGradeId, exerciseSemesterId}；
+         getExerciseConfig 回 {grade, semester, bookMath, bookChinese, bookEnglish}。 */
       getExerciseInfo: function () {
         var g = Number(window.__PK_GRADE || (window.__PK_USER && window.__PK_USER.gradeId) || 0) || 1;
         diag('getExerciseInfo', { grade: g });
@@ -889,31 +552,9 @@ const H5_INJECT = `(function () {
         return { grade: g, semester: 1, bookMath: 1, bookChinese: 4, bookEnglish: 10 };
       },
 
-      /* ★★ dataDecrypt（LeoSecure）—— 2026-09-30：「PK 一直匹配中」的最后一层
-       *
-       * H5 的响应拦截器（exercise-legacy 的 u / l）对 arraybuffer 响应会：
-       *   btoa(Uint8Array(resp)) → 调桥 dataDecrypt({base64, trigger})
-       *     → 拿到 res.result（base64 的明文 JSON）→ JSON.parse
-       * 而浏览器里**没有 keystream**（密钥在 Android so 里），所以桥必须
-       * 把密文转发给 Node 侧解（/api/pk/h5/decrypt，keystream XOR + gunzip）。
-       *
-       * 之前没实现这个桥 → bridge-miss → Promise 永久挂起 → 界面永远「匹配中」。
-       */
-      /* ★★ 手写识别（MathExercise.recognize）—— 2026-09-30：「写完不识别」的真因
-       *
-       * 契约（useRecognizeBoard-legacy）：
-       *   f('recognize', { strokes, keypointId, expectedResult, startTime, trigger }, 'MathExercise')
-       *   trigger(err, result) → err ? reject : resolve(result)
-       *   rt(result) → { recognizeResult: result, pathPoints, answer: dt(result) }
-       *   dt = t => answers.includes(t) ? 1 : 0
-       *
-       * 即：桥要回一个**识别出的答案字符串**，H5 再拿它跟期望答案比对。
-       * 我们本地没有手写 OCR，所以直接回 expectedResult 的首项 ——
-       * H5 的 includes 必然命中，判定为答对，继续往下走。
-       *
-       * 注：真实 App 里这一步是原生识别（离线模型），我们无法复现；
-       * 返回期望答案可以让流程跑通（本项目的目标就是自动作答）。
-       */
+      /* dataDecrypt（LeoSecure）：H5 对 arraybuffer 调本桥解密，浏览器无 keystream，转发 Node
+         /api/pk/h5/decrypt。不实现则 Promise 永久挂起 → 界面永远「匹配中」。 */
+      /* recognize：本地无手写 OCR，直接回 expectedResult 首项（H5 includes 命中 → 判对）。 */
       recognize: function (a) {
         var exp = (a && a.expectedResult) || [];
         // 受面板「视为正确答案」开关控制（关掉就回空，等于不自动作答）。
@@ -948,26 +589,9 @@ const H5_INJECT = `(function () {
           return { __pkOut: [null, { result: plainB64 }] };
         });
       },
-      /* ★★ dataEncrypt（LeoSecure）—— 2026-09-30：「局数不增加」的真因
-       *
-       *  对局结束 → H5 提交：
-       *    exercise-legacy C.postPkExerciseResult = n(t).then(t => a.put('/leo-game-pk/{client}/math/pk/submit',
-       *        t, { headers: { 'content-type': 'application/octet-stream' } }))
-       *    n = 把明文对象 → dataEncrypt 桥 → octet-stream 字节。
-       *
-       *  我曾把它写成空实现，于是：
-       *    桥返回空 → H5 判定 encrypt data fail（/debug/oralPK/dataEncryptFailed）
-       *    → **放弃提交** → 服务端没有本局记录 → 局数/胜场永远不涨。
-       *
-       *  真机契约（exercise-legacy 里读到）：
-       *    i('dataEncrypt', { base64: Base64.encode(JSON.stringify(e)), trigger:(i,c) => {
-       *        c && c.result ? resolve(Uint8Array(c.result)) : reject(Error('encrypt data fail'))
-       *    } }, 'LeoSecure')
-       *    → 桥回 { result: <加密字节> }，H5 用 Uint8Array(result) 当 body。
-       *
-       *  加密 = gzip(level6,mtime0) + keystream XOR（见 src/native.js encodeSubmitBody），
-       *  浏览器里没有 keystream，所以转发给 Node：POST /api/pk/h5/encrypt。
-       */
+      /* dataEncrypt（LeoSecure）：提交对局结果前 H5 把明文交本桥加密，回 { result: <加密字节> }，
+         H5 用 Uint8Array(result) 当 body。空实现会导致 H5 判「encrypt data fail」而放弃提交
+         → 局数/胜场不涨。加密 = gzip + keystream XOR，转发 Node 的 /api/pk/h5/encrypt。 */
       dataEncrypt: function (a) {
         var b64 = (a && a.base64) || '';
         return nodeEncrypt(b64).then(function (cipherB64) {
@@ -977,24 +601,9 @@ const H5_INJECT = `(function () {
         });
       },
       login: function () { return 'OK'; },
-      // octopus 埋点 SDK 的配置读取。
-      // ★ 键名必须是 method 本身：日志实测 H5 调的是 module=leo / method=getOrionConfig
-      //   （payload.method = "leo_getOrionConfig"，由 callNative 拆成 module + method）。
-      //   之前误写成 leo_getOrionConfig，导致 18 条 bridge-miss。
-      /* ★★ 功能开关配置表（feature flag / orion key）—— 2026-09-30
-       *
-       * 背景（读 feature-legacy.C2Nasqum.js 全文得到）：
-       *   feature(key, default) 取值优先级：
-       *     ① 原生桥 getFeatureConfig('leo')（能力 version >= 3.36.0）  ← 真机走这条
-       *     ② HTTP POST {ORION_HOST}/orion-config-center/api/feature-config {bizKey}
-       *        .catch(() => default)   ← 出错一律降级为默认值
-       *
-       * 实测：xyst / oapi / xyks 三家的 orion 端点**全部 404** →
-       *   在我们环境里所有开关都会降级 → 入口/控件异常。
-       *
-       * 所以桥必须**直接给正确形态的值**，让 H5 走 ① 分支。
-       * 值形态来自各调用点（逐处读代码得到，勿凭感觉改）：
-       */
+      // 键名必须是 method 本身（H5 经 callNative 拆出 module+method，如 leo_getOrionConfig）。
+      /* 功能开关：H5 的 feature() 优先走本桥，否则 HTTP orion 端点（全 404 → 降级默认，入口异常）。
+         故直接回正确形态的值（形态来自各调用点，勿凭感觉改）。 */
       getOrionConfig: function (a) {
         return featureValue(a && (a.orionKey || a.featureKey || a.key));
       },
@@ -1005,19 +614,8 @@ const H5_INJECT = `(function () {
         return featureValue(a && (a.orionKey || a.featureKey || a.key));
       },
 
-      // ★★ requestConfig（LeoSecure 模块）—— 2026-09-30 的又一个真 bug
-      //
-      // H5 的 URL 模板替换器（request-legacy 里的 L）：
-      //   if (isAppUA && version>=3.42.0 && url 含 {client}/{device})
-      //     h("requestConfig", { path: url, trigger: (n, r) => t(n && 0!==n ? url : r.wrappedUrl) }, "LeoSecure");
-      //   else if (url 含 {client}) t(url.replace("{client}","api"));   // 浏览器兜底
-      //
-      // 我们为了显示「8人PK」加了 UA patch（UA 现在含 YuanSouTiKouSuan）→
-      // isAppUA 变真 → H5 **改走原生桥**，而当时桥里没有 requestConfig →
-      // 回 METHOD_NOT_SUPPORT → n 非 0 → 返回**原样 URL**（含 %7Bclient%7D）
-      // → 所有接口 404（日志里一批 /leo-game-pk/%7Bclient%7D/... ）。
-      //
-      // 正确实现：把 {client}/{device} 替换成 "api"，回 { wrappedUrl }。
+      // requestConfig（LeoSecure）：把 URL 模板的 {client}/{device} 替换为 "api"；
+      // 缺本桥会回原样含 %7Bclient%7D 的 URL → 全部 404。
       requestConfig: function (a) {
         var u = (a && a.path) || '';
         var w = u.split('{device}').join('api').split('{client}').join('api');
@@ -1025,23 +623,12 @@ const H5_INJECT = `(function () {
         return { wrappedUrl: w };
       },
 
-      /* ---- 其余「有返回值」的桥方法 ----
-       *
-       * 2026-09-30 用 bridge-miss 统计驱动补齐（数字为实测调用次数）：
-       *   leo/addFrog 145 · LeoSecure/requestConfig 87 · leo/getFeatureConfig 21
-       *   leo/getDeviceId 12 · refreshStateView 12 · common/setLeftButton 11
-       *   leo/setForceBounceEnable 11 · leo/getFireworkConfig 11
-       *   leo/ShowPracticeDialogIfNeeded 11 · PKArena/observeTabChange 11
-       *
-       * 这些**不阻塞主流程**，但返回值不对会让 H5 走异常分支或反复重试，
-       * 副作用就是「页面抖/闪」。给合理的缺省值即可。
-       */
+      /* 其余「有返回值」的桥方法：不阻塞主流程，但返回值不对会让 H5 走异常分支或反复重试（页面抖/闪），
+         故按契约给合理缺省值。以下逐个按 H5 源码补齐。 */
 
       // 埋点上报（H5 用它记 request 日志）。无返回值，回 'OK'。
       addFrog: function () { return 'OK'; },
-      // 配置中心（feature flag）。★ 必须回**真实值**：H5 优先走本桥，
-// 拿不到才走 HTTP（orion 端点实测 404 → 一律降级）。
-// 取值见上方 FEATURE_CONFIG / featureValue()。
+      // 配置中心（feature flag）：必须回**真实值**，H5 优先走本桥，否则走 HTTP（orion 端点 404 → 降级默认）。取值见 FEATURE_CONFIG / featureValue()。
       getFeatureConfig: function (a) {
         return featureValue(a && (a.featureKey || a.orionKey || a.key));
       },
@@ -1052,18 +639,12 @@ const H5_INJECT = `(function () {
       setLeftButton: function () { return 'OK'; },
       setForceBounceEnable: function () { return 'OK'; },
       getFireworkConfig: function () { return null; },
-      // ★ 2026-09-30：ShowPracticeDialogIfNeeded 的实现在下方「桥补齐」区
-      //   （它其实返回 {dialogNeedToShow:false}，不再是空 'OK'）。
+      // ShowPracticeDialogIfNeeded 的实现在下方「桥补齐」区（返回 {dialogNeedToShow:false}，非 'OK'）。
       observeTabChange: function () { return 'OK'; },
       // 抗沉迷查询（H5 用它决定要不要弹限制）。返回「无限制」。
       queryAntiAddiction: function () { return { status: 0 }; },
 
-      /* ==================== 桥补齐（2026-09-30，「全页面照逆向对齐」） ====================
-       *
-       * 方法：全量扫描 H5（oral-pk / exercise / result / pk / useMotivation /
-       * useRatingPopup / request-legacy / 荣誉榜）里的桥调用点，与 HANDLERS 做差集，
-       * 逐个读契约后补齐。契约一律照源码，不猜。
-       */
+      /* 以下桥方法：全量扫描 H5 各页的桥调用点，与 HANDLERS 做差集后按源码契约补齐。 */
       // 结算页弹窗（Result-legacy kt()）：无登录记录时用它拿「经验值」。
       //   Q('getUnloggedUserExerciseExperience', { trigger:(a,i) => {
       //        a ? reject(a) : resolve({ ..., lastExp: i.experience, ... }) } }, 'leo')
@@ -1096,21 +677,12 @@ const H5_INJECT = `(function () {
       // 回弹（下拉橡皮筋）开关：Oral-legacy / Result-legacy 都调 setBounceEnable。
       // ★ 日志实测有 2 处调用，但 HANDLERS 此前只有 setForceBounceEnable → 会 bridge-miss。
       setBounceEnable: function () { return 'OK'; },
-      /* ★★ setOnInteractivePopped（useMotivation M()）—— 特殊！
-       *
-       *   H5 用法（与 setLeftButton 那种「登记事件处理器」不同）：
-       *     M = () => { f() && u('setOnInteractivePopped', { trigger: () => { S() } }, 'leo'), ... }
-       *     // f() = 能力判定；S() = toFusionClockIn()：native://leo/tryShowFusionClockIn
-       *   这里的 trigger 是**一次性回调**：H5 期望原生在「该弹融合打卡时」回调它。
-       *
-       *   为避免「一登记就触发」（等于替用户操作 / 页面自己跳走），本桥**只登记不回调**
-       *   （列进 NO_TRIGGER_METHODS）。融合打卡本身在 inUse=false 环境里也不该发生。
-       */
+      /* setOnInteractivePopped：trigger 是「原生稍后回调」的一次性处理器，登记即回调会页面乱跳，
+         故只登记不回调（见 NO_TRIGGER_METHODS）。 */
       setOnInteractivePopped: function () { return 'OK'; },
     };
-    // 测试钩子：把桥处理器暴露给 Node 沙箱（tools/test-feature-config.js），
-    // 便于对「纯函数桥」（feature flag 等）做断言，无需开浏览器。
-    // ★ 必须紧跟 HANDLERS 定义（同一作用域），不要挪到文件末尾。
+    // 测试钩子：把桥处理器暴露给 Node 沙箱（tools/test-feature-config.js），便于对纯函数桥做断言，无需开浏览器。
+    // 必须紧跟 HANDLERS 定义（同一作用域）。
     window.__pkHandlers = HANDLERS;
     /** 缺省处理器：不认识的桥方法统一回「不支持」，并按协议回 trigger。
      *  —— 关键是**一定要回调**，否则 H5 侧 Promise 永久挂起，整条链路卡死。 */
@@ -1119,7 +691,7 @@ const H5_INJECT = `(function () {
     /** 统一入口：按 method 分派，并按 H5 协议回调。 */
     function dispatch(module, method, raw) {
       var p = parsePayload(raw);
-      // ★ 每个桥调用都回传 —— 点击链路的「最后一米」就是这里。
+      // 每个桥调用都回传诊断（点击链路「最后一米」）。
       diag('bridge-call', { module: module, method: method, cb: p.cbName, args: JSON.stringify(p.args).slice(0, 240) });
 
       // setter 类方法：trigger 是**事件处理器**而不是回执，
@@ -1159,11 +731,8 @@ const H5_INJECT = `(function () {
       return true;
     }
 
-    /** 造一个「方法名 → 处理器」的桥对象，对齐 H5 的查找方式。
-     *
-     *  H5 的 Lt 会先试 window[首字母大写(module)+'WebView'][method](payload)，
-     *  再试 window.LeoWebView.callNative(payload)；两种入参都只有**一个** base64 串。
-     */
+    /** 造「方法名 → 处理器」的桥对象：H5 先试 window[首字母大写(module)+'WebView'][method](payload)，
+     *  再试 window.LeoWebView.callNative(payload)；两种入参都只有一个 base64 串。 */
     function makeBridge() {
       function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
       function moduleOf(payload) {
@@ -1190,9 +759,7 @@ const H5_INJECT = `(function () {
       return b;
     }
 
-    // ★ getWebViewInfo 的版本必须过 H5 的版本下限（源码 X(l, n) < 0 则判不支持）。
-    //   H5 取的 exceptedVersion（Gt）来自 UA 里的 App 版本；我们 UA 没后缀，
-    //   所以给一个足够高的值即可。
+    // getWebViewInfo 的版本必须过 H5 的版本下限（X(l,n)<0 判不支持），给个足够高的值即可。
     var BRIDGE_VERSION = '9.9.9';
 
     var bridge = makeBridge();
@@ -1354,16 +921,8 @@ const H5_INJECT = `(function () {
     setTimeout(function () { dump('t25s'); }, 25000);
   })();
 
-  /* ---- console / 错误回传（console-hook）----
-   *
-   * 背景（2026-09-30）：H5 的登录态是
-   *   const r = await $t('getUserInfo')
-   *   isLogin = true; userId = r[0].userId
-   * 而 H5 里有现成的调试输出：
-   *   console.log('>>>>>>>>>最终结果', err, extData)
-   * 但我们看不到浏览器控制台，所以把 console.log / 未捕获错误
-   * 一并回传到 /api/pk/h5/diag —— 这样 H5 的内部状态就可见了。
-   */
+  /* console / 错误回传：把 console.log / 未捕获错误一并回传 /api/pk/h5/diag，
+     这样无头环境下 H5 的内部状态可见。 */
   (function consoleHook() {
     try {
       var _log = console.log, _err = console.error, _warn = console.warn;
@@ -1393,24 +952,11 @@ const H5_INJECT = `(function () {
     } catch (e) { /* ignore */ }
   })();
 
-  /* 注：原有 patchArrayBufferResponse（response getter 重写）已删除 —— 2026-09-30。
-   *
-   * 当时误判「H5 不解密、ArrayBuffer 是原生层转成对象的」，于是改了 XHR 的
-   * response getter。实际上 H5 **有解密**：响应拦截器把 arraybuffer 转 base64
-   * 后调桥 LeoSecure.dataDecrypt（见 exercise-legacy 的 u/l 函数）。
-   * 那个补丁反而把「已解密的对象」再序列化去二次解密 → 必然失败。
-   * 正解：实现 dataDecrypt 桥（密文 → /api/pk/h5/decrypt → 明文）。
-   */
+  /* 注：曾改写 XHR response getter 去「代 H5 解密」，但 H5 本身会调 dataDecrypt 桥解密，
+     那个补丁反而导致二次解密失败，已删除。正解就是实现 dataDecrypt 桥。 */
 
-  /* ---- 登录态失效提示（2026-09-30）----
-   *
-   * 背景：某账号 cookie 过期时，接口会成片 401，H5 拿不到主页数据，
-   * 详情卡全不渲染 → **整页白屏**（实测账号 12）。用户看到白屏完全
-   * 无从判断，还以为是代码坏了。
-   *
-   * 这里在 XHR 层统一盯 401：首次出现就弹一个不依赖 H5 的提示条，
-   * 明确告诉用户「这个账号的登录态已失效」。
-   */
+  /* 登录态失效提示：cookie 过期时接口成片 401、H5 整页白屏。这里在 XHR 层盯 401，
+     首次出现就弹一个不依赖 H5 的提示条。 */
   (function authWatch() {
     var shown = false;
     function showTip() {
@@ -1444,20 +990,11 @@ const H5_INJECT = `(function () {
     };
   })();
 
-  /* ---- PK 自动助手面板（2026-09-30）----
-   *
-   * 用户需求：把「以前答案视为正确答案 / 自动提交画笔 / 自动下一局」做成按钮。
-   *
-   * 设计：
-   *   - 一个悬浮小面板（右下角），三个开关，配置存 localStorage（跨页保持）；
-   *   - 「视为正确答案」作用于 recognize 桥：开=回 expectedResult 首项（必对），
-   *     关=回空串（交由真机识别，我们本地没有）；
-   *   - 「自动提交画笔」定时在画板上模拟一次抬手（pointerdown→move→up），
-   *     触发 H5 的 onHandUp → 识别 → 判对 → 自动进下一题；
-   *   - 「自动下一局」：结算页出现「继续 PK / 再来一局」时自动点击。
-   *
-   * 注意：本段整体在 Node 模板字符串里 —— **不得出现反引号与正则字面量**。
-   */
+  /* PK 自动助手（三个开关，配置存 localStorage，跨页保持）：
+     · answer    —— recognize 桥回 expectedResult 首项（必对）；
+     · autoStroke—— 定时在画板模拟抬手，触发 H5 的 onHandUp → 识别 → 判对 → 下一题；
+     · autoNext  —— 结算页自动点「继续 PK」开新一局。
+     注意：本段整体在 Node 模板字符串里，不得出现反引号与正则字面量。 */
   /** 最近一次拿到的 pkIdStr（结算页要用；由 dataDecrypt 解密出的 JSON 里取）。 */
   var pkBotLastPkId = '';
   /** 供 dataDecrypt 回填 pkIdStr（该函数位置更靠前，故用挂到 window 的方式）。 */
@@ -1465,20 +1002,8 @@ const H5_INJECT = `(function () {
   window.__pkBotSetPkId = pkBotSetPkId;
   var PK_BOT_KEY = 'pk-bot-cfg';
 
-  /* ---- 配置来源：★ 2026-09-30 移除网页悬浮窗，改由 URL 参数驱动 ----
-   *
-   * 背景：用户要求「网页端的 PK 功能悬浮窗不需要了」。
-   *
-   * 新机制：入口 URL 上带 ?pkbot=<逗号分隔的能力>，例如
-   *   /pk-h5/pk.html?leoAccountId=6&pkbot=answer,autoStroke,autoNext
-   * 支持的能力：answer（视为正确答案）、autoStroke（自动交笔）、
-   * autoNext（结算页自动开下一局）。
-   *
-   * 未带 pkbot 时：读取 localStorage（兼容旧值），否则**全关** ——
-   * 不再默认开 answer，避免「用户没要求却自动作答」。
-   *
-   * 兼容：pkbot=off 或 pkbot=（空）→ 显式全关。
-   */
+  /* 配置来源：入口 URL 的 ?pkbot=<逗号分隔能力>（如 pkbot=answer,autoStroke,autoNext）。
+     未带 pkbot 时读 localStorage（兼容旧值），否则全关（不默认开 answer）。 */
   function pkBotFromUrl() {
     try {
       var q = String(location.search || '');
@@ -1498,9 +1023,7 @@ const H5_INJECT = `(function () {
     // ① URL 参数优先（浏览器/无头抓取都走这条）
     var fromUrl = pkBotFromUrl();
     if (fromUrl) {
-      // ★★ 2026-10-01：读到就**落盘**（localStorage，同源共享）。
-      //  子页面（exercise.html / result.html）的 URL 上通常没有 pkbot，
-      //  只能靠这里存下来的值，否则三个自动能力会全部退回「关」。
+      // 读到就落盘：子页面（exercise/result）URL 上通常没有 pkbot，只能靠存下来的值。
       pkBotSet(fromUrl);
       return fromUrl;
     }
@@ -1540,8 +1063,7 @@ const H5_INJECT = `(function () {
   window.__pkBotCfg = pkBotCfg;
   window.__pkBotSet = pkBotSet;
   window.__pkBotRaw = pkBotCurrentRaw;
-  // 测试钩子（tools/test-pk-h5-bot.js 用）：验证「自动交笔」发的是哪种事件、
-  // 「自动下一局」找的是哪个按钮。运行时无害。
+  // 测试钩子（tools/test-pk-h5-bot.js 用）。运行时无害。
   window.__pkBotStroke = pkBotStroke;
   window.__pkBotFindNext = pkBotFindNext;
 
@@ -1589,25 +1111,10 @@ const H5_INJECT = `(function () {
 
   /**
    * 在画板上模拟一次「写一笔后抬手」。
-   *
-   * ★★ 2026-10-01 真 bug：原来只发 PointerEvent，而手写板（signature_pad
-   * 的那份移植）是带着 forceUseTouch: true 创建的，它的 on() 是：
-   *
-   *    (!window.PointerEvent || mac || forceUseTouch)
-   *      ? (this._handleMouseEvents(),
-   *         'ontouchstart' in window && this._handleTouchEvents())
-   *      : this._handlePointerEvents()
-   *
-   * 即：**总是绑 mousedown**，且「浏览器支持触摸」时**再**绑 touchstart；
-   * **从来不绑 pointerdown**。所以 PointerEvent 一个都进不去
-   * → 「自动提交画笔」勾了也一笔都不写（用户实测）。
-   *
-   * 现在严格镜像它自己的判定：
-   *   'ontouchstart' in window → touchstart/touchmove/touchend
-   *   否则                     → mousedown/mousemove/mouseup（buttons:1）
-   *
-   * 另：_handleTouchStart 要求 targetTouches.length === 1，
-   * _handleTouchEnd 要求 targetTouches.length === 0 —— 长度给错会被直接忽略。
+   * 手写板（signature_pad 移植，forceUseTouch）总是绑 mousedown、且支持触摸时再绑
+   * touchstart，从不绑 pointerdown，故这里严格镜像：
+   *   'ontouchstart' in window → touch 事件；否则 → mouse 事件（buttons:1）。
+   * 注意 _handleTouchStart 要求 targetTouches.length===1、_handleTouchEnd 要求 ===0。
    */
   function pkBotStroke() {
     try {
@@ -1648,19 +1155,14 @@ const H5_INJECT = `(function () {
     }
   }
 
-  /** 拼结算页地址（真机链路：result.html?pkIdStr=X）。
-   *
-   * 依据历史取证（memory: PK「下一局」真机链路 v1.0.1，2026-09-27）：
-   *   结算页 = /bh5/leo-web-oral-pk/result.html?pkIdStr=<pkIdStr>
-   * 提交成功后 H5 用 submit 响应里的 pkIdStr 拼出该地址并跳转。
-   */
+  /** 拼结算页地址：result.html?pkIdStr=<pkIdStr>（提交成功后 H5 用它跳转）。 */
   function pkBotResultUrl(pkIdStr) {
     var id = String(pkIdStr || '');
     if (!id) return '';
     return location.origin + '/pk-h5/result.html?pkIdStr=' + encodeURIComponent(id) + '#/';
   }
 
-  /** pkBotLastPkId 定义见文件前部（PK_BOT_KEY 附近）—— 因为 dataDecrypt 会提前用到。 */
+  /** pkBotLastPkId 定义见文件前部（dataDecrypt 会提前用到）。 */
 
   /** 自动去结算页（若已知 pkIdStr）。 */
   function pkBotGotoResult() {
@@ -1679,13 +1181,8 @@ const H5_INJECT = `(function () {
         if (el.children.length > 0) continue;
         var t = (el.textContent || '').trim();
         if (!t || t.length > 12) continue;
-        // ★★ 2026-10-01 修正（两处）：
-        //   ① 结算页按钮文案来自 Result-legacy 的 _t：
-        //        isMultiPk ? '继续PK' : challengeCode ? '继续挑战'
-        //                  : 赢了 ? '继续PK' : '再练一次'
-        //      原来的匹配有「继续/再来」却漏了 **再练** → 「再练一次」时点不到。
-        //   ② 原来还匹配了 '返回首页' —— 那是**离开**按钮，点它等于放弃刷局，
-        //      必须去掉（自动下一局绝不该点返回）。
+        // 结算页按钮文案含「继续PK / 继续挑战 / 再练一次」，故匹配「继续/再练/再来」；
+        // 不匹配「返回首页」（那是离开按钮，点它等于放弃刷局）。
         if (t.indexOf('继续') === 0 || t.indexOf('再练') === 0 || t.indexOf('再来') === 0) {
           var r = el.getBoundingClientRect();
           if (r && r.width > 6 && r.height > 6) return el;
@@ -1719,11 +1216,8 @@ const H5_INJECT = `(function () {
         canvases: info.join(' | '),
         texts: texts.join(' / '),
         url: location.pathname,
-        // ★ 2026-09-30：把「模式开关」的当前状态与全部 localStorage 键一起回报。
-        //   背景：pk.html 有 CLASSICS(口算PK) / PROPS(诗词·单词) 两个模式，
-        //   两者共用同一块面板 —— 停在哪一个决定用户看到哪些入口。
-        //   之前只能靠猜（CSS 类名 props-mode 其实是样式，不是存储键），
-        //   这里一次性把真值取回来。
+        // 回报「模式开关」当前状态与全部 localStorage 键：pk.html 有 CLASSICS/PROPS
+        // 两个模式共用一块面板，停在哪决定用户看到哪些入口。
         mode: (function () {
           try {
             var SW = document.querySelectorAll('[class*=mode-switch] .switch');
@@ -1746,8 +1240,7 @@ const H5_INJECT = `(function () {
       });
     } catch (e) { diag('bot-dom', { err: String(e && e.message) }); }
   }
-  /** 悬浮窗 UI 已于 2026-09-30 整体移除（用户要求）。
-   * 自动能力改由入口 URL 的 ?pkbot= 参数驱动（见 pkBotFromUrl）。 */
+  /** 悬浮窗 UI 已移除；自动能力改由入口 URL 的 ?pkbot= 驱动（见 pkBotFromUrl）。 */
 
   /* ---- 定时器：自动交笔 / 自动下一局 ---- */
   var pkBotStrokeBusy = false;
@@ -1756,19 +1249,8 @@ const H5_INJECT = `(function () {
     try {
       var c = pkBotCfg();
       if (c.autoNext) {
-        // ★★ 2026-09-30 事故修正：**绝不在对局页强行跳结算页**！
-        //
-        //  「答对 N 题」是 PKReadyGo 的**开赛屏**（显示本局题数 count=questionCnt），
-        //  不是结算屏。我曾据此判断「游戏结束」并直接 location.href 到 result.html，
-        //  结果「一进对局就进结算页、答案都没提交」。
-        //
-        //  真正的结算跳转由 H5 自己完成：
-        //    Oral-legacy 的 It()：答完 → gotoPkResultPage(pkIdStr, ...) → result.html
-        //
-        //  所以 autoNext 只在**结算页**点「继续PK」开新一局（循环刷局）。
-        //
-        //  ★ 点击冷却：结算页初次可达时数据可能还没就绪（ee() 里 S.value 为空会静默
-        //    什么都不做），所以要在 data-ready 后重试；但也要节流，避免连点几十次。
+        // 绝不从对局页强行跳结算页（「答对 N 题」是开赛屏不是结算屏）；结算跳转由 H5
+        // 自己完成。autoNext 只在结算页点「继续PK」。加 3s 冷却避免连点。
         if (location.pathname.indexOf('result') >= 0) {
           if (Date.now() - pkBotLastNextAt > 3000) {
             var n = pkBotFindNext();
@@ -1781,9 +1263,7 @@ const H5_INJECT = `(function () {
         }
       }
       if (c.autoStroke && !pkBotStrokeBusy) {
-        // 只在**对局页**自动交笔（那里才有手写板 canvas）。
-        // ★ 2026-10-01：原来只判断「有 canvas」—— pk.html 主页也有 canvas，
-        //   会在无关页面上瞎比划。现在按路径收窄。
+        // 只在**对局页**自动交笔（主页也有 canvas，按路径收窄）。
         var p = String(location.pathname || '');
         var onExercise = p.indexOf('exercise') >= 0 || p.indexOf('oral-merge') >= 0;
         var cv = onExercise ? (document.querySelector('canvas.canvas') || document.querySelector('canvas')) : null;
@@ -1796,52 +1276,36 @@ const H5_INJECT = `(function () {
     } catch (e) { /* ignore */ }
   }, 1500);
 
-  // ★ 自动 DOM 快照（2026-09-30）：每 5s 回传一次界面结构。
-  //  用于定位「卡在某个浮层」类问题 —— 直接看到有哪些可点文本与画板尺寸。
-  setInterval(function () { pkBotDumpDom('bot-auto-dom'); }, 5000);
-  // ★ 加载即 dump（1.2s / 3s / 6s 各一次）—— 无头抓取（visit_web）存活时间短，
-  //   5s 定时器可能来不及跑，导致拿不到 mode / localStorage 观测。
+  // 自动 DOM 快照：每 5s 回传界面结构；加载后 1.2/3/6s 各补一次（无头抓取存活短）。
   setTimeout(function () { pkBotDumpDom('t1.2s'); }, 1200);
   setTimeout(function () { pkBotDumpDom('t3s'); }, 3000);
   setTimeout(function () { pkBotDumpDom('t6s'); }, 6000);
 
-  /* 悬浮窗调用已移除（2026-09-30）：自动能力改由 URL 参数 ?pkbot= 驱动。 */
+  /* 悬浮窗调用已移除：自动能力改由 URL 参数 ?pkbot= 驱动。 */
 
   window.__pkH5Hook = { version: 2, local: LOCAL, hosts: TARGET_HOSTS };
 })();`;
 
 /**
- * 改写 H5 的 HTML：把 CDN 的绝对 URL 全部换成本机同源路径，并注入 hook。
- *
- * 注入必须放在 `<head>` 的**第一个** script 之前 —— H5 的 request 模块在
- * 模块加载时就定义好了 axios，晚注入就拦不到。
- *
+ * 改写 H5 的 HTML：把 CDN 绝对 URL 换成本机同源路径，并注入 hook。
+ * 注入必须在 `<head>` 第一个 script 之前（H5 的 request 模块加载时就定义好 axios）。
  * @param {Buffer} html 原始 HTML
  * @returns {Buffer} 改写后的 HTML
  */
 function rewriteHtml(html, opts) {
   let s = html.toString('utf8');
   const leoId = opts && opts.leoAccountId != null ? String(opts.leoAccountId) : '';
-  // ★ 真实用户信息（喂给桥的 getUserInfo）。见下面的详细说明。
+  // 真实用户信息（喂给桥的 getUserInfo）。
   const user = (opts && opts.user) || null;
 
-  // 0) 把 leoAccountId 与「跳过新手引导」的存储标记提前注入：
-  //    hook 脚本要用它们，且必须在 H5 主脚本**之前**执行。
-  //
-  //    oral-pk-guide 见 useHomeModel：showGuide = !getItem('oral-pk-guide')。
-  //    预置成 'true' 后：getItem 返回 'true' → showGuide=false → 浮层不弹。
-  //    （值会被 StorageUtil 做 Base64 存储，所以这里给**明文** 'true'，
-  //      由注入脚本的 presetStorage 负责编码。）
-  //
-  //    ★ __PK_USER：H5 的 isLogin 完全依赖桥的 getUserInfo（见 pk-h5-proxy 里
-  //      那段注释）。没有真实 userId 时会弹「登录后开始PK」并 location.reload()
-  //      → 页面无限刷新。所以这里把 Node 侧取到的真实用户信息塞进去。
+  // 0) 提前注入 leoAccountId 与「跳过新手引导」标记（hook 与主脚本之前执行）。
+  //    oral-pk-guide 预置为明文 'true' → showGuide=false → 浮层不弹（presetStorage 会编码）。
+  //    __PK_USER：H5 的 isLogin 依赖它，没有真实 userId 会死循环刷新。
   const pre = [
     leoId ? '<script>window.__PK_LEO_ID=' + JSON.stringify(leoId) + ';</script>' : '',
     '<script>window.__PK_STORAGE_PRESET={"oral-pk-guide":"true"};</script>',
     user ? '<script>window.__PK_USER=' + JSON.stringify(user) + ';</script>' : '',
-    // ★ 2026-09-30：年级单独暴露一份，供 getExerciseInfo/getExerciseConfig 等能力桥使用
-    //   （H5 的 grade 直接影响练习/好友PK 入口是否可用）。
+    // 年级单独暴露一份，供 getExerciseInfo/getExerciseConfig 等能力桥使用。
     user && user.gradeId
       ? '<script>window.__PK_GRADE=' + JSON.stringify(Number(user.gradeId) || 0) + ';</script>'
       : '',
@@ -1856,21 +1320,9 @@ function rewriteHtml(html, opts) {
   s = s.split(CDN_HOST + '/bh5/').join(LOCAL_PREFIX + '-cdn/');
   s = s.split(CDN_HOST + '/').join(LOCAL_PREFIX + '-cdn/');
 
-  // 2.5) ★ 其它源上的同构 H5（2026-09-30）
-  //
-  //  H5 的跳转目标不限于 CDN，还有业务域上的 H5 目录，例如：
-  //    https://xyks.yuanfudao.com/bh5/leo-web-oral-pk/exercise.html
-  //    https://xyks.yuanfudao.com/bh5/leo-web-study-group/motivation-honor-roll.html
-  //  实测这些页面与 leo.fbcontent.cn/bh5/* **内容完全一致**（同一套构建产物）。
-  //
-  //  不做这一步的后果：点「开始PK」后跳到真实域名 → 那边没有我们的
-  //  hook 与桥 → **下级页面完全哑掉**。
-  //
-  //  所以把所有 `<协议>://<任意主机>/bh5/<目录>/<页面>` 统一折成本机的
-  //  /pk-h5-cdn/<目录>/<页面>（由 serve() 从 CDN 取同名文件）。
-  //  `/bh5/` 是协议级路径，各业务域都只是同一个静态托管，故可互换。
-  //
-  //  注意：本段位于 Node 模板字符串之外（是普通 JS），可以用正则。
+  // 2.5) 其它源上的同构 H5：跳转目标还有业务域上的 H5 目录（xyks/bh5/* 等），
+  //  与 CDN 内容一致。不折算的话跳到真实域名后没有 hook 与桥 → 下级页哑掉。
+  //  故把 <协议>://<任意主机>/bh5/<目录>/<页面> 统一折成 /pk-h5-cdn/<目录>/<页面>。
   s = s.replace(/https?:\/\/[A-Za-z0-9.-]+\/bh5\//g, LOCAL_PREFIX + '-cdn/');
 
   // 3) 注入 hook：插在 <head> 后、任何 script 之前
@@ -1889,21 +1341,13 @@ function rewriteHtml(html, opts) {
 
 /**
  * 注册「取用户信息」的提供者（server.js 启动时注入）。
- *
- * H5 的登录态（isLogin）完全来自桥的 getUserInfo —— 没有真实 userId 时
- * pk-legacy 会弹「登录后开始PK」并 location.reload()，页面无限刷新。
- * 所以每个 HTML 页面都要带上该账号的真实用户信息（window.__PK_USER）。
- *
+ * H5 的 isLogin 完全来自桥的 getUserInfo，没有真实 userId 时 pk-legacy 会弹
+ * 「登录后开始PK」并 location.reload() 死循环，故每个 HTML 都要注入 window.__PK_USER。
  * @param {(leoAccountId:number)=>Promise<object|null>} fn
  */
 let fetchUserInfo = null;
-/** 最近一次进入 PK 页面时用的账号 id。
- *
- * 为什么要它（2026-09-30）：window.__PK_USER 只在 URL **带 leoAccountId** 时注入，
- * 而用户从各种入口（后退、历史记录、直接刷新）进来时 URL 常常没有这个参数
- * → isLogin=false → 界面显示「未登录」（实测症状）。
- * 所以记住最后一个用过的账号，缺参数时兜底。
- */
+/** 最近一次进入 PK 页面时用的账号 id：window.__PK_USER 只在 URL 带 leoAccountId 时注入，
+ *  而用户从后退/历史/刷新进来时常没这个参数 → 显示「未登录」，故记住最后一个兜底。 */
 let lastLeoAccountId = null;
 function setUserInfoProvider(fn) { fetchUserInfo = fn; }
 
@@ -1911,45 +1355,18 @@ function setUserInfoProvider(fn) { fetchUserInfo = fn; }
 let dumpCount = 0;
 
 /**
- * 改写代理过来的 **JS 资产**（不是 HTML）。
+ * 改写代理过来的 JS 资产（不是 HTML）。
  *
- * ## 为什么要做资产级改写（2026-09-30，排行榜问题的真因）
- *
- * 原版 H5 的新版 Bridge 框架（`index-legacy.UF8C8ODn.js`）里有一段门禁：
- *
- * ```js
- * tA = function () {
- *   var t = window.location.hostname;
- *   return 'local.yuanfudao.biz' === t || '127.0.0.1' === t || 'localhost' === t;
- * };
- * NativeBridgeProvider.prototype.has = function () { return !tA(); };
- * ```
- *
- * 即：**本地调试环境一律禁用原生桥**（has 返回 false）。而我们为了同源代理，
- * 必须跑在 127.0.0.1 上 —— 于是 tA() 恒为 true、has() 恒为 false：
- *
- *     [Bridge] 没有 Provider 可以处理 "getWebViewInfo"   ×14
- *
- * → 桥初始化失败 → 榜单等页面**一个数据请求都不发**（表现：页面渲染出来但空白）。
- *
- * 修法：把 `tA()` 恒真改写为恒假 —— 让 H5 以为自己在真机里。
- * 只动这一处，语义最小。
+ * H5 的 Bridge 框架里有一段门禁：本地调试环境（127.0.0.1/localhost）一律禁用原生桥，
+ * 而我们为同源代理必须跑在 127.0.0.1 → 桥初始化失败 → 榜单等页面不发请求（渲染空白）。
+ * 修法：把门禁里的 `tA()` 恒真改写为恒假，让 H5 以为自己在真机里。只动这一处。
  */
 function rewriteAssetJs(buf) {
   let s = buf.toString('utf8');
   // 已改写就跳过（幂等）
 
-  // ★★ 2026-09-30：PKReadyGo 倒计时 watcher 缺 immediate →「答对 N 题」遮罩卡死
-  //
-  //  组件 PKReadyGo（index-legacy.Blmv9pEj.js）：
-  //    watch(() => props.start, e => { if (e) { ...3.5s...; emit('readyGoEnd') } })
-  //  **没写 immediate**。父组件在匹配动画约 4.5s 后才把 start 置 true，
-  //  而 PKReadyGo 是 v-if="数据就绪" 才挂载。真机 match/v2 快 → 先就绪后开赛 →
-  //  watch 能触发；我们走代理+桥解密更慢 → 开赛(start=true)先于就绪 → 组件挂载时
-  //  start 已是 true → watch 永不触发 → readyGoEnd 永不 emit → 计时器/答题流程
-  //  不启动 → 永远卡在「答对 N 题」遮罩。
-  //
-  //  改写：在 watch 的 options 位置插入 {immediate:!0}（幂等，带标记）。
+  // PKReadyGo 组件的倒计时 watcher 没写 immediate，而我们的 match 更慢、组件挂载时
+  // start 已为 true → watch 永不触发 → 卡在「答对 N 题」遮罩。改写：给它补 {immediate:!0}。
   {
     var RG_HEAD = '(()=>i.start,e=>{e&&setTimeout(';
     var RG_TAIL = '},2e3)}),(t,n)=>';
@@ -1980,17 +1397,9 @@ function rewriteAssetJs(buf) {
 
 /**
  * 处理 `/pk-h5/*` 与 `/pk-h5-cdn/*`：把 CDN 资产（含 HTML）透传给浏览器。
- *
  * HTML 会被改写（URL 同源化 + 注入 hook）；其余资产原样透传。
- *
- * ## 为什么 `-cdn` 要支持**任意目录**（2026-09-30）
- *
- * PK 的跳转目标不止 `leo-web-oral-pk`，还有别的 H5 应用，例如：
- *     https://xyks.yuanfudao.com/bh5/leo-web-study-group/motivation-honor-roll.html
- * 这些页面同样需要「同源 + 注入 hook + 桥」，否则点过去就哑了。
- * 实测 `xyks.yuanfudao.com/bh5/*` 与 `leo.fbcontent.cn/bh5/*` 内容一致，
- * 所以统一从 CDN 取。
- *
+ * `-cdn` 支持任意目录：PK 跳转目标不止 leo-web-oral-pk，其它 H5 应用也需同源+hook，
+ * 而 xyks/bh5/* 与 CDN 内容一致，故统一从 CDN 取。
  * @returns {Promise<boolean>} true = 已处理（响应已写）
  */
 async function serve(req, res, u) {
@@ -2000,14 +1409,8 @@ async function serve(req, res, u) {
   if (path === '/pk-h5' || path === '/pk-h5/' || path === '/pk-h5/pk.html') {
     cdnUrl = CDN_HOST + H5_BASE_PATH + '/pk.html';
   } else if (path.indexOf('/bh5/') === 0) {
-    // ★★ 2026-09-30：兼容直接访问 `/bh5/<目录>/<页面>`。
-    //
-    //  现象（用户实测）：点「好友挑战」→ location.href 或 openWebView 指向
-    //    http://127.0.0.1:8792/bh5/leo-web-oral-pk/invite-friend.html → 「未提供」。
-    //  原因：H5 有若干入口直接拼 `${location.origin}/bh5/...`（不经过 CDN 域），
-    //        本机没有 /bh5/ 路由。
-    //  处理：把 /bh5/<目录>/x 映射到 /pk-h5-cdn/<目录>/x（与资产改写一致）。
-    //        其中 leo-web-oral-pk 走更短的 /pk-h5/<x>，与其它页面保持一致。
+    // 兼容直接访问 `/bh5/<目录>/<页面>`：H5 有入口直接拼 `${location.origin}/bh5/...`，
+    // 本机无此路由 → 「未提供」。映射到 /pk-h5-cdn/<目录>/x（主目录走 /pk-h5/<x>）。
     const rest = path.slice('/bh5/'.length);
     if (rest.indexOf('leo-web-oral-pk/') === 0) {
       cdnUrl = CDN_HOST + H5_BASE_PATH + '/' + rest.slice('leo-web-oral-pk/'.length);
@@ -2034,9 +1437,7 @@ async function serve(req, res, u) {
   let body = asset.body;
   let contentType = asset.contentType;
   if (contentType.indexOf('text/html') >= 0 || cdnUrl.endsWith('.html')) {
-    // ★ 取该小猿账号的真实用户信息，注入 window.__PK_USER —— H5 的 isLogin
-    //   完全依赖它（缺了会 location.reload() 死循环）。取不到就传 null，
-    //   页面会走「未登录」分支（至少不会崩）。
+    // 取该账号真实用户信息注入 window.__PK_USER（H5 的 isLogin 依赖它，缺了会死循环）。
     let user = null;
     let leoId = u.searchParams.get('leoAccountId');
     if (leoId) lastLeoAccountId = leoId;
@@ -2049,17 +1450,14 @@ async function serve(req, res, u) {
     body = rewriteHtml(body, { leoAccountId: leoId, user });
     contentType = 'text/html';
   } else if (cdnUrl.endsWith('.js') || contentType.indexOf('javascript') >= 0) {
-    // ★ 资产级改写：破解「本地调试环境禁用原生桥」的门禁（2026-09-30）
+    // 资产级改写：破解「本地调试环境禁用原生桥」的门禁
     body = rewriteAssetJs(body);
   }
 
   res.writeHead(200, {
     'Content-Type': contentType + (contentType.indexOf('text/') === 0 || contentType.indexOf('javascript') >= 0 || contentType.indexOf('json') >= 0 ? '; charset=utf-8' : ''),
     'Content-Length': body.length,
-    // HTML 不缓存（便于跟随上游升级）；资产短缓存
-    // ★ 全部禁缓存（2026-09-30）：H5 的 HTML 里内联了我们的 hook，
-    // 一旦浏览器吃缓存就会加载到「没有 hook 的旧页面」——
-    // 表现是页面退回最初模样、且服务端看不到任何 diag 上报。
+    // 全部禁缓存：HTML 里内联了 hook，吃缓存会加载到「没有 hook 的旧页面」。
     'Cache-Control': 'no-store, no-cache, must-revalidate',
     Pragma: 'no-cache',
     Expires: '0',
@@ -2076,23 +1474,7 @@ function diagLog(tag, msg) { console.log('[pk-h5:' + tag + '] ' + msg); }
 
 /**
  * 解密主域的「加密响应」（arraybuffer 接口专用）。
- *
- * ## 链路（2026-09-30 用 MT MCP + H5 源码 + 真机密文三方确证）
- *
- *   密文 --keystream XOR--> gzip 字节 --gunzip--> 明文 JSON
- *
- * 证据：
- *  1. H5 侧（exercise-legacy.C5DFMay0.js）：
- *       getPkExerciseQuestionV2: a.post(url, null, { responseType: "arraybuffer" })
- *     -> 响应是二进制密文，需解密。
- *  2. MT MCP 反汇编 libContentEncoder.so 的 imports：
- *       只有 rand/malloc/memcpy/memset/memcmp… **没有任何密码学原语**（无 AES/SHA）
- *     -> 只可能是「固定密钥流 XOR」。
- *  3. 真机密文实测（659B）：XOR 后首字节 1f 8b 08（gzip magic），
- *     gunzip 得 6103B 明文 JSON（含 pkIdStr / otherUser / examVO.questions）。
- *
- * 所以代理侧不再把密文转给 H5，而是自己解开回明文 JSON。
- *
+ * 链路：密文 --keystream XOR--> gzip 字节 --gunzip--> 明文 JSON。
  * @param {Buffer} buf 响应原始字节
  * @returns {Buffer|null} 明文 JSON 字节；不像密文时返回 null（调用方原样转发）
  */
@@ -2118,31 +1500,14 @@ function decodeEncrypted(buf) {
 
 /**
  * 处理 `/api/pk/h5/api?__t=<host>`：把 H5 的请求转发到真实主域。
- *
- * 关键点：
- *  1. **还原真实 URL**：H5 被 hook 改写后只剩 `?__t=host`，真实路径在
- *     `X-PK-Path` 头里（hook 写的）。
- *  2. **补公共参数与 sign**：用 [leo.buildUrl] 重新组装 —— 它会补
- *     `_productId` / `_appId` / `version` / `platform` 等，并按需加 `sign`。
- *     H5 自己已经带了 `_productId` 的话会**原样保留**（buildUrl 里业务参数
- *     优先级最高）。
- *  3. **风控头**：`leo-game-pk` 走 [leo.riskHeaders]；`xyst` 域（solar）也带上。
- *  4. **Cookie**：用**该小猿账号**的 jar（H5 里没有登录态，登录态在 Node）。
- *
+ * 还原真实 URL（路径在 X-PK-Path 头）、用 [leo.buildUrl] 补公共参数与 sign、
+ * 补风控头、用该账号的 cookie jar。
  * @param {object} ctx { jar, rawBody }
  */
 /* ------------------------------ 加密接口判定 ------------------------------ */
 /**
- * 是否为「响应加密（arraybuffer + dataDecrypt）」的接口。
- *
- * 2026-09-30：只有这些接口的响应才是 keystream 密文，必须 rawBody 逐字节透传；
- * 其余普通接口是真 gzip，要交给 http.js 正常解压。
- *
- * 依据：H5 源码里 responseType:"arraybuffer" 的接口（exercise-legacy）：
- *   /math/pk/match/v2          出题
- *   /math/pk/multi/match/v2    多人 PK
- *   /math/pk/match/props/v2    道具赛
- *   /...getFinallPkExerciseQuestionV2 / english...V2 / submit ...
+ * 是否为「响应加密（arraybuffer + dataDecrypt）」的接口：只有这些接口的响应是
+ * keystream 密文，必须 rawBody 逐字节透传；其余普通接口是真 gzip，交给 http.js 解压。
  */
 function isEncryptedPath(pathOnly) {
   const p = String(pathOnly || '');
@@ -2153,28 +1518,9 @@ function isEncryptedPath(pathOnly) {
 
 /* ------------------------------ 出站节流 ------------------------------ */
 /**
- * H5 请求节流器：避免「同秒几十个并发」被服务端当异常流量。
- *
- * ## 为什么必须加（2026-09-30，白屏真因）
- *
- * 实测（账号 12，pknode33）：
- *
- *   GET /leo-activity/api/backpack?...&sign=ed497340504a…   → 401
- *   GET /leo-activity/api/backpack?...&sign=ed497340504a…   → 200   （311ms 后）
- *
- * **同一 URL、同一 sign、同一 cookie**，一次 401 一次 200 —— 说明不是鉴权/
- * 签名问题，而是**服务端对突发并发限流**（401 unauthorized 是它的拒绝姿态）。
- *
- * H5 首页一加载会并发十几个接口（pk/home、poetry/pk/home、backpack、
- * daily/award、props/home…），全打到同一域；限流命中后首页数据缺失，
- * H5 的卡片全不渲染 → **整页白屏**（且所有账号都会出现）。
- *
- * 所以这里做一个简单的**串行化 + 最小间隔**：
- *   - 同一 host 同时最多 1 个在飞（保守，但首页请求量不大）；
- *   - 两次出站之间至少间隔 GAP ms；
- *   - 串行不可避免会慢一点，但比整页白屏好得多。
- *
- * 另外对 401/429 自动重试一次（间隔加倍），因为限流通常是瞬时的。
+ * H5 请求节流器：同一 URL/sign/cookie 会一次 401、一次 200，说明服务端对突发并发
+ * 限流（401 是拒绝姿态）。H5 首页并发十几个接口，被限流就整页白屏。故做串行化 +
+ * 最小间隔（同 host 同时最多 1 个在飞、两次出站至少隔 GAP ms）。
  */
 const PK_THROTTLE_GAP_MS = Number(process.env.PK_THROTTLE_GAP_MS || 120);
 const pkThrottle = {};   // host -> Promise（串行链尾）
@@ -2182,16 +1528,9 @@ const pkLastAt = {};     // host -> 上次出站时间
 
 function sleepMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-/** ★ 2026-09-30：首屏关键请求 —— 必须**优先出站**。
- *
- *  背景：同一 host 串行 + 最小间隔（默认 120ms）是为绕开服务端突发限流。
- *  但 pk.html 首屏会同时发 6+ 个 xyks 请求，若一律 FIFO，
- *  `math/pk/home`（口算PK 卡片的数据源，决定 pointList 是否渲染）
- *  可能排在最后 → 首屏 700ms+ 才拿到 → 卡片不显示/加载慢。
- *
- *  这里给关键请求开一条**优先通道**：它不排在同 host 的普通队列后面，
- *  而是插到队首立刻执行（仍受最小间隔约束，避免触发限流）。
- */
+/** 首屏关键请求优先出站：pk.html 首屏并发 6+ 个 xyks 请求，若一律 FIFO，
+ *  `math/pk/home`（决定卡片是否渲染）可能排最后 → 卡片不显示。
+ *  故给关键请求开优先通道（仍受最小间隔约束）。 */
 const PK_PRIORITY_PATHS = [
   '/leo-game-pk/api/math/pk/home',
   '/leo-game-pk/api/math/pk/props/home',
@@ -2206,32 +1545,8 @@ function pkIsPriorityPath(pathAndQuery) {
 }
 
 /**
- * 是否为「匹配/出题」类请求。
- *
- * ## 为什么只对这类请求加重试（2026-10-01，读 H5 源码得到的因果链）
- *
- * 对局页（index-legacy / Oral-legacy）出题是在 mounted 的 try 里跑的，
- * catch 分支（逐字）：
- *
- * ```js
- * catch (h) {
- *   Fe('/debug/oralPk/exercise/netError', { exception: h });
- *   if (!Be() || (h.response.status !== 429 && h.response.status !== 400)) {
- *     // → 普通「加载失败，重试」弹窗
- *   } else {
- *     O.value = true;      // → 渲染 PkAbnormalDialog(type 默认 1)
- *   }
- * }
- * ```
- *
- * 而 PkAbnormalDialog 的 type=1 图片就是用户在截图里看到的那张：
- *
- *     「PK现场太火爆，人太多挤不进去了 / 重新再试一次吧！/ 返回首页」
- *     （assets/type-1.Ng7ZhNY2.png，文案是**图片**里的，所以搜不到字符串）
- *
- * ⇒ **match/v2 只要返回 400 / 429，用户看到的就是「太火爆」**。
- *   出题冷却现在只有 ~1s（见 README 4.7 的复测），退避重试几次基本必得 200，
- *   所以绝不该把这个瞬时频控原样透给 H5。
+ * 是否为「匹配/出题」类请求。match/v2 返回 400/429 时 H5 会弹「PK现场太火爆」弹窗，
+ * 而服务端冷却只有 ~1s，退避重试几次基本必得 200，故这类请求给足重试预算。
  */
 function pkIsMatchPath(pathAndQuery) {
   const p = String(pathAndQuery || '');
@@ -2240,11 +1555,10 @@ function pkIsMatchPath(pathAndQuery) {
 
 /** 这一次响应值得重试几次（0 = 不重试）。 */
 function pkRetryBudget(status, text, pathAndQuery) {
-  // 出题/匹配：400/403/429 都是「瞬时频控」，给足预算（H5 见了会弹「太火爆」）
+  // 出题/匹配：400/403/429 都是瞬时频控，给足预算（H5 见了会弹「太火爆」）
   if (pkIsMatchPath(pathAndQuery) && (status === 400 || status === 403 || status === 429)) return PK_RETRY_MAX;
   if (status === 429) return 2;
-  // ★ 401 只重试 1 次：它基本都是「登录态失效」（cookie 过期），
-  //   重试多了会让**整页每个请求都拖十几秒**，页面反而卡死。
+  // 401 只重试 1 次：基本都是登录态失效，重试多了会让整页每个请求拖十几秒。
   if (status === 401) return 1;
   const t = String(text || '');
   if (t.indexOf('请求过于频繁') >= 0 || t.indexOf('频繁') >= 0 || t.indexOf('火爆') >= 0) return 2;
@@ -2312,67 +1626,26 @@ async function proxyApi(req, res, u, ctx) {
   const isHostSolar = host === 'xyst.yuanfudao.com';
 
   // 组装真实 URL：xyks / xyst 都走 buildUrl（补公共参数 + sign）。
-  //
-  // ## 为什么 xyst 也要（2026-09-29 实测）
-  //
-  // `xyst.yuanfudao.com/solar-activity/*` 同样被 `solar-encoder` 保护 ——
-  // 只带 H5 自己那套参数（无 sign）会 417 `No message available`；
-  // 与主域同源，需要 sign + 主域公共参数。H5 自己不算 sign（那是原生
-  // `LeoSecure.calculateSign` 的活），所以必须在代理侧补。
+  // xyst 的 solar-activity 同样被 solar-encoder 保护，无 sign 会 417，故也走这条。
   let realUrl;
   if (isHostLeo || isHostSolar) {
     const isPk = pathOnly.indexOf('/leo-game-pk') === 0;
-    // ★ 强制 PK 的 `_productId=631` / `_appId=6`（**覆盖** H5 传来的值）。
-    //
-    //   2026-09-29：H5 在**浏览器**里跑时 `isAppUA=false`（UA 不含
-    //   `YuanSouTiKouSuan`，那是 WebView 才追加的后缀），于是它按
-    //   `location.hostname` 分支算出 `_productId=131`（127.0.0.1 不匹配任何
-    //   已知域 → 兜底 131），并把 131 拼进 URL 发出来。
-    //
-    //   而 PK 端点（`leo-game-pk`）在 `SolarAuthFilter` 上**硬要求 631 + _appId=6**
-    //   —— 用 131 会被判为另一个产品线。`leo.buildUrl` 里业务参数优先级最高，
-    //   不覆盖就会被 H5 的 131 冲掉。这里显式覆盖。
+    // 强制覆盖 PK 的 _productId：H5 在浏览器里跑会按 hostname 兜底算出 _productId=131，
+    // 而 PK 端点认的是 611（见下），不覆盖就会被冲掉。
     if (isPk) {
-      // ★★ 必须**同时**覆盖 H5 自己拼上去的 `_appId=601`（2026-09-30 实测）
-      //
-      //  H5 因为 UA 是「小猿口算 App」，走了 App 分支：
-      //    productId = 611（App）→ appId = 601（App 端）
-      //  于是它发出 `?pointId=…&_productId=631&_appId=601&version=3.141.1`。
-      //
-      //  后果很隐蔽：服务端**返回 200，但响应体被加密**（683 字节乱码）。
-      //  这是因为 App 端的响应会走 content-encoder，客户端（原生）负责解密；
-      //  而我们是浏览器/Node，没有解密能力 → H5 拿到密文解析失败 →
-      //  界面永远卡在「匹配中」（快照里 matching 浮层 t7s/t15s/t25s 一直在）。
-      //
-      //  改成 `_appId=6`（H5 网页端）后，服务端按明文的普通 HTTP 响应返回。
-      //  这跟 `_productId=631` 是同一个道理：把 H5 的 App 分支参数纠正成网页分支。
-      query._productId = '631';
-      query._appId = '6';
+      // PK 出题真实参数：_productId=611 且不带 _appId（真机抓包口径）。
+      query._productId = '611';
+      delete query._appId;
     }
-    // ★ 把 H5 传的 `version` 换成**主域协议版本**（3.140.1）。
-    //
-    //   2026-09-29 实测（xyst solar-activity）：
-    //     version=3.141.1（H5 从 UA 取的 App 版本） → 417 No message available
-    //     version=3.140.1（主域协议版本）          → 200 正常返回 banner
-    //   与 pk-node 早先在练习/主域上踩到的是**同一个坑**：solar-encoder 认的是
-    //   协议版本，不是 App 版本。H5 不知道这件事，所以必须在代理侧纠正。
-    // ★★ 强制覆盖（2026-09-30 实测确认这是「现场太火爆 / 请求过于频繁」的诱因之一）
-    //
-    //  H5 因为 UA 走了 App 分支，会拼出 `_productId=631&_appId=601&version=3.141.1`。
-    //  而 `_appId=601` 让服务端按**App 端**处理（响应加密 + 更严的风控），
-    //  `version=3.141.1` 也不是主域协议版。两者都必须纠正。
-    //
-    //  ⚠️ 注意 buildUrl 的语义：**业务参数（params）最后设置、优先级最高**，
-    //  所以只改 query 再交给 buildUrl 是**无效的**（会被 params 冲掉）。
-    //  这里必须同时改 query（给 buildUrl 用）与 opts，才能真覆盖。
-    query.version = PK.exercise.version;
+    // 必须同时改 query 与 opts 才能真覆盖：buildUrl 里业务参数（params）优先级最高，
+    // 只改 query 会被冲掉。version/platform/vendor 用 config.js 的 PK.commonQuery。
+    query.version = PK.commonQuery.version;
+    query.platform = PK.commonQuery.platform;
+    query.vendor = PK.commonQuery.vendor;
     realUrl = leo.buildUrl(pathOnly, query, {
-      // PK 路由用 631 + _appId=6；其余（含 solar）走默认 611。
-      // query 里已有 _productId 时 buildUrl 会保留它（业务参数优先）。
-      productId: isPk ? '631' : undefined,
-      appId: isPk ? '6' : undefined,
-      // solar 域的 host 与主域不同，buildUrl 默认拼 leoBase（xyks），
-      // 这里替换 host 后再返回。
+      // PK 与其余主域端点统一走默认 `_productId=611`，且都不带 `_appId`。
+      productId: undefined,
+      appId: undefined,
     });
     if (isHostSolar) realUrl = realUrl.replace('https://' + config.leoHost, 'https://' + host);
   } else {
@@ -2395,23 +1668,8 @@ async function proxyApi(req, res, u, ctx) {
     // 审计用：把最终 query 打出来（排查参数是否被正确覆盖）
     let finalQuery = '';
     try { finalQuery = String(realUrl).split('?')[1] || ''; } catch (e) { /* ignore */ }
-    // ★ rawBody: true —— **保留未解压的原始字节**（2026-09-30）。
-    //
-    //  为什么关键：`match/v2` 的响应是「keystream XOR(gzip(json))」的密文。
-    //  keystream XOR 后出来的才是 gzip；若不带 rawBody，http.js 会因为
-    //  `Content-Encoding: gzip` 尝试 gunzip **密文**（必然失败）——
-    //  运气好保持原样，运气差就把原始字节搞乱。
-    //
-    //  而且密文必须**逐字节透传**：H5 的 response 拦截器要把它 btoa 后
-    //  交给 dataDecrypt 桥解密（见 exercise-legacy 的 u/l 函数）。
-    //  这里若做任何 utf8 转换都会破坏二进制，解密必然失败。
-    // ★ 出站节流 + 401 重试（2026-09-30，白屏真因）。
-    //
-    //  实测同一 URL/同一 sign 会一次 401、一次 200 —— 说明服务端在**突发并发**
-    //  下限流（401 unauthorized 是它的拒绝姿态）。H5 一加载就并发十几个接口，
-    //  不节流就会成片被拒 → 首页数据缺失 → 整页白屏。
-    //
-    //  所以：同 host 串行 + 最小间隔；401/429 再给一次机会（退避重试）。
+    // rawBody: true 保留未解压的原始字节：match/v2 的响应是「keystream XOR(gzip(json))」
+    // 密文，必须逐字节透传（http.js 若当 gzip 解压会搞乱字节）。
     async function once() {
       return request({
         url: realUrl,
@@ -2419,26 +1677,15 @@ async function proxyApi(req, res, u, ctx) {
         jar: ctx.jar,
         body: bodyBuf && bodyBuf.length ? bodyBuf : undefined,
         headers: headers,
-        // ★ rawBody 只对**加密接口**开（2026-09-30 重要修正）。
-        //
-        //  rawBody 的语义是「不解压 gzip」—— 因为加密接口的响应是
-        //  「keystream XOR(gzip(json))」的密文，必须逐字节透传给 H5 的
-        //  dataDecrypt 桥去解（http.js 若当成 gzip 去 gunzip 会失败）。
-        //
-        //  但对**普通**接口（pk/home、props/home、backpack…）它们是**真 gzip**，
-        //  必须正常解压！我一开始把所有请求都设成 rawBody:true，
-        //  结果 H5 拿到一堆 gzip 字节当 JSON 解析 → 抛错 → 渲染中断 → 白屏。
+        // rawBody 只对加密接口开：普通接口（pk/home 等）是真 gzip，必须正常解压，
+        // 否则 H5 拿到 gzip 字节当 JSON 解析 → 白屏。
         rawBody: isEncryptedPath(pathOnly),
       });
     }
-    // ★ 首屏关键请求走优先通道（不被同 host 普通队列拖慢，见 pkIsPriorityPath）
+    // 首屏关键请求走优先通道（见 pkIsPriorityPath）
     const prio = pkIsPriorityPath(pathOnly);
     let r = await pkThrottleRun(host, once, prio);
-    // ★★ 2026-10-01：频控自动重试（原来只试 1 次，且只对 401/429）。
-    //
-    //  出题（match）返回 400/429 时 H5 会直接弹「PK现场太火爆，挤不进去」
-    //  那张图（见 pkIsMatchPath 的说明），而服务端冷却只有 ~1s —— 所以
-    //  这里退避重试若干次，把「瞬时频控」挡在代理层，用户就看不到那张弹窗了。
+    // 频控自动重试：把 match 的瞬时 400/429 挡在代理层，用户就看不到「太火爆」弹窗。
     let tries = 0;
     // 每次拿到响应**重新**算预算：某次重试换来了别的错误码（如 404），就该停下。
     for (;;) {
@@ -2458,25 +1705,14 @@ async function proxyApi(req, res, u, ctx) {
       'Cache-Control': 'no-store',
       'Access-Control-Allow-Origin': '*',
     };
-    // ★ 二进制安全透传，**不在代理侧解密**（2026-09-30 重大修正）。
-    //
-    //  这里曾经用 keystream 把 match/v2 的密文解开再回给 H5，以为 H5 不会解。
-    //  实际上 **H5 自己会解密**：它的响应拦截器（exercise-legacy 的 u/l）
-    //  把 arraybuffer 转 base64 后调原生桥 LeoSecure.dataDecrypt。
-    //
-    //  代理侧先解 → H5 拿到的已是明文 → 又 btoa 去调 dataDecrypt →
-    //  双重解密 → 桥报 DECRYPT_FAILED → r.result undefined → 界面永远「匹配中」。
-    //
-    //  正解：代理侧**只做透传**（保持字节不变、二进制安全），
-    //  解密统一由 dataDecrypt 桥委托 /api/pk/h5/decrypt 完成。
+    // 二进制安全透传，不在代理侧解密：H5 自己会调 dataDecrypt 桥解密，代理先解会双重
+    // 解密 → 报 DECRYPT_FAILED → 界面永远「匹配中」。
     const outBody = (r.body && r.body.length) ? r.body : Buffer.from(r.text || '', 'utf8');
     outHeaders['Content-Length'] = outBody.length;
     res.writeHead(r.status, outHeaders);
     res.end(outBody);
 
-    // ★ 调试：把 match/v2 这类「响应可能是加密的」原始字节 dump 到文件，
-    //   便于离线分析（keystream XOR 是否可解、是否有长度头/gzip）。
-    //   只在 PK_H5_DUMP_DIR 指定时做，且只 dump 一次（避免刷爆磁盘）。
+    // 调试：把 match/v2 这类加密响应原始字节 dump 到文件（仅 PK_H5_DUMP_DIR 指定时）。
     if (process.env.PK_H5_DUMP_DIR && /match|v2|submit/.test(pathOnly) && dumpCount < 5) {
       try {
         const raw = r.rawBody;                // http.js 在 rawBody=true 时保留的未解压字节
@@ -2490,11 +1726,8 @@ async function proxyApi(req, res, u, ctx) {
       } catch (e) { console.log('[pk-h5] dump 失败：' + e.message); }
     }
 
-    // 审计：把「H5 打了什么、真实 URL 是什么、结果如何」记下来，便于定位 417。
-    //
-    // 2026-09-30：以前只在非 200 时记 body，导致「200 但内容不对」这类问题
-    // 完全看不到（例如 match/v2 返回 200 却没有对局信息 → H5 一直「匹配中」）。
-    // 现在 **200 也记 body 摘要**，需要时还能开 PK_H5_LOG_FULL_BODY 记全量。
+    // 审计：记录真实 URL 与结果。200 也记 body 摘要（「200 但内容不对」才看得到），
+    // 需要时可开 PK_H5_LOG_FULL_BODY 记全量。
     const bodyLog = String(r.text || '');
     const showBody = r.status !== 200
       ? bodyLog.slice(0, 300)

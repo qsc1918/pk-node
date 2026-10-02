@@ -1,17 +1,11 @@
 'use strict';
 /**
- * 数据库层（Node 内置 `node:sqlite`，零外部依赖）。
- *
- * ## 设计要点
- *
- * - **单进程同步 API**：`node:sqlite` 是同步的，本项目是单机小服务，同步足够且代码简单。
- *   唯一要注意的是别在热路径里做全表扫描（都加了索引）。
- * - **用户口令**：`scrypt` + 每用户随机 salt（Node `crypto.scryptSync`）。
- *   不用 bcrypt/argon2 是为了零依赖；scrypt 本身是抗暴力破解的 KDF。
- * - **小猿 cookie 的存储**：`leo_accounts.cookies_json` 里每个 cookie 的 **value 都加密**
- *   （AES-256-GCM，见 [cookiecrypt]）。`name/domain/path` 保持明文，便于「只列 cookie 名」。
- *   密钥来自 `PK_SECRET`（>=16 字符）或 `data/secret.key`（0600，自动生成）。
- *   => 光拿到 db 文件**打不开登录态与设备链**；要同时拿到密钥文件才行。
+ * 数据库层（Node 内置 node:sqlite，零外部依赖）。
+ * - 单进程同步 API（别在热路径全表扫描，已加索引）。
+ * - 用户口令：scrypt + 每用户随机 salt（零依赖，抗暴力破解）。
+ * - 小猿 cookie：`leo_accounts.cookies_json` 每个 value 都加密（AES-256-GCM，见 cookiecrypt）；
+ *   name/domain/path 明文便于「只列 cookie 名」。密钥来自 PK_SECRET 或 data/secret.key（0600）。
+ *   => 光拿 db 文件打不开登录态与设备链，要同时拿密钥文件。
  */
 
 const fs = require('node:fs');
@@ -84,7 +78,7 @@ CREATE TABLE IF NOT EXISTS leo_accounts (
 );
 CREATE INDEX IF NOT EXISTS idx_leo_accounts_user ON leo_accounts(user_id);
 
--- ★ 设备链池：多份 ks_*（同一设备可来自不同 App 账号），登录账号自动挑一份补齐。
+-- 设备链池：多份 ks_*（同一设备可来自不同 App 账号），登录账号自动挑一份补齐。
 --   value 同样加密存储（见 cookiecrypt）；label 只是给人看的备注。
 CREATE TABLE IF NOT EXISTS device_chains (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -179,7 +173,7 @@ function init() {
     console.warn('[db] cookie 加密迁移失败（不影响启动）：' + e.message);
   }
 
-  // 首次启动写入默认管理员（用户要求 admin/admin）。
+  // 首次启动写入默认管理员。
   const row = db.prepare('SELECT COUNT(*) AS n FROM users WHERE role = ?').get('admin');
   if (!row || row.n === 0) {
     createUser(config.defaultAdminUser, config.defaultAdminPass, 'admin');
@@ -274,11 +268,8 @@ function deleteSession(token) {
 }
 
 /**
- * 清掉某用户的**全部**会话 —— 即「强制退出登录」。
- *
- * ★ 2026-10-01：管理员点「禁用」时必须调它。
- * 否则被禁用的那个浏览器还拿着有效 token，页面上照样能开任务（
- * `disabled` 只在「登录」那一刻检查，已存在的会话不受影响）。
+ * 清掉某用户的全部会话 —— 即「强制退出登录」。
+ * 管理员点「禁用」时必须调它：disabled 只在登录时检查，已存在的会话不受影响，否则禁用后仍能开任务。
  */
 function deleteSessionsByUser(userId) {
   const info = get().prepare('DELETE FROM sessions WHERE user_id = ?').run(Number(userId));
@@ -482,9 +473,7 @@ function createJob(userId, leoAccountId, subUserId, cfg, roundsTotal) {
   const now = Date.now();
   // ⚠️ 参数顺序必须与列顺序严格一致：
   // (user_id, leo_account_id, sub_user_id, status, config_json, rounds_total, created_at)
-  // 之前写成 ...subUserId, JSON.stringify(cfg), roundsTotal, 'queued', now 是错的 ——
-  // 会把 config 写进 status、把 rounds_total 写成字符串 'queued'，
-  // 结果任务循环条件 `i <= job.rounds_total` 永远为 false，一局都不跑就「完成」。
+  // 顺序错会把 config 写进 status、rounds_total 写成字符串，导致循环条件恒 false。
   const info = get()
     .prepare(
       `INSERT INTO jobs (user_id, leo_account_id, sub_user_id, status, config_json, rounds_total, created_at)
@@ -506,8 +495,8 @@ function setJobStatus(id, status, patch = {}) {
   const sets = ['status = ?'];
   const args = [status];
   if (patch.startedAt != null) { sets.push('started_at = ?'); args.push(patch.startedAt); }
-  // ★ 2026-10-01：改成 `!== undefined`，这样「继续任务」时能传 finished_at = null 显式清空
-  //   （否则续跑的任务会带着上次的结束时间，UI 上看起来像「已结束却还在跑」）。
+  // 用 `!== undefined` 判断，使「继续任务」能传 finished_at = null 显式清空
+  // （否则续跑任务带着上次结束时间，UI 像「已结束却还在跑」）。
   if (patch.finishedAt !== undefined) { sets.push('finished_at = ?'); args.push(patch.finishedAt); }
   if (patch.roundsDone != null) { sets.push('rounds_done = ?'); args.push(patch.roundsDone); }
   if (patch.roundsFailed != null) { sets.push('rounds_failed = ?'); args.push(patch.roundsFailed); }
@@ -577,12 +566,8 @@ function listJobRounds(jobId, limit = 200) {
 }
 
 /**
- * 把「上次进程被杀时残留的 running/queued 任务」标成 interrupted。
- *
- * ★ 2026-10-01：现在刷练习也是后台任务了，进程重启后库里会留下永远
- * 「运行中」的僵尸任务，UI 会一直显示「运行中 / 2 个在跑」且无法停止。
- * 启动时清理一次，语义与「服务重启 = 任务中断」一致。
- *
+ * 把进程被杀时残留的 running/queued 任务标成 failed（语义：服务重启 = 任务中断）。
+ * 现在刷练习也是后台任务，重启后会留下僵尸 running 任务，启动时清理一次。
  * @returns {number} 被标记的任务数
  */
 function markInterruptedJobs() {

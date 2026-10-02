@@ -1,27 +1,11 @@
 'use strict';
 /**
- * cookie 值加密（落库用）。
- *
- * ## 为什么要加密
- * 账号的 cookie 里含 **设备链 `ks_*`**（设备级凭据）与 `sess`（登录态）。
- * 之前 `data/pk-node.sqlite` 里是**明文**，谁拿到那个文件谁就拿到了你的登录态与设备身份。
- *
- * ## 方案
- * `AES-256-GCM`（带认证，防篡改），每条 cookie 的 `value` 单独加密：
- *
- * ```
- * enc:v1:<b64 iv(12B)>:<b64 tag(16B)>:<b64 ciphertext>
- * ```
- *
- * - **只加密 value**，`name/domain/path` 保持明文 —— 这样「列出 cookie 名」不需要解密。
- * - 读旧数据时：值不带 `enc:v1:` 前缀 = 明文（历史数据），照常可用；下次写入即加密。
- *
- * ## 密钥（PK_SECRET）
- * - 若设了环境变量 `PK_SECRET`（≥16 字符）→ `key = sha256(PK_SECRET)`；
- * - 否则用密钥文件 `data/secret.key`（32 随机字节，权限 0600），首次运行自动生成。
- *
- * ⚠️ 密钥文件在 `data/` 下（已被 .gitignore 排除），**不要把它提交到仓库**；
- *    丢了密钥 = 已加密的 cookie 无法解密（需要重新导入账号）。
+ * cookie 值加密（落库用）。cookie 含设备链 `ks_*` 与登录态 `sess`，不能明文落库。
+ * 方案：AES-256-GCM（带认证），只加密 value，name/domain/path 保持明文。
+ * 格式：`enc:v1:<b64 iv(12B)>:<b64 tag(16B)>:<b64 ciphertext>`；
+ * 无该前缀 = 明文（历史数据），下次写入即加密。
+ * 密钥：PK_SECRET（≥16 字符）→ sha256；否则 data/secret.key（32 随机字节，0600）。
+ * ⚠️ 密钥文件不要提交仓库；丢了密钥 = 已加密的 cookie 无法解密。
  */
 const crypto = require('node:crypto');
 const fs = require('node:fs');
