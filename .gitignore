@@ -21,3 +21,5 @@ dist/
 .vscode/
 *.swp
 *~
+# Worker 部署产物（由 tools/gen-worker-bundle.js 生成，含 2.7MB base64 so）
+deploy/w/

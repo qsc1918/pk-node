@@ -1,0 +1,41 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "pk-node",
+  "main": "deploy/worker.js",
+  "compatibility_date": "2026-10-02",
+
+  // 容器镜像定义（wrangler deploy 时会用 Docker 构建并推送到 Cloudflare Registry）
+  "containers": [
+    {
+      "class_name": "PkNodeContainer",
+      "image": "./deploy/Dockerfile",
+      "max_instances": 1,
+      "instance_type": "basic"
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "PKNODE", "class_name": "PkNodeContainer" }
+    ]
+  },
+
+  // 容器实例需要有 SQLite 存储的 DO
+  "exports": {
+    "PkNodeContainer": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+
+  // 容器环境变量（敏感值用 `wrangler secret put` 覆盖，不要写在这里）
+  "vars": {
+    "PK_PORT": "8792",
+    "PK_HOST": "0.0.0.0",
+    "PK_R2_BUCKET": "pk-node-data"
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}
