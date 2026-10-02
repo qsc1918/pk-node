@@ -227,6 +227,18 @@ function listUsers() {
     .all();
 }
 
+/** 管理员人数（用于「不能删掉最后一个管理员」的保护）。 */
+function countAdmins() {
+  const r = get().prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'").get();
+  return Number(r && r.n) || 0;
+}
+
+/** 某用户名下的小猿账号数（删除账号前提示用）。 */
+function countLeoAccountsOfUser(userId) {
+  const r = get().prepare('SELECT COUNT(*) AS n FROM leo_accounts WHERE user_id = ?').get(Number(userId));
+  return Number(r && r.n) || 0;
+}
+
 function deleteUser(id) {
   get().prepare('DELETE FROM users WHERE id = ?').run(Number(id));
 }
@@ -259,6 +271,18 @@ function getUserBySession(token) {
 
 function deleteSession(token) {
   get().prepare('DELETE FROM sessions WHERE token = ?').run(String(token));
+}
+
+/**
+ * 清掉某用户的**全部**会话 —— 即「强制退出登录」。
+ *
+ * ★ 2026-10-01：管理员点「禁用」时必须调它。
+ * 否则被禁用的那个浏览器还拿着有效 token，页面上照样能开任务（
+ * `disabled` 只在「登录」那一刻检查，已存在的会话不受影响）。
+ */
+function deleteSessionsByUser(userId) {
+  const info = get().prepare('DELETE FROM sessions WHERE user_id = ?').run(Number(userId));
+  return Number(info.changes) || 0;
 }
 
 function purgeExpiredSessions() {
@@ -482,7 +506,9 @@ function setJobStatus(id, status, patch = {}) {
   const sets = ['status = ?'];
   const args = [status];
   if (patch.startedAt != null) { sets.push('started_at = ?'); args.push(patch.startedAt); }
-  if (patch.finishedAt != null) { sets.push('finished_at = ?'); args.push(patch.finishedAt); }
+  // ★ 2026-10-01：改成 `!== undefined`，这样「继续任务」时能传 finished_at = null 显式清空
+  //   （否则续跑的任务会带着上次的结束时间，UI 上看起来像「已结束却还在跑」）。
+  if (patch.finishedAt !== undefined) { sets.push('finished_at = ?'); args.push(patch.finishedAt); }
   if (patch.roundsDone != null) { sets.push('rounds_done = ?'); args.push(patch.roundsDone); }
   if (patch.roundsFailed != null) { sets.push('rounds_failed = ?'); args.push(patch.roundsFailed); }
   if (patch.error !== undefined) { sets.push('error = ?'); args.push(patch.error); }
@@ -511,19 +537,37 @@ function getJob(id) {
   return get().prepare('SELECT * FROM jobs WHERE id = ?').get(Number(id));
 }
 
+const JOB_SELECT = `
+  SELECT j.*, u.username, la.name AS leo_name
+    FROM jobs j
+    LEFT JOIN users u ON u.id = j.user_id
+    LEFT JOIN leo_accounts la ON la.id = j.leo_account_id`;
+
 function listJobs(userId, limit = 50) {
   return get()
-    .prepare('SELECT * FROM jobs WHERE user_id = ? ORDER BY id DESC LIMIT ?')
+    .prepare(JOB_SELECT + ' WHERE j.user_id = ? ORDER BY j.id DESC LIMIT ?')
     .all(Number(userId), Number(limit));
 }
 
 function listAllJobs(limit = 100) {
   return get()
-    .prepare(
-      `SELECT j.*, u.username FROM jobs j LEFT JOIN users u ON u.id = j.user_id
-       ORDER BY j.id DESC LIMIT ?`,
-    )
+    .prepare(JOB_SELECT + ' ORDER BY j.id DESC LIMIT ?')
     .all(Number(limit));
+}
+
+/**
+ * 某用户「还没跑完」的任务（running / queued / paused）。
+ *
+ * 用途：管理员禁用 / 删除用户时，要把这些任务一并停下来 —— 否则用户界面上
+ * 显示「已禁用」，后台却还在替他刷局。
+ */
+function listActiveJobsByUser(userId) {
+  return get()
+    .prepare(
+      `SELECT * FROM jobs WHERE user_id = ? AND status IN ('running','queued','paused')
+       ORDER BY id DESC`,
+    )
+    .all(Number(userId));
 }
 
 function listJobRounds(jobId, limit = 200) {
@@ -597,11 +641,14 @@ module.exports = {
   setUserPassword,
   setUserDisabled,
   listUsers,
+  countAdmins,
+  countLeoAccountsOfUser,
   deleteUser,
   touchLogin,
   createSession,
   getUserBySession,
   deleteSession,
+  deleteSessionsByUser,
   purgeExpiredSessions,
   migrateCookieEncryption,
   addDeviceChain,
@@ -623,6 +670,7 @@ module.exports = {
   getJob,
   listJobs,
   listAllJobs,
+  listActiveJobsByUser,
   listJobRounds,
   markInterruptedJobs,
   kvGet,

@@ -158,6 +158,8 @@ function startJob(o) {
   // 而不是每个新任务都从零重新白撞一次。
   const ctx = {
     stopped: false,
+    // 'stop' = 彻底结束；'pause' = 暂停（保留进度，可「继续」从下一轮接着跑）
+    paused: false,
     jar: jar,
     config: cfg,
     controller: controller,
@@ -171,16 +173,21 @@ function startJob(o) {
 
   // 后台跑（不 await，让 HTTP 请求立刻返回）
   runLoop(job, cfg, ctx).catch((e) => {
-    // 被手动结束 → stopped（不是失败），别让用户看到一条吓人的 failed
+    // 被手动结束 → stopped / paused（不是失败），别让用户看到一条吓人的 failed。
+    //
+    // ⚠️ 优先级：**用户显式「暂停」优先于任何异常** —— 暂停时我们在中断在途请求，
+    // 那些请求抛出的网络错误（DNS/超时/连接重置）不应把任务判成 failed，
+    // 否则「暂停」完一刷新就变成「失败」，已刷的进度也白记了。
     const aborted = e && e.aborted === true;
-    db.setJobStatus(job.id, aborted ? 'stopped' : 'failed', {
+    const paused = ctx.paused;
+    db.setJobStatus(job.id, paused ? 'paused' : (aborted ? 'stopped' : 'failed'), {
       finishedAt: Date.now(),
-      error: aborted ? null : e.message,
+      error: (paused || aborted) ? null : e.message,
     });
     publish(job.id, {
       type: 'status',
-      message: aborted ? '任务已立即结束' : ('任务异常：' + e.message),
-      finished: true,
+      message: paused ? '任务已暂停' : (aborted ? '任务已立即结束' : ('任务异常：' + e.message)),
+      finished: !paused,
       at: Date.now(),
     });
   }).finally(() => {
@@ -191,34 +198,126 @@ function startJob(o) {
 }
 
 /**
- * 停止任务。
+ * 停止 / 暂停任务。
  *
  * `immediate=true`（默认）→ **立即结束**：中断在途 HTTP + 中断等待中的 sleep，
- * 不用等当前轮次跑完（否则最长要等 20s 的轮间隔）。
+ * 不用等当前轮次跑完（否则最长要等 60s 的轮间隔）。
  * `immediate=false` → 老行为：等本轮结束再退。
+ *
+ * ★ 2026-10-01：新增 `mode='pause'`。
+ *
+ *   管理后台要能「暂停别人的任务」，而原来的语义只有「彻底结束」。
+ *   暂停 = 立即中断，但状态记为 **paused**（不是 stopped），且**保留已跑轮数** ——
+ *   于是「继续」时可以从 `rounds_done + 1` 接着跑，不浪费已经刷过的局。
+ *
+ * @param {number} jobId
+ * @param {boolean} [immediate] 默认 true
+ * @param {{mode?:'stop'|'pause'}} [opts]
  */
-function stopJob(jobId, immediate) {
+function stopJob(jobId, immediate, opts) {
   const id = Number(jobId);
   const quick = immediate !== false;      // 默认立即
+  const mode = (opts && opts.mode) || 'stop';
+  const pause = mode === 'pause';
   const ctx = running.get(id);
 
   if (!ctx) {
     const job = db.getJob(id);
-    if (job && (job.status === 'queued' || job.status === 'running')) {
-      db.setJobStatus(id, 'stopped', { finishedAt: Date.now() });
-      return { ok: true, message: '任务未在运行，已标记为停止' };
+    if (job && (job.status === 'queued' || job.status === 'running' || job.status === 'paused')) {
+      db.setJobStatus(id, pause ? 'paused' : 'stopped', { finishedAt: Date.now() });
+      return { ok: true, message: '任务未在运行，已标记为' + (pause ? '暂停' : '停止') };
     }
     return { ok: false, message: '任务未在运行' };
   }
 
   ctx.stopped = true;
+  if (pause) ctx.paused = true;
   if (quick && ctx.controller) {
-    publish(id, { type: 'status', message: '收到「立即结束」，正在中断…', at: Date.now() });
+    publish(id, {
+      type: 'status',
+      message: pause ? '收到「暂停」，正在中断…' : '收到「立即结束」，正在中断…',
+      at: Date.now(),
+    });
     ctx.controller.abort();               // 掐断在途请求与 sleep
   } else {
-    publish(id, { type: 'status', message: '收到停止请求，将在本轮结束后退出', at: Date.now() });
+    publish(id, {
+      type: 'status',
+      message: pause ? '收到暂停请求，将在本轮结束后挂起' : '收到停止请求，将在本轮结束后退出',
+      at: Date.now(),
+    });
   }
-  return { ok: true, immediate: quick };
+  return { ok: true, immediate: quick, mode: mode };
+}
+
+/**
+ * 继续一个「已暂停 / 已停止」的任务（从下一轮接着跑，已刷的局不丢）。
+ *
+ * ## 为什么不是「新建任务」
+ *
+ * 暂停时 `rounds_done` 已经落库，而主循环是 `for (i = rounds_done + 1; …)`，
+ * 所以**沿用同一个 jobId** 重新 `startJob()` 就是天然断点续跑 ——
+ * 任务 id 不变、日志流不断、管理页看到的是同一条记录。
+ *
+ * @param {number} jobId
+ * @returns {{ok:boolean, message?:string, jobId?:number, resumedFrom?:number}}
+ */
+function resumeJob(jobId) {
+  const id = Number(jobId);
+  const job = db.getJob(id);
+  if (!job) return { ok: false, message: '任务不存在' };
+  if (running.has(id)) return { ok: false, message: '该任务正在运行中' };
+  if (job.status !== 'paused' && job.status !== 'stopped' && job.status !== 'queued') {
+    return { ok: false, message: '只有「已暂停 / 已停止」的任务可以继续' };
+  }
+  if ((job.rounds_done || 0) >= job.rounds_total) {
+    return { ok: false, message: '任务已跑完全部轮次，没有可继续的' };
+  }
+
+  let kind = 'pk';
+  try { kind = (JSON.parse(job.config_json) || {}).kind || 'pk'; } catch (e) { /* 保持 pk */ }
+
+  // 清掉上次结束的痕迹，回到「排队中」再由 start*Job 置为 running
+  db.setJobStatus(id, 'queued', { finishedAt: null, error: null });
+  const start = kind === 'exercise' ? startExerciseJob({ jobId: id }) : startJob({ jobId: id });
+  if (!start.ok) return start;
+  return {
+    ok: true,
+    jobId: id,
+    resumedFrom: (job.rounds_done || 0) + 1,
+    roundsTotal: job.rounds_total,
+    message: `已继续：从第 ${(job.rounds_done || 0) + 1}/${job.rounds_total} 轮接着跑`,
+  };
+}
+
+/**
+ * 把某用户**所有还没跑完**的任务停掉 / 暂停。
+ *
+ * 用途：管理员「禁用」或「删除」用户时，必须连带把他正在跑的任务停掉 ——
+ * 否则界面上写着「已禁用」，后台还在替他刷局（这正是用户反馈的问题）。
+ *
+ * @param {number} userId
+ * @param {{mode?:'stop'|'pause'}} [opts]
+ * @returns {number} 受影响的任务数
+ */
+function stopJobsByUser(userId, opts) {
+  const mode = (opts && opts.mode) || 'pause';
+  const uid = Number(userId);
+  let n = 0;
+  // 1) 真正在跑的：走正规停止流程（会中断在途请求）
+  for (const id of Array.from(running.keys())) {
+    const job = db.getJob(id);
+    if (job && Number(job.user_id) === uid) {
+      stopJob(id, true, { mode: mode });
+      n++;
+    }
+  }
+  // 2) 库里残留的 queued / paused（进程重启过、或压根没起来）：直接落状态
+  for (const job of db.listActiveJobsByUser(uid)) {
+    if (running.has(job.id)) continue;
+    db.setJobStatus(job.id, mode === 'pause' ? 'paused' : 'stopped', { finishedAt: Date.now() });
+    n++;
+  }
+  return n;
 }
 
 /** 主循环：一轮一轮跑，每轮落库并广播。 */
@@ -252,8 +351,19 @@ async function runLoop(job, cfg, ctx) {  const jobId = job.id;
 
   for (let i = done + 1; i <= job.rounds_total; i++) {
     if (ctx.stopped) {
-      db.setJobStatus(jobId, 'stopped', { finishedAt: Date.now(), roundsDone: done, roundsFailed: failed });
-      publish(jobId, { type: 'status', message: `已停止（完成 ${done}/${job.rounds_total}）`, at: Date.now() });
+      // 暂停（paused）与停止（stopped）都在这里收尾，区别只在落库状态：
+      // paused 保留已跑轮数，之后可以「继续」；stopped 视为彻底结束。
+      db.setJobStatus(jobId, ctx.paused ? 'paused' : 'stopped', {
+        finishedAt: Date.now(), roundsDone: done, roundsFailed: failed,
+      });
+      publish(jobId, {
+        type: 'status',
+        message: ctx.paused
+          ? `已暂停（完成 ${done}/${job.rounds_total}，可点「继续」接着跑）`
+          : `已停止（完成 ${done}/${job.rounds_total}）`,
+        finished: !ctx.paused,
+        at: Date.now(),
+      });
       return;
     }
 
@@ -265,10 +375,19 @@ async function runLoop(job, cfg, ctx) {  const jobId = job.id;
         publish(jobId, Object.assign({ round: i, at: Date.now() }, ev));
       }, ctx);
     } catch (e) {
-      // 被手动「立即结束」→ 直接收尾，标 stopped，不当失败
+      // 被手动「立即结束 / 暂停」→ 直接收尾，不当失败
       if (e && e.aborted === true) {
-        db.setJobStatus(jobId, 'stopped', { finishedAt: Date.now(), roundsDone: done, roundsFailed: failed });
-        publish(jobId, { type: 'status', message: `已立即结束（完成 ${done}/${job.rounds_total}）`, finished: true, at: Date.now() });
+        db.setJobStatus(jobId, ctx.paused ? 'paused' : 'stopped', {
+          finishedAt: Date.now(), roundsDone: done, roundsFailed: failed,
+        });
+        publish(jobId, {
+          type: 'status',
+          message: ctx.paused
+            ? `已暂停（完成 ${done}/${job.rounds_total}，可点「继续」接着跑）`
+            : `已立即结束（完成 ${done}/${job.rounds_total}）`,
+          finished: !ctx.paused,
+          at: Date.now(),
+        });
         return;
       }
       res = { ok: false, httpCode: null, message: '异常：' + e.message, detail: '' };
@@ -343,6 +462,7 @@ function startExerciseJob(o) {
   const controller = new AbortController();
   const ctx = {
     stopped: false,
+    paused: false,
     jar: jarOf(account),
     config: cfg,
     controller: controller,
@@ -357,14 +477,16 @@ function startExerciseJob(o) {
   });
 
   runExerciseLoop(job, cfg, ctx).catch((e) => {
-    // startExerciseJob 里 runExerciseLoop 已自行 try/catch，这里是最后兜底
+    // startExerciseJob 里 runExerciseLoop 已自行 try/catch，这里是最后兜底。
+    // 同刷局：**用户显式暂停优先于任何异常**（中断在途请求带来的网络错误不算失败）。
     const aborted = e && e.aborted === true;
-    db.setJobStatus(job.id, aborted ? 'stopped' : 'failed', {
-      finishedAt: Date.now(), error: aborted ? null : e.message,
+    const paused = ctx.paused;
+    db.setJobStatus(job.id, paused ? 'paused' : (aborted ? 'stopped' : 'failed'), {
+      finishedAt: Date.now(), error: (paused || aborted) ? null : e.message,
     });
     publish(job.id, {
-      type: 'status', exercise: true, jobId: job.id, finished: true,
-      message: aborted ? '练习已停止' : ('练习任务异常：' + e.message),
+      type: 'status', exercise: true, jobId: job.id, finished: !paused,
+      message: paused ? '练习已暂停' : (aborted ? '练习已停止' : ('练习任务异常：' + e.message)),
       at: Date.now(),
     });
   }).finally(() => { running.delete(job.id); });
@@ -403,6 +525,18 @@ async function runExerciseLoop(job, cfg, ctx) {
       onEvent: emit,
     });
     done = r.done; failed = r.failed;
+    // 期间被暂停 → 落 paused（保留进度），别标成「已完成」
+    if (ctx.stopped) {
+      db.setJobStatus(jobId, ctx.paused ? 'paused' : 'stopped', {
+        finishedAt: Date.now(), roundsDone: done, roundsFailed: failed,
+      });
+      publish(jobId, {
+        type: 'status', exercise: true, jobId: jobId, finished: !ctx.paused,
+        message: ctx.paused ? `练习已暂停（完成 ${done}，可点「继续」接着跑）` : `练习已停止（完成 ${done}）`,
+        at: Date.now(),
+      });
+      return;
+    }
     db.setJobStatus(jobId, 'done', { finishedAt: Date.now(), roundsDone: done, roundsFailed: failed });
     // 收尾核对一次周分数（只读接口，不计入任何频控）——「经验到底到账没」的唯一可信口径
     let scoreMsg = '';
@@ -417,13 +551,16 @@ async function runExerciseLoop(job, cfg, ctx) {
     });
   } catch (e) {
     const aborted = e && e.aborted === true;
-    db.setJobStatus(jobId, aborted ? 'stopped' : 'failed', {
+    const paused = ctx.paused;
+    db.setJobStatus(jobId, paused ? 'paused' : (aborted ? 'stopped' : 'failed'), {
       finishedAt: Date.now(), roundsDone: done, roundsFailed: failed,
-      error: aborted ? null : e.message,
+      error: (paused || aborted) ? null : e.message,
     });
     publish(jobId, {
-      type: 'status', exercise: true, jobId: jobId, finished: true,
-      message: aborted ? `练习已停止（完成 ${done}）` : ('练习任务异常：' + e.message),
+      type: 'status', exercise: true, jobId: jobId, finished: !paused,
+      message: paused
+        ? `练习已暂停（完成 ${done}，可点「继续」接着跑）`
+        : (aborted ? `练习已停止（完成 ${done}）` : ('练习任务异常：' + e.message)),
       at: Date.now(),
     });
   }
@@ -450,6 +587,8 @@ module.exports = {
   startJob,
   startExerciseJob,
   stopJob,
+  resumeJob,
+  stopJobsByUser,
   subscribe,
   publish,
   bufferedEvents,

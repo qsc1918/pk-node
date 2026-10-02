@@ -238,6 +238,67 @@ function clampRounds(v, def) {
   return Math.min(n, MAX_ROUNDS);
 }
 
+/* ---------------------- 任务参数构造（单个 / 批量共用） ---------------------- */
+//
+// 2026-10-01：批量开任务要求「N 个账号用同一套参数」，所以把参数解析抽成纯函数，
+// 「单开」与「批量」走同一份代码 —— 避免两边漂移（一边改了另一边忘了）。
+// 出错时不抛异常，而是返回 `{ error: '…' }`，由调用方决定回什么状态码。
+
+/** 刷局（PK）参数。 */
+function makePkConfig(b) {
+  const cfg = {
+    pointId: Number(b.pointId || 1951),
+    costTimeMs: b.costTimeMs == null || b.costTimeMs === '' ? null : Number(b.costTimeMs),
+    // 轮间隔：**唯一的节奏旋钮**。服务端有 ≈60s 的账号级出题冷却（实测仍在），
+    // 但引擎按要求**不强制**替你等 —— 你填多少就按多少跑（默认取网页上的推荐值）。
+    gapMinMs: b.gapMinMs == null ? 60000 : Number(b.gapMinMs),
+    gapMaxMs: b.gapMaxMs == null ? 65000 : Number(b.gapMaxMs),
+    // 出题成功 → 提交答案 之间的间隔（让节奏更像真人，也错开频控窗口）
+    submitDelayMinMs: b.submitDelayMinMs == null ? 0 : Number(b.submitDelayMinMs),
+    submitDelayMaxMs: b.submitDelayMaxMs == null ? 0 : Number(b.submitDelayMaxMs),
+    rateLimitBaseMs: b.rateLimitBaseMs == null ? PK.rateLimitBaseMs : Number(b.rateLimitBaseMs),
+    rateLimitMaxWait: b.rateLimitMaxWait == null ? PK.rateLimitMaxWait : Number(b.rateLimitMaxWait),
+    // 出题被频控时的自动重试：间隔 / 总等待上限（见 pk-engine 第 2 步）
+    matchRetryIntervalMs: b.matchRetryIntervalMs == null ? PK.matchRetryIntervalMs : Number(b.matchRetryIntervalMs),
+    matchRetryMaxMs: b.matchRetryMaxMs == null ? PK.matchRetryMaxMs : Number(b.matchRetryMaxMs),
+    strokeMode: strokes.normalizeStrokeMode(b.strokeMode),
+    subUserId: b.subUserId == null ? null : Number(b.subUserId),
+  };
+  if (cfg.costTimeMs != null && (!Number.isFinite(cfg.costTimeMs) || cfg.costTimeMs < 0)) {
+    return { error: 'costTime 必须是非负数字（留空=自动）' };
+  }
+  // ★ 2026-10-01：不再截断轮数（原来 Math.min(999, …) 会把大数字悄悄改小）。
+  //   只挡掉非数字/非正数；上限给一个足够大的安全值防止误填天文数字。
+  cfg.rounds = clampRounds(b.rounds, 10);
+  return cfg;
+}
+
+/** 刷练习参数。 */
+function makeExerciseConfig(b) {
+  const cfg = {
+    kind: 'exercise',
+    keypointId: Number(b.keypointId) || 235001,
+    limit: Math.max(1, Math.min(200, Number(b.limit) || 100)),
+    gapMinMs: Math.max(0, Number(b.gapMinMs) || 0),
+    gapMaxMs: Math.max(0, Number(b.gapMaxMs) || 0),
+    costTimePerQuestionMs: b.costTimePerQuestionMs == null ? undefined : Number(b.costTimePerQuestionMs),
+  };
+  cfg.rounds = clampRounds(b.rounds, 1);
+  return cfg;
+}
+
+/**
+ * 任务归属判定：本人或管理员可操作。
+ *
+ * ⚠️ 2026-10-01：此前 `/api/jobs/:id/stop` 没做这个校验 —— 任何登录用户
+ *    都能停掉别人的任务。所有任务操作接口现在统一走这里。
+ */
+function jobBelongsTo(job, user) {
+  if (!job || !user) return false;
+  if (user.role === 'admin') return true;
+  return Number(job.user_id) === Number(user.id);
+}
+
 /* ---------------------------- 静态文件 ---------------------------- */
 
 const MIME = {
@@ -335,6 +396,14 @@ async function handleApi(req, res, u, user) {
     const r = auth.changePassword(user.id, b.oldPassword, b.newPassword);
     db.audit(user.id, 'change_password', r.ok ? '成功' : r.message, clientIp(req));
     return sendJson(res, r.ok ? 200 : 400, r);
+  }
+
+  // ★ 2026-10-01：被禁用的账号在此一律拦下。
+  //   `auth.currentUser` 已经会让禁用用户的会话立刻失效（返回 null → 401），
+  //   这里是**纵深防御**：万一有请求抢在会话清理之前进来（或前端还拿着旧 token），
+  //   也不允许开任务 / 加账号 / 启穿透等任何写操作。退出登录在上面已放行。
+  if (user && user.disabled) {
+    return sendJson(res, 403, { ok: false, message: '账号已被管理员禁用' });
   }
 
   /* ------------------------ 小猿登录（短信 / 密码） ------------------------ */
@@ -654,36 +723,68 @@ async function handleApi(req, res, u, user) {
     });
   }
 
+  /* ---- 批量开任务：多个小猿账号，同一套配置，各起一个任务 ---- */
+  //
+  // ★ 2026-10-01：用户场景「我登了 6 个账号，想按同样配置一次性全开」。
+  //   逐个点 6 次「开始刷局」既慢又容易填错参数 —— 这里一次请求搞定：
+  //   每个账号**各建一条 jobs 记录**（各自独立计数、独立可停），
+  //   共用的只是同一份参数快照。某个账号失败（比如没设备链）不影响其它账号。
+  if (p === '/api/jobs/batch' && method === 'POST') {
+    const b = await readJson(req);
+    const ids = (Array.isArray(b.leoAccountIds) ? b.leoAccountIds : [])
+      .map((x) => Number(x)).filter((n) => Number.isFinite(n) && n > 0);
+    const uniq = Array.from(new Set(ids));
+    if (uniq.length === 0) return sendJson(res, 400, { ok: false, message: '请先勾选至少一个小猿账号' });
+    if (uniq.length > 100) return sendJson(res, 400, { ok: false, message: '一次最多 100 个账号' });
+
+    const kind = b.kind === 'exercise' ? 'exercise' : 'pk';
+    const results = [];
+    let okCount = 0;
+    for (const leoId of uniq) {
+      const acc = db.getLeoAccount(leoId);
+      if (!acc || acc.user_id !== user.id) {
+        results.push({ leoAccountId: leoId, ok: false, message: '小猿账号不存在' });
+        continue;
+      }
+      let jobId, start;
+      if (kind === 'exercise') {
+        const cfg = makeExerciseConfig(b);
+        if (cfg.error) { results.push({ leoAccountId: leoId, name: acc.name, ok: false, message: cfg.error }); continue; }
+        jobId = db.createJob(user.id, leoId, null, cfg, cfg.rounds);
+        start = jobs.startExerciseJob({ jobId: jobId });
+        if (!start.ok) db.setJobStatus(jobId, 'failed', { finishedAt: Date.now(), error: start.message });
+      } else {
+        const cfg = makePkConfig(b);
+        if (cfg.error) { results.push({ leoAccountId: leoId, name: acc.name, ok: false, message: cfg.error }); continue; }
+        jobId = db.createJob(user.id, leoId, cfg.subUserId, cfg, cfg.rounds);
+        start = jobs.startJob({ jobId: jobId });
+        if (!start.ok) db.setJobStatus(jobId, 'failed', { finishedAt: Date.now(), error: start.message });
+      }
+      if (start.ok) okCount++;
+      results.push({
+        leoAccountId: leoId, name: acc.name, ok: !!start.ok, jobId: jobId, message: start.message,
+      });
+    }
+    db.audit(user.id, 'job_batch_create', `kind=${kind} n=${uniq.length} ok=${okCount}`, clientIp(req));
+    return sendJson(res, 200, {
+      ok: okCount > 0,
+      kind: kind,
+      started: okCount,
+      failed: uniq.length - okCount,
+      results: results,
+      message: `已启动 ${okCount}/${uniq.length} 个任务` + (okCount < uniq.length ? '（部分失败，见明细）' : ''),
+    });
+  }
+
   if (p === '/api/jobs' && method === 'POST') {
     const b = await readJson(req);
     const leoId = Number(b.leoAccountId);
     const acc = db.getLeoAccount(leoId);
     if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '小猿账号不存在' });
 
-    const cfg = {
-      pointId: Number(b.pointId || 1951),
-      costTimeMs: b.costTimeMs == null || b.costTimeMs === '' ? null : Number(b.costTimeMs),
-      // 轮间隔：**唯一的节奏旋钮**。服务端有 ≈60s 的账号级出题冷却（实测仍在），
-      // 但引擎按要求**不强制**替你等 —— 你填多少就按多少跑（默认取网页上的推荐值）。
-      gapMinMs: b.gapMinMs == null ? 60000 : Number(b.gapMinMs),
-      gapMaxMs: b.gapMaxMs == null ? 65000 : Number(b.gapMaxMs),
-      // 出题成功 → 提交答案 之间的间隔（让节奏更像真人，也错开频控窗口）
-      submitDelayMinMs: b.submitDelayMinMs == null ? 0 : Number(b.submitDelayMinMs),
-      submitDelayMaxMs: b.submitDelayMaxMs == null ? 0 : Number(b.submitDelayMaxMs),
-      rateLimitBaseMs: b.rateLimitBaseMs == null ? PK.rateLimitBaseMs : Number(b.rateLimitBaseMs),
-      rateLimitMaxWait: b.rateLimitMaxWait == null ? PK.rateLimitMaxWait : Number(b.rateLimitMaxWait),
-      // 出题被频控时的自动重试：间隔 / 总等待上限（见 pk-engine 第 2 步）
-      matchRetryIntervalMs: b.matchRetryIntervalMs == null ? PK.matchRetryIntervalMs : Number(b.matchRetryIntervalMs),
-      matchRetryMaxMs: b.matchRetryMaxMs == null ? PK.matchRetryMaxMs : Number(b.matchRetryMaxMs),
-      strokeMode: strokes.normalizeStrokeMode(b.strokeMode),
-      subUserId: b.subUserId == null ? null : Number(b.subUserId),
-    };
-    if (cfg.costTimeMs != null && (!Number.isFinite(cfg.costTimeMs) || cfg.costTimeMs < 0)) {
-      return sendJson(res, 400, { ok: false, message: 'costTime 必须是非负数字（留空=自动）' });
-    }
-    // ★ 2026-10-01：不再截断轮数（原来 Math.min(999, …) 会把大数字悄悄改小）。
-    //   只挡掉非数字/非正数；上限给一个足够大的安全值防止误填天文数字。
-    const rounds = clampRounds(b.rounds, 10);
+    const cfg = makePkConfig(b);
+    if (cfg.error) return sendJson(res, 400, { ok: false, message: cfg.error });
+    const rounds = cfg.rounds;
     const jobId = db.createJob(user.id, leoId, cfg.subUserId, cfg, rounds);
     db.audit(user.id, 'job_create', `job=${jobId} rounds=${rounds} pointId=${cfg.pointId}`, clientIp(req));
 
@@ -691,19 +792,47 @@ async function handleApi(req, res, u, user) {
     return sendJson(res, start.ok ? 200 : 400, { ok: start.ok, jobId: jobId, message: start.message });
   }
 
+  /* ---- 停止 / 暂停 / 继续（普通用户只能动自己的任务） ---- */
+  //
+  // ⚠️ 2026-10-01 修了个洞：原来的 `/api/jobs/:id/stop` **完全没校验归属**，
+  //    任何登录用户都能把别人的任务停掉。这里统一走 `jobBelongsTo` 校验。
   const jobStop = /^\/api\/jobs\/(\d+)\/stop$/.exec(p);
   if (jobStop && method === 'POST') {
+    const id = Number(jobStop[1]);
+    const job = db.getJob(id);
+    if (!job || !jobBelongsTo(job, user)) return sendJson(res, 404, { ok: false, message: '任务不存在' });
     const b = await readJson(req).catch(() => ({}));
     // immediate 默认 true = 立即结束（中断在途请求与等待）
-    const r = jobs.stopJob(Number(jobStop[1]), b.immediate !== false);
+    const r = jobs.stopJob(id, b.immediate !== false, { mode: b.mode === 'pause' ? 'pause' : 'stop' });
+    db.audit(user.id, 'job_stop', `job=${id} mode=${(r && r.mode) || 'stop'}`, clientIp(req));
     return sendJson(res, 200, r);
+  }
+
+  const jobPause = /^\/api\/jobs\/(\d+)\/pause$/.exec(p);
+  if (jobPause && method === 'POST') {
+    const id = Number(jobPause[1]);
+    const job = db.getJob(id);
+    if (!job || !jobBelongsTo(job, user)) return sendJson(res, 404, { ok: false, message: '任务不存在' });
+    const r = jobs.stopJob(id, true, { mode: 'pause' });
+    db.audit(user.id, 'job_pause', 'job=' + id, clientIp(req));
+    return sendJson(res, 200, r);
+  }
+
+  const jobResume = /^\/api\/jobs\/(\d+)\/resume$/.exec(p);
+  if (jobResume && method === 'POST') {
+    const id = Number(jobResume[1]);
+    const job = db.getJob(id);
+    if (!job || !jobBelongsTo(job, user)) return sendJson(res, 404, { ok: false, message: '任务不存在' });
+    const r = jobs.resumeJob(id);
+    db.audit(user.id, 'job_resume', 'job=' + id + (r.ok ? ' ok' : ' ' + r.message), clientIp(req));
+    return sendJson(res, r.ok ? 200 : 400, r);
   }
 
   const jobDetail = /^\/api\/jobs\/(\d+)$/.exec(p);
   if (jobDetail && method === 'GET') {
     const id = Number(jobDetail[1]);
     const job = db.getJob(id);
-    if (!job || job.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '任务不存在' });
+    if (!job || !jobBelongsTo(job, user)) return sendJson(res, 404, { ok: false, message: '任务不存在' });
     return sendJson(res, 200, {
       ok: true,
       job: publicJob(job),
@@ -715,7 +844,8 @@ async function handleApi(req, res, u, user) {
   if (jobStream && method === 'GET') {
     const id = Number(jobStream[1]);
     const job = db.getJob(id);
-    if (!job || job.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '任务不存在' });
+    // 管理员可以旁观任何人的任务日志（管理页「明细」要用）
+    if (!job || !jobBelongsTo(job, user)) return sendJson(res, 404, { ok: false, message: '任务不存在' });
 
     // ★ 统一走 sseStart()：隧道（Cloudflare）下 no-store 会被边缘压缩/缓冲，
     //   导致「一条日志都刷不出来」。详见 sseStart 的注释。
@@ -807,28 +937,17 @@ async function handleApi(req, res, u, user) {
     const b = await readJson(req);
     const acc = db.getLeoAccount(Number(b.leoAccountId));
     if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '小猿账号不存在' });
-    const rounds = clampRounds(b.rounds, 1);
-    const limit = Math.max(1, Math.min(200, Number(b.limit) || 100));
-    const keypointId = Number(b.keypointId) || 235001;
 
     // ★★ 2026-10-01：刷练习改为**正经的后台任务**（跟刷局同一套）。
     //
     //  旧实现是裸的 async IIFE：不落库、不登记 running、不占并行名额，
     //  于是「任务」页看不到它、切 tab 回来日志空白、也没法停止。
     //  现在写一条 jobs 记录（config.kind='exercise'）再交给 jobs.startExerciseJob，
-    //  于是：任务页可见 / 逐轮明细落库 / 可停止 / 与刷局共用 SSE。
-    const cfg = {
-      kind: 'exercise',
-      keypointId: keypointId,
-      limit: limit,
-      gapMinMs: Math.max(0, Number(b.gapMinMs) || 0),
-      gapMaxMs: Math.max(0, Number(b.gapMaxMs) || 0),
-      costTimePerQuestionMs: b.costTimePerQuestionMs == null ? undefined : Number(b.costTimePerQuestionMs),
-      rounds: rounds,
-    };
-    const jobId = db.createJob(user.id, acc.id, null, cfg, rounds);
+    //  于是：任务页可见 / 逐轮明细落库 / 可停止 / 可暂停继续 / 与刷局共用 SSE。
+    const cfg = makeExerciseConfig(b);
+    const jobId = db.createJob(user.id, acc.id, null, cfg, cfg.rounds);
     const start = jobs.startExerciseJob({ jobId: jobId });
-    db.audit(user.id, 'exercise_run', `job=${jobId} leo=${acc.id} rounds=${rounds} limit=${limit} kp=${keypointId}`, clientIp(req));
+    db.audit(user.id, 'exercise_run', `job=${jobId} leo=${acc.id} rounds=${cfg.rounds} limit=${cfg.limit} kp=${cfg.keypointId}`, clientIp(req));
     if (!start.ok) {
       db.setJobStatus(jobId, 'failed', { finishedAt: Date.now(), error: start.message });
       return sendJson(res, 400, { ok: false, jobId: jobId, message: start.message });
@@ -836,9 +955,9 @@ async function handleApi(req, res, u, user) {
     return sendJson(res, 200, {
       ok: true,
       jobId: jobId,
-      rounds: rounds,
-      limit: limit,
-      message: `已开始：${rounds} 轮 × ${limit} 题（任务 #${jobId}，可在「任务」页查看进度）`,
+      rounds: cfg.rounds,
+      limit: cfg.limit,
+      message: `已开始：${cfg.rounds} 轮 × ${cfg.limit} 题（任务 #${jobId}，可在「任务」页查看进度）`,
     });
   }
 
@@ -885,7 +1004,12 @@ async function handleApi(req, res, u, user) {
 
   if (p === '/api/admin/users' && method === 'GET') {
     if (user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
-    return sendJson(res, 200, { ok: true, users: db.listUsers() });
+    // 带上「有几个小猿账号 / 有几个任务还在跑」—— 删除前要给管理员看清楚要删掉什么
+    const users = db.listUsers().map((u) => Object.assign({}, u, {
+      leoAccounts: db.countLeoAccountsOfUser(u.id),
+      activeJobs: db.listActiveJobsByUser(u.id).length,
+    }));
+    return sendJson(res, 200, { ok: true, users: users });
   }
 
   if (p === '/api/admin/users' && method === 'POST') {
@@ -918,14 +1042,128 @@ async function handleApi(req, res, u, user) {
     const target = db.findUserById(Number(adminUserDisable[1]));
     if (!target) return sendJson(res, 404, { ok: false, message: '用户不存在' });
     if (target.id === user.id) return sendJson(res, 400, { ok: false, message: '不能禁用自己' });
-    db.setUserDisabled(target.id, !!b.disabled);
-    db.audit(user.id, 'admin_disable_user', target.username + ' -> ' + (b.disabled ? '禁用' : '启用'), clientIp(req));
-    return sendJson(res, 200, { ok: true });
+    const disable = !!b.disabled;
+    db.setUserDisabled(target.id, disable);
+
+    // ★★ 2026-10-01：禁用 = **立刻暂停他的全部任务 + 强制退出登录**。
+    //
+    //  原实现只改了 users.disabled 一个字段，而 `disabled` 只在**登录时**校验，
+    //  于是对方浏览器那张旧会话 token 完全不受影响 —— 页面照常显示、任务照常能开，
+    //  「禁用」形同虚设（这正是用户反馈的问题）。
+    //
+    //  现在三件事一起做：
+    //   1) 把他名下所有 running/queued 任务**暂停**（不是直接 stopped —— 保留已刷轮数，
+    //      重新启用后他自己可以点「继续」接着跑，不浪费）；
+    //   2) 删掉他**所有**会话 ⇒ 现有页面立刻 401 被踢回登录页；
+    //   3) `auth.currentUser` 对 disabled 返回 null（见 services/auth.js），
+    //      所以就算他还有别的设备在线，下一个请求也会被挡。
+    let paused = 0, kicked = 0;
+    if (disable) {
+      paused = jobs.stopJobsByUser(target.id, { mode: 'pause' });
+      kicked = db.deleteSessionsByUser(target.id);
+    }
+    db.audit(user.id, 'admin_disable_user',
+      target.username + ' -> ' + (disable ? `禁用（暂停 ${paused} 个任务，踢掉 ${kicked} 个会话）` : '启用'),
+      clientIp(req));
+    return sendJson(res, 200, {
+      ok: true, pausedJobs: paused, kickedSessions: kicked,
+      message: disable
+        ? `已禁用：暂停 ${paused} 个任务，强制退出 ${kicked} 个登录会话`
+        : '已启用（被暂停的任务仍保持暂停，用户可自行「继续」）',
+    });
   }
+
+  /* ------------------------ 删除账号（2026-10-01 新增） ------------------------ */
+  //
+  // 之前只有「禁用」，没有删除。这里补上，并遵守三条保护：
+  //   · 不能删自己（否则管理员会把自己锁死在门外）；
+  //   · 不能删掉最后一个管理员（否则系统再也没有管理员）；
+  //   · 删之前先停掉他的任务、清掉会话。
+  // 数据级联：users 删掉后，由外键 ON DELETE CASCADE 连带清掉
+  //   sessions / leo_accounts / jobs / job_rounds / sub_accounts（见 db.js SCHEMA）。
+  const adminUserDelete = /^\/api\/admin\/users\/(\d+)$/.exec(p);
+  if (adminUserDelete && method === 'DELETE') {
+    if (user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
+    const id = Number(adminUserDelete[1]);
+    if (id === user.id) return sendJson(res, 400, { ok: false, message: '不能删除自己' });
+    const target = db.findUserById(id);
+    if (!target) return sendJson(res, 404, { ok: false, message: '用户不存在' });
+    if (target.role === 'admin' && db.countAdmins() <= 1) {
+      return sendJson(res, 400, { ok: false, message: '这是最后一个管理员，不能删除' });
+    }
+    const leoCount = db.countLeoAccountsOfUser(id);
+    // 删除前先把任务停下来（级联删除会连 jobs 一起删，但那只是「记录消失」，
+    // 正在跑的循环还在内存里 —— 必须先中断，否则进程还会继续替他刷局）。
+    const stopped = jobs.stopJobsByUser(id, { mode: 'stop' });
+    const kicked = db.deleteSessionsByUser(id);
+    db.deleteUser(id);
+    db.audit(user.id, 'admin_delete_user',
+      `${target.username}（role=${target.role}）· 小猿账号 ${leoCount} 个 · 停任务 ${stopped} · 清会话 ${kicked}`,
+      clientIp(req));
+    return sendJson(res, 200, {
+      ok: true, stoppedJobs: stopped, kickedSessions: kicked, leoAccounts: leoCount,
+      message: `已删除 ${target.username}：停止 ${stopped} 个任务，清理 ${leoCount} 个小猿账号`,
+    });
+  }
+
+  /* ------------------------ 全部任务（管理视角） ------------------------ */
 
   if (p === '/api/admin/jobs' && method === 'GET') {
     if (user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
-    return sendJson(res, 200, { ok: true, jobs: db.listAllJobs(200).map(publicJob) });
+    return sendJson(res, 200, {
+      ok: true,
+      jobs: db.listAllJobs(200).map(publicJob),
+      running: jobs.runningIds(),        // 内存里真正在跑的（比 status 字段更实时）
+    });
+  }
+
+  // 管理员看任意任务的明细（逐轮日志）—— 普通接口 /api/jobs/:id 只放行本人
+  const adminJobOne = /^\/api\/admin\/jobs\/(\d+)$/.exec(p);
+  if (adminJobOne && method === 'GET') {
+    if (user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
+    const id = Number(adminJobOne[1]);
+    const job = db.getJob(id);
+    if (!job) return sendJson(res, 404, { ok: false, message: '任务不存在' });
+    return sendJson(res, 200, {
+      ok: true,
+      job: publicJob(job),
+      rounds: db.listJobRounds(id, 500),
+    });
+  }
+
+  /**
+   * 管理员批量操控任务：stop / pause / resume。
+   *
+   * 为什么单独一个接口而不是复用 `/api/jobs/:id/*`：
+   * 管理页要「勾 6 个任务一起停」，逐个请求 6 次既慢又容易半途失败。
+   * 这里一次请求做完，逐条返回成败，前端照实显示。
+   */
+  if (p === '/api/admin/jobs/action' && method === 'POST') {
+    if (user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
+    const b = await readJson(req);
+    const ids = (Array.isArray(b.ids) ? b.ids : []).map(Number).filter((n) => Number.isFinite(n));
+    const action = String(b.action || '');
+    if (!ids.length) return sendJson(res, 400, { ok: false, message: '请先选择任务' });
+    if (!['stop', 'pause', 'resume'].includes(action)) {
+      return sendJson(res, 400, { ok: false, message: '未知操作：' + action });
+    }
+    const results = [];
+    let okCount = 0;
+    for (const id of ids) {
+      const job = db.getJob(id);
+      if (!job) { results.push({ id: id, ok: false, message: '任务不存在' }); continue; }
+      let r;
+      if (action === 'resume') r = jobs.resumeJob(id);
+      else r = jobs.stopJob(id, true, { mode: action === 'pause' ? 'pause' : 'stop' });
+      if (r.ok) okCount++;
+      results.push({ id: id, ok: !!r.ok, message: r.message });
+    }
+    db.audit(user.id, 'admin_job_' + action, `ids=${ids.join(',')} ok=${okCount}`, clientIp(req));
+    const label = { stop: '停止', pause: '暂停', resume: '继续' }[action];
+    return sendJson(res, 200, {
+      ok: okCount > 0, action: action, done: okCount, failed: ids.length - okCount, results: results,
+      message: `${label} ${okCount}/${ids.length} 个任务`,
+    });
   }
 
   if (p === '/api/admin/audit' && method === 'GET') {
@@ -976,8 +1214,11 @@ function publicJob(j) {
   return {
     id: j.id,
     userId: j.user_id,
-    username: j.username,
+    username: j.username || null,
     leoAccountId: j.leo_account_id,
+    // 2026-10-01：管理页要显示「谁在用哪个小猿账号在刷」，所以带上账号名
+    leoName: j.leo_name || null,
+    subUserId: j.sub_user_id == null ? null : j.sub_user_id,
     status: j.status,
     // 'exercise' = 刷练习（2026-10-01 起练习也是正经后台任务）；默认 'pk' = 刷局
     kind: (cfg && cfg.kind) || 'pk',
