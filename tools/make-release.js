@@ -46,13 +46,10 @@ const INCLUDE = [
   'bin/pick-port.js',
   'bin/reset-admin.js',
   'bin/selftest.js',
-  // ★★ `bin/start.js` 是**启动入口**：package.json 的 "start"、start.bat、start.sh
-  //    全都指向它。PR#2 新增了这个文件，但当时没同步加进本白名单 →
-  //    v1.6.0 的发布包里缺它，Windows 双击 start.bat 直接崩：
-  //    `Error: Cannot find module '...\pk-node-1.6.0\bin\start.js'`（用户实测）。
+  // `bin/start.js` 是启动入口（package.json "start"、start.bat、start.sh 都指向它），必须打包。
   'bin/start.js',
-  'bin/keystream.bin',        // ★ 纯 JS 内容编码器的密钥流，必需
-  'bin/native/lre.so',        // ★ sign 纯 JS 模拟所需的「机器码数据」（约 0.9MB，不执行）
+  'bin/keystream.bin',        // 纯 JS 内容编码器的密钥流，必需
+  'bin/native/lre.so',        // sign 纯 JS 模拟所需的「机器码数据」（约 0.9MB，不执行）
   'bin/get-cloudflared.sh',
   'public',
   'docs',
@@ -97,17 +94,8 @@ function collect() {
 }
 
 /**
- * 把权限**归一化**：只保留「可执行位」这一个信息。
- *
- * ## 为什么（踩过的坑）
- *
- * 直接用源文件的 `st_mode` 会导致**同样的源码在不同机器上打出不同的 zip**：
- * 我在 proot 里 umask 让文件是 `0600`，而 GitHub runner 上是 `0644` ——
- * 32 个条目的内容（size/CRC）完全一样，只有权限位不同，zip 的 sha256 就不一样。
- *
- * 归一化后：
- *  - 同一份源码在**任何环境**打出的 zip **逐字节相同**（sha256 可对账）；
- *  - 发布包解压出来也不会是「只有 owner 能读」的怪文件。
+ * 把权限**归一化**：只保留「可执行位」这一个信息，保证任何环境打出的 zip 逐字节相同（sha256 可对账），
+ * 解压出来也不会是「只有 owner 能读」的怪文件。
  */
 function normMode(mode) {
   return (mode & 0o111) ? 0o755 : 0o644;
@@ -196,9 +184,7 @@ for (const must of ['server.js', 'start.bat', 'start.sh', 'bin/start.js', 'bin/k
 }
 console.log('  [OK] server.js / start.bat / start.sh / bin/start.js / bin/keystream.bin / bin/native/lre.so 均在位');
 
-// 2b) ★ 反向校验：package.json 里所有 `node <file>` 形式的脚本入口都必须在包里。
-//     这类「白名单漏了新入口文件」的 bug 已经踩过一次（v1.6.0 缺 bin/start.js →
-//     Windows 用户双击 start.bat 直接 Cannot find module）。以后新增入口会自动被挡住。
+// 2b) 反向校验：package.json 里所有 `node <file>` 形式的脚本入口都必须在包里（防止白名单漏加新入口）。
 for (const [name, cmd] of Object.entries(pkg.scripts || {})) {
   const m = /(?:^|\s)node\s+([^\s&|]+)/.exec(String(cmd));
   if (!m) continue;

@@ -1,33 +1,7 @@
 'use strict';
 /**
- * 练习（`/leo-star` `/leo-math`）协议层。
- *
- * ## 与 PK 的关系
- *
- * 练习与 PK 是**两条独立链路**，别混：
- *
- * | | PK（`leo-game-pk`） | 练习（`leo-star` / `leo-math`） |
- * |---|---|---|
- * | `version` | 3.141.1（沿用 PK.commonQuery） | **3.140.1（必须！否则 417）** |
- * | `platform` | android36 | **android37** |
- * | `sign` | 不需要 | 也不需要（实测） |
- * | 频控 | 出题 ~61.6s/账号 | 见 [explainLimits] |
- *
- * ## 417 墙的根因（2026-09-28 实测）
- *
- * 主域端点被 `solar-encoder` 拦成 `417 No message available`，
- * 根因**只有一个**：`version` 用了 3.141.1。改 3.140.1 立刻 200。
- * 逐项 A/B 见 `config.exercise` 的注释。
- *
- * ## 三条可用链路
- *
- * 1. **出题**：`POST /leo-math/android/exams`（form: keypointId + limit）
- *    → 返回 `{idString, questions[{content, answer, ...}]}`
- *    —— 每题都带 `answer`，所以「作答」= 抄答案。
- * 2. **整卷提交**：`PUT /leo-math/android/exams/v2/{examId}`（`@NeedEncode`）
- *    —— ⚠️ 尚未打通（见 [submitExam] 注释）。
- * 3. **经验上报**：`POST /leo-star/android/exercise/rank/login/attend`（`@NeedEncode`）
- *    —— ✅ 已验证能记账，每次 +200。
+ * 练习（`/leo-star` `/leo-math`）协议层，与 PK 是两条独立链路。
+ * 练习必须用 `version=3.140.1` + `platform=android37`（否则主域 417），sign 由原生库算。
  */
 
 const { config, PK } = require('./config');
@@ -50,10 +24,7 @@ function randomTraceId() {
 }
 
 /**
- * 练习专用请求头（对齐原版抓包逐字）。
- *
- * 与 PK 的 [leo.riskHeaders] 区别：这里必须带 `leo-client-trace-id` 与
- * `default-namespace-sw8` —— 主域风控会看它们。
+ * 练习专用请求头：相比 PK，必须带 `leo-client-trace-id` 与 `default-namespace-sw8`（主域风控会看）。
  */
 function exerciseHeaders(extra, traceId) {
   const tid = traceId || randomTraceId();
@@ -82,19 +53,14 @@ function leo_sw8(traceId) {
 /** `Leo/3.140.1 (Redmi25053RT47C; Android 17; Scale/3.25)` —— 版本必须与 query 一致。 */
 function exerciseUa() {
   const d = config.device;
-  // ⚠️ UA 里的 Android 版本是 **17**（原版抓包逐字），不是 SDK 号 37。
-  // 这两处不一样：query 的 `platform=android37` 用 SDK 号，
-  // 而 UA 用「Android 17」。用 37 会被风控识别成异构请求（实测 417）。
+  // ⚠️ UA 的 Android 版本是 17（原版逐字），不是 SDK 号 37；用 37 会被风控识别成异构请求（417）。
   return 'Leo/' + EX.version +
     ' (' + d.brand + d.model + '; Android ' + (d.uaSdk || 17) + '; Scale/' + d.scale + ')';
 }
 
 /**
- * 拼练习 URL。
- *
- * 严格按原版顺序：`_productId` 最前、`sign` 最后（参数顺序原版确实如此，
- * 虽然服务端大概率不校验，但既然要「逐字对齐」就做全）。
- * sign 由原生库算（纯 JS 不可复现），算不出来就不带 —— 练习实测不需要它。
+ * 拼练习 URL：`_productId` 最前、`sign` 最后（按原版顺序）。
+ * sign 由原生库算（纯 JS 不可复现），算不出就不带——练习实测不需要它。
  */
 function buildExerciseUrl(path, params) {
   const q = [['_productId', EX.productId]];
@@ -111,28 +77,15 @@ function buildExerciseUrl(path, params) {
 }
 
 /**
- * 练习端点的签名策略。
- *
- * ## ★ 练习**必须**带 sign（实测）
- *
- * ```
- * 不带 sign / 假 sign → 417 No message available   （solar-encoder 拦）
- * 带真 sign           → 200
- * ```
- *
- * 这里**不受 `config.signMode` 影响** —— 练习端点一律带上。
- *
- * ## ★ 2026-10-01：sign 已可在任意平台计算（417 根治）
- *
- * 此前 sign 依赖 `bin/native/linker64 + dump7`（arm64），Windows/x86 上算不出来，
- * 于是练习端点必然 417 —— 这就是「PK 能用、练习不能用」的根因。
- * 现在 T 由 `src/lre-emu.js` 在 JS 里执行同一段机器码算出，**平台无关**。
+ * 练习端点的签名策略：一律带 sign（不受 `config.signMode` 影响）。
+ * 不带 sign → 417（solar-encoder 拦）；sign 由原生库算，算不出返回 null（端点会 417 但 UI 可见响应）。
  */
 function maybeSign(path) {
   try {
-    return nativeLib.calcSign(path);
+    // 练习走「练习版」签名资产（variant: 'exercise'，配 version=3.140.1）
+    return nativeLib.calcSign(path, { variant: 'exercise' });
   } catch (e) {
-    // 算不出来（如 x86 无原生库）→ 不带。此时练习端点会 417，
+    // 算不出来 → 不带。此时练习端点会 417，
     // 但至少不抛异常，UI 能看到明确的服务端响应。
     return null;
   }
@@ -218,9 +171,7 @@ async function overview(jar) {
 
 /**
  * `GET /leo-math/android/exams/exercises/type/{type}` —— 知识点树。
- *
- * ⚠️ `book` / `grade` / `semester` **三个都必填**（缺哪个服务端就报哪个）。
- * 默认值取本机实测可用组合：`book=54, grade=1, semester=1`。
+ * ⚠️ `book` / `grade` / `semester` 三个都必填（缺哪个服务端就报哪个）。
  */
 async function keypoints(jar, opts) {
   const o = opts || {};
@@ -238,13 +189,8 @@ async function keypoints(jar, opts) {
 }
 
 /**
- * `POST /leo-math/android/exams` —— **出一整套题**。
- *
- * body 是 form-urlencoded 的 `keypointId` + `limit`（原版 `@Field` 都是 String）。
- *
- * 返回的 `questions[]` **每题自带 `answer`** —— 所以「作答」就是抄答案，
- * 不需要解题模型。这正是本项目能把练习做成流水线的原因。
- *
+ * `POST /leo-math/android/exams` —— 出一整套题。
+ * body 是 form-urlencoded 的 `keypointId` + `limit`；返回 `questions[]` 每题自带 `answer`（「作答」= 抄答案）。
  * @returns {Promise<{status:number, json:object|null, text:string}>}
  */
 async function getExam(jar, keypointId, limit, opts) {
@@ -261,34 +207,9 @@ async function getExam(jar, keypointId, limit, opts) {
 }
 
 /**
- * 提交整卷成绩 —— **已打通**（2026-09-28）。
- *
- * ## ★ 正确形态（试出来之前错了很多次）
- *
- * ```
- * PUT /leo-math/android/exams/{examId}        ← 旧路径，不是 /v2/！
- * Content-Type: application/json              ← JSON 明文，**不编码**
- * body: ExamVO(JSON)
- * → 200 {idString, correctCnt, questionCnt, questions:[...批改结果...]}
- * ```
- *
- * ## 三个曾经的坑
- *
- * | 试过的错误做法 | 结果 |
- * |---|---|
- * | `PUT .../exams/v2/{examId}` + gzip+编码 | 400 |
- * | `PUT .../exams/v2/{examId}` + 明文 JSON | 400 |
- * | `PUT .../exams/{examId}`（旧路径）+ octet-stream | **415**（"Content-Type 不支持"）|
- * | `PUT .../exams/{examId}`（旧路径）+ **JSON** | **200** ✅ |
- *
- * 注意与 PK 的区别：PK 提交**必须** `gzip + c()` + octet-stream；
- * 练习提交**必须** JSON 明文。**两条链路的编码纪律相反，别互相套用。**
- *
- * ## 作答要求
- *
- * 每题填 `userAnswer` / `status`(1 对 / -1 错) / `costTime`（**下限 5ms**）；
- * 整卷填 `correctCnt` / `costTime`。`script`（笔迹）实测**不填也能过**。
- *
+ * 提交整卷成绩：`PUT /leo-math/android/exams/{examId}`（旧路径，不是 /v2/），JSON 明文不编码。
+ * 注意与 PK 区别：PK 提交必须 gzip+c()+octet-stream；练习必须 JSON 明文（编码纪律相反）。
+ * 作答填 `userAnswer` / `status`(1对/-1错) / `costTime`（下限5ms）；`script`(笔迹) 不填也能过。
  * @returns {Promise<{status:number, json:object|null, text:string}>}
  */
 async function submitExam(jar, examId, exam, opts) {
@@ -314,23 +235,11 @@ async function getExamResult(jar, examId, opts) {
 }
 
 /**
- * 本地「作答」：把每题填成全对，**并生成笔迹**。
- *
- * ## ★ 为什么必须有 `script`（笔迹）
- *
- * 实测：只填 `userAnswer` + `status:1` 提交 → HTTP 200，但服务端判
- * **`correctCnt=0`**（不认客户端自报的 status）。
- * 补上 `script`（笔迹点集）+ `curTrueAnswer` 后 → **判对 10/10，经验 +20**。
- *
- * ⇒ **服务端是「回放笔迹 + 识别」判卷，不信任 `status` 字段。**
- * 这与 PK 一致（PK 的笔迹也是服务端会回放的）。
- *
- * 笔迹复用本项目的 [strokes]（与 PK 提交同一套）：
- * 比较题（`>`/`<`/`=`）走弧线模板，其它回落七段码。
- *
+ * 本地「作答」：把每题填成全对，并生成笔迹（供服务端回放判卷）。
+ * 服务端是「回放笔迹 + 识别」判卷，不信任客户端 `status` 字段（PK 同理）。
+ * 笔迹复用 [strokes]：比较题（`>`/`<`/`=`）走弧线模板，其它回落七段码。
  * @param {object} exam 出题响应
- * @param {number} [costTimePerQuestionMs] 每题耗时（**下限 5ms**，真机纪律）
- * @param {(ev:object)=>void} [onProgress] 进度回调
+ * @param {number} [costTimePerQuestionMs] 每题耗时（下限 5ms，真机纪律）
  */
 function answerAll(exam, costTimePerQuestionMs) {
   const per = Math.max(5, Number(costTimePerQuestionMs) || 900);
@@ -342,7 +251,7 @@ function answerAll(exam, costTimePerQuestionMs) {
       userAnswer: answer,
       status: 1,                              // 1 = 答对
       costTime: per,
-      script: JSON.stringify(pathPoints),     // ★ 服务端据此判卷
+      script: JSON.stringify(pathPoints),     // 服务端据此判卷
       curTrueAnswer: {
         recognizeResult: answer,
         pathPoints: pathPoints,
@@ -360,36 +269,17 @@ function answerAll(exam, costTimePerQuestionMs) {
 
 /* ---------------------------------------------------- 经验上报（刷分） */
 
-/**
- * 可记账的 `ruleType`（**实测**，2026-09-28）。
- *
- * 全量枚举 0~43 后，只有 **0 和 1** 会让 `curWeekScore` 真正增加；
- * 其余（2..16, 20, 33, 41, 43）服务端都返回 200 但不记账。
- */
+/** 可记账的 `ruleType`（实测只有 0 和 1 会让 `curWeekScore` 真正增加）。 */
 const PUMP_RULE_TYPES = [0, 1];
 
 /** 单条 `obtainExp` 的服务端 clamp 上限（发更多也只记这么多）。 */
 const PER_ITEM_MAX = 200;
 
 /**
- * `POST /leo-star/android/exercise/rank/login/attend` —— **经验上报（刷分）**。
- *
- * ## 语义
- *
- * body 是**增量**上报：`obtainExp` = 本次获得经验，服务端累加到周分数。
- * 不是「设置总分」。所以这是唯一能直接加分的合法链路。
- *
- * ## 编码
- *
- * 带 `@NeedEncode`：**必须** `gzip + c()` 且 `Content-Type: octet-stream`。
- * 明文直接发 → **HTTP 500**；编码后 → **200 `{data:true}`**。
- *
- * ## 频率（实测，重要）
- *
- * **每个可记账 `ruleType` 每天只记一次。** 同一 ruleType 第二次发会返回
- * `{data:true}` 但分数不动 —— 服务端静默丢弃，不报错。
- * 所以日上限 = `200 × |PUMP_RULE_TYPES|` = **400**。
- *
+ * `POST /leo-star/android/exercise/rank/login/attend` —— 经验上报（刷分）。
+ * body 是**增量**上报：`obtainExp`=本次获得经验，服务端累加到周分数（不是设置总分）。
+ * 带 `@NeedEncode`：必须 gzip+c() 且 Content-Type: octet-stream；明文直接发→500，编码后→200。
+ * 每个可记账 `ruleType` 每天只记一次（同 ruleType 第二次静默丢弃），日上限 = 200×|ruleTypes|。
  * @param {number} delta   本次增量（会被服务端 clamp 到 [PER_ITEM_MAX]）
  * @param {number} ruleType 见 [PUMP_RULE_TYPES]
  * @returns {Promise<{status:number, json:object|null, text:string}>}
@@ -426,12 +316,8 @@ async function readScore(jar) {
 }
 
 /**
- * 「刷分」：对每个可记账 ruleType 各上报一次，**以服务端入账为准**返回。
- *
- * 为什么按 ruleType 遍历而不是「拆条」：`obtainExp` 的语义是
- * 「本次练习获得的经验」，同一天同一 ruleType 发多条属于伪造行为且**并不加分**
- * （服务端按 ruleType/天去重）。不同 ruleType 各记一笔才是原版语义。
- *
+ * 「刷分」：对每个可记账 ruleType 各上报一次，以服务端入账为准返回。
+ * 按 ruleType 遍历（同 ruleType 每天去重，发多条并不加分）；不同 ruleType 各记一笔才是原版语义。
  * @param {(ev:object)=>void} [onEvent] 进度回调
  * @param {AbortSignal} [signal]
  */
@@ -473,19 +359,8 @@ async function pumpScore(jar, opts) {
 }
 
 /**
- * 练习出题冷却（毫秒）—— 每轮之间的**下沿**，不是硬上限。
- *
- * ## ★ 2026-10-01 实测：62s 的旧结论已作废
- *
- * 旧值取下 PK 同源的「账号级 62 秒限流」（2026-09-28 实测）。但当前服务端
- * **已彻底放开**：同一账号连续出题（间隔 1.5s）**4 次全 200**，无 429。
- * 继续按 62s 配速会把刷练习拖慢 60 倍 —— 这也是「刷练习感觉没用」的原因之一。
- *
- * 现在默认 **1s**（与安卓端 `ExercisePumpEngine.DEFAULT_COOLDOWN_MS` 对齐），
- * 可用 `PK_EX_MATCH_COOLDOWN_MS` 覆盖。
- *
- * 它同时是「每轮间隔的下沿」：实际等待 = `max(冷却剩余, 随机间隔)`，
- * 万一服务端将来收紧，[runPractice] 内部的 429 重试仍会兜底。
+ * 练习出题冷却（毫秒）—— 每轮之间的下沿，不是硬上限。
+ * 默认 1s（与安卓端 DEFAULT_COOLDOWN_MS 对齐），可用 PK_EX_MATCH_COOLDOWN_MS 覆盖。
  */
 const MATCH_COOLDOWN_MS = Math.max(0, Number(process.env.PK_EX_MATCH_COOLDOWN_MS) || 1_500);
 /** 撞 429 时的重试间隔 / 总等待上限。 */
@@ -494,17 +369,7 @@ const MATCH_RETRY_MAX_MS = 4 * 60 * 1000;
 
 /**
  * **完整练习闭环**：出题 → 抄答案 → 提交 → 拉回批改结果。
- *
- * 这是「刷练习」的主链路（与 [pumpScore] 的经验上报互补）：
- *  - 本函数：走真实练习流程，服务端按卷算分（经验 = 答对题数 × 2）
- *  - [pumpScore]：直接上报经验增量，每次 +200
- *
- * ## 出题频控（429）自动重试
- *
- * 出题有账号级冷却（≈62s）。撞到 `429 too_many_request` 时按
- * [MATCH_RETRY_INTERVAL_MS] 重试，累计超 [MATCH_RETRY_MAX_MS] 才判失败 ——
- * 所以调用方不必自己算窗口。
- *
+ * 出题有账号级冷却，撞到 429 自动重试（累计超上限判失败），调用方不必自己算窗口。
  * @param {number} keypointId 知识点 ID（默认 235001）
  * @param {number} limit      题数（口算可选 10/20/30/60/100）
  * @param {(ev:object)=>void} [onEvent]
@@ -575,18 +440,8 @@ async function runPractice(jar, opts) {
 
 /**
  * **循环刷练习**：跑 N 轮「出题 → 抄答案 → 提交」，按出题冷却配速。
- *
- * ## 配速策略（与 PK 引擎同一套思路）
- *
- * 出题冷却 ≈[MATCH_COOLDOWN_MS]（账号级，实测）。这里记住**上次成功出题时刻**，
- * 下一轮直接等到「上次成功 + 冷却」再发车 —— 既不白撞 429、也不多等。
- * 万一估计偏了，[runPractice] 内部的 429 重试会兜底。
- *
- * ## 建议用 100 题/局
- *
- * 冷却按「次」算，不按题数 —— 所以一次开 100 题（=200 exp）比开 10 题（=20 exp）
- * 划算 10 倍。默认 [limit] 就取 100。
- *
+ * 记住上次成功出题时刻，下一轮等到「上次成功 + 冷却」再发车，避免白撞 429。
+ * 冷却按「次」算不按题数，一次开 100 题比 10 题划算 10 倍（默认 limit=100）。
  * @param {(ev:object)=>void} [onEvent] 进度事件
  * @param {number} [rounds] 轮数
  * @param {number} [limit]  每局题数
@@ -598,21 +453,13 @@ async function practiceLoop(jar, opts) {
   const limit = o.limit == null ? 100 : Number(o.limit);
   const kp = o.keypointId == null ? 235001 : o.keypointId;
   /**
-   * 「每轮间隔」（用户在 UI 上配的）——与 PK 引擎同一套语义。
-   *
-   * 实际等待 = max(冷却剩余, 随机(下限, 上限))：
-   *   1. 服务端出题冷却（[MATCH_COOLDOWN_MS]）是**硬下限** —— 配得比它小也没用，
-   *      会 429；所以取 max 而不是覆盖。
-   *   2. 在冷却之上再随机 `[gapMinMs, gapMaxMs]`，避免固定节奏（更像人、更稳）。
-   *   3. [cooldownSafetyMs] 是从冷却下沿往回退的安全边距（默认 1000ms）。
-   *
-   * 想「最快」就把 gapMin=gapMax=0；想「更稳」就配大一点。
+   * 「每轮间隔」（UI 配置）：实际等待 = max(冷却剩余, 随机[gapMinMs, gapMaxMs])。
+   * 冷却是硬下限（配更小也没用，会 429），之上再随机间隔避免固定节奏；
+   * cooldownSafetyMs 是从冷却下沿往回退的安全边距。
    */
   const gapMin = Math.max(0, Number(o.gapMinMs) || 0);
   const gapMax = Math.max(gapMin, Number(o.gapMaxMs) || 0);
-  // 安全边距：从冷却下沿往回退一点，避免每次都贴着窗口边缘白撞 429。
-  // 默认 200ms —— 原来是 1000ms，那会把 1s 的冷却**完全抵消**（净等待 0），
-  // 结果每轮都撞 429 再白等 10s 重试，比不配速还慢。
+  // 安全边距：从冷却下沿往回退一点，避免贴着窗口边缘白撞 429（默认 200ms）。
   const safety = o.cooldownSafetyMs == null ? 200 : Math.max(0, Number(o.cooldownSafetyMs));
   const randGap = () => (gapMax > gapMin
     ? gapMin + Math.floor(Math.random() * (gapMax - gapMin + 1))
@@ -702,12 +549,7 @@ function explainLimits() {
   };
 }
 
-/**
- * 小睡（内部用）。
- *
- * ★ 2026-10-01：支持 AbortSignal —— 轮间隔可能很长（用户可配到几十秒），
- * 点「停止任务」时必须**立刻**退出，而不是等这段等待睡满。
- */
+/** 小睡：支持 AbortSignal，点「停止任务」时立刻退出而非等满等待。 */
 function sleep(ms, signal) {
   const total = Math.max(0, Number(ms) || 0);
   if (!signal) return new Promise((r) => setTimeout(r, total));
@@ -739,7 +581,7 @@ module.exports = {
   homepage, rankPrefetch, itemStatus, taskHome, overview, readScore,
   // 出题
   keypoints, getExam, answerAll, getExamResult, runPractice, practiceLoop,
-  // 提交（未打通）
+  // 提交
   submitExam,
   // 刷分
   attend, pumpScore, explainLimits, practiceLoop,

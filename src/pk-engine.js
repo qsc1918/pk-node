@@ -1,25 +1,13 @@
 'use strict';
 // PK 刷局引擎：出题 → 组装提交 body → 加密提交 → 频控退避。
 //
-// ## 提交 body 结构（真机 ground truth，逐字段对齐）
-//
-// 顶层直接展开 examVO 字段，**没有** examVO 嵌套、**没有** userInfos、
-// **没有** updatedTime（这三样加上去会 400）：
-//
+// 提交 body 结构（真机 ground truth，缺 sign 会 417）：
 //   { pkIdStr, pointId, pointName, ruleType, questionCnt, correctCnt, costTime, questions }
+// 顶层直接展开 examVO 字段，**没有** examVO 嵌套 / userInfos / updatedTime（加上去会 400）。
+// 每题 = 原始 question 深拷贝 + 补字段；`script` = JSON.stringify(pathPoints)（两处同源）。
 //
-// 每题 = 原始 question 深拷贝 + 补字段：
-//   { id, examId, content, answer, userAnswer, answers, status, script,
-//     wrongScript, ruleType, errorState, curTrueAnswer:{recognizeResult,
-//     pathPoints, answer, showReductionFraction} }
-//
-// `script` = JSON.stringify(pathPoints)，两处内容完全一致（同源）。
-//
-// ## 笔迹（stroke）
-//
-// 服务端会回放笔迹做一致性检查，比较类题（`>` / `<`）用普通字形会被判可疑。
-// 这里移植原项目的「密集弧线」模板：`<` 用左弧、`>` 用右弧，
-// 坐标是画布像素（x≈150-240, y≈450-500），每题抖动 + 平移，避免完全雷同。
+// 笔迹（stroke）：服务端回放笔迹做一致性检查，比较类题用普通字形会被判可疑；
+// 这里移植「密集弧线」模板：`<` 用左弧、`>` 用右弧，坐标画布像素，每题抖动+平移。
 
 const { PK } = require('./config');
 const leo = require('./leo');
@@ -162,8 +150,8 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
   //
   // ctx 里带着**同账号**上一次成功出题的时刻（跨轮/跨任务共享），
   // 所以连续刷局时不会每次都白撞窗口、也不会多等。默认关闭（= 0）。
-  const gapMin = num(cfg.gapMinMs, 60000);
-  const gapMax = num(cfg.gapMaxMs, 65000);
+  const gapMin = num(cfg.gapMinMs, 0);
+  const gapMax = num(cfg.gapMaxMs, 0);
   const gap = gapMin + Math.floor(Math.random() * Math.max(1, gapMax - gapMin));
 
   let cooldownWait = 0;
@@ -195,17 +183,15 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
   // 这样配置里那个「轮间隔」就只是**下限**（保护服务器、也让节奏像真人），
   // 而不需要用户去猜一个刚好大于频控窗口的数 —— 猜小了会白跑一局，
   // 猜大了又白白拖慢。
-  const matchMaxWaitMs = num(cfg.matchRetryMaxMs, 4 * 60 * 1000);
-  const matchIntervalMs = num(cfg.matchRetryIntervalMs, 8_000);
+  const matchMaxWaitMs = num(cfg.matchRetryMaxMs, 2 * 60 * 1000);
+  const matchIntervalMs = num(cfg.matchRetryIntervalMs, 10_000);
   emit({ type: 'match', message: `出题 pointId=${cfg.pointId}` });
   let m = null;
   {
     const tMatch = Date.now();
     let tries = 0;
     for (;;) {
-      // ★ 2026-09-30：改用 v2（原版 App 在用的接口）。
-      //   旧版 `match`（明文）风控极严；v2 返回加密响应，
-      //   由 leo.pkMatchV2 内部用 keystream 解开（与真机行为一致）。
+      // 改用 v2（原版 App 在用的接口）：v2 返回加密响应，由 leo.pkMatchV2 内部用 keystream 解开。
       m = await leo.pkMatchV2(jar, cfg.pointId, anySignal({}));
       tries++;
       if (m.status === 200 && m.json) break;
@@ -240,8 +226,8 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
   //
   // 真人是「看一眼题、写答案、再交卷」，不是秒交。这里给一段可配的等待，
   // 让提交节奏更自然（也顺便错开频控窗口）。
-  const dMin = num(cfg.submitDelayMinMs, 0);
-  const dMax = num(cfg.submitDelayMaxMs, 0);
+  const dMin = num(cfg.submitDelayMinMs, 8000);
+  const dMax = num(cfg.submitDelayMaxMs, 12000);
   if (dMax > 0 || dMin > 0) {
     const lo = Math.min(dMin, dMax);
     const hi = Math.max(dMin, dMax);

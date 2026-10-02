@@ -1,20 +1,7 @@
 'use strict';
 // Cloudflare 快速隧道（trycloudflare.com）封装。
-//
-// ## 用的是什么
-//
-// Cloudflare 官方 `cloudflared` 的**快速隧道（Quick Tunnel）**：
-//   cloudflared tunnel --url http://127.0.0.1:8787 --no-autoupdate
-// 不需要 Cloudflare 账号、不需要登录，启动后 cloudflared 会把分配到的
-// 公网地址（形如 `https://xxxx-xxxx.trycloudflare.com`）打印在 stderr 里。
-// 参考：https://developer.aliyun.com/article/1765280
-//
-// ## 重要限制（必须如实告知用户）
-//
-// 1. **临时**：cloudflared 进程一停，域名立刻失效，下次是**另一个**随机域名；
-// 2. **无鉴权**：拿到地址的人都能访问。所以本项目强制要求「本服务账号登录」，
-//    且后台管理入口仍需 admin 身份 —— 但不排除被扫到后撞库，请用强密码；
-// 3. **境内速度一般**，且 Cloudflare 可能对未登录隧道做限速。
+// 用 cloudflared 的 Quick Tunnel（无需账号），启动后从 stderr 解析出公网地址。
+// 限制：临时（进程停即失效）、无鉴权（拿到地址即可访问，故本服务强制登录）、境内速度一般。
 
 const fs = require('node:fs');
 const path = require('node:path');

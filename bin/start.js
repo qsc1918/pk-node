@@ -1,23 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * 统一的启动器 —— `start.sh` 与 `start.bat` 都只负责调它。
- *
- * ## 为什么要单独抽一个 JS 启动器（2026-10-01）
- *
- * 用户反馈：Windows 上双击 `start.bat` 用不了，只能装 Git/MSYS2 用 `start.sh`。
- * 真因有两个（都已修）：
- *
- *  1. **`start.bat` 是 LF 行尾** —— cmd.exe 要求 CRLF。LF 文件里
- *     `if errorlevel 1 (` … `)`、`for /f … do set X=%%v` 这类多行结构会被
- *     当成一行解析，cmd 直接语法报错，双击窗口一闪就没了。
- *  2. 端口探测 / Node 版本校验全写成了 `for /f … node -p …`，在带 UTF-8
- *     中文内容的 bat 里容易被代码页搅乱，进一步加剧问题。
- *
- * 现在把「校验 Node 版本 / 挑空闲端口 / 打印横幅」搬到 Node 里（一份代码
- * 两个平台共用），bat 只剩十几行、**纯 ASCII**、**CRLF** —— 不再有解析风险。
- *
- * 零依赖：只用 node:net / node:path 与内置模块。
+ * 统一的启动器 —— start.sh 与 start.bat 都只负责调它。
+ * 校验 Node 版本 / 挑空闲端口 / 打印横幅都放在这里（一份代码跨平台共用），
+ * 让 bat 保持纯 ASCII + CRLF，避免 cmd.exe 解析失败。零依赖。
  */
 
 const net = require('node:net');
@@ -81,8 +67,7 @@ async function pickPort(start) {
   }
   if (port !== DEFAULT_PORT) console.log('提示：' + DEFAULT_PORT + ' 已被占用，自动改用 ' + port);
 
-  // ★ 必须在 require server.js **之前**写回环境变量 —— config.js 是在 require
-  //   时读 process.env.PK_PORT 的。
+  // 必须在 require server.js 之前写回环境变量 —— config.js 在 require 时读 process.env.PK_PORT。
   process.env.PK_PORT = String(port);
 
   console.log('== pk-node ==');

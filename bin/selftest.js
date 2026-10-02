@@ -153,12 +153,10 @@ const missingLeo = REQUIRED_LEO.filter((k) => typeof leoLib[k] === 'undefined');
 check('leo.js 导出齐全', missingLeo.length === 0,
   missingLeo.length === 0 ? REQUIRED_LEO.length + ' 项' : '缺少 ' + missingLeo.join(', '));
 
-// ★ sign / T 链路：必须能在**任意平台**（含 Windows/x86）算出 T。
-//
-// 这是练习链路 417 的根治点：sign 依赖的 T 原先只能由 arm64 的
-// linker64+dump7 执行 lre.so 得到，Windows 上算不出来 → 练习端点必然 417
-// （x-block-by: solar-encoder）。现在改由 src/lre-emu.js 在 JS 里执行同一段
-// 机器码，判据是「真机抓包 fixture 逐字节一致」。
+// sign / T 链路：必须能在任意平台（含 Windows/x86）算出 T。
+// 这是练习链路 417 的根治点：sign 依赖的 T 原先只能由 arm64 执行 lre.so 得到，
+// Windows 上算不出来 → 练习端点必然 417（x-block-by: solar-encoder）。
+// 现在改由 src/lre-emu.js 在 JS 里执行同一段机器码，判据是「真机抓包 fixture 逐字节一致」。
 {
   const lreEmu = require(path.join(root, 'src', 'lre-emu'));
   const FIXTURE_T = '331546629839215717298392312983921519499463992983919162712654497319929839215'

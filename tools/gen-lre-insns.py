@@ -30,6 +30,13 @@ from capstone.arm64 import ARM64_OP_REG, ARM64_OP_IMM, ARM64_OP_MEM
 SO = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'bin', 'native', 'lre.so')
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'lre-insns.js')
 
+# 支持命令行指定「输入 so / 输出 js」（签名有两套资产：练习版 lre.so + PK 版 lre_pk.so）。
+# 用法：gen-lre-insns.py [so路径] [输出js路径]，省略则用上面的默认值。
+if len(sys.argv) > 1:
+    SO = sys.argv[1]
+if len(sys.argv) > 2:
+    OUT = sys.argv[2]
+
 # 导出区间：T 函数本体 + 它 bl 到的内部函数（0x64990 / 0x65614 / 0x65be8 / 0x65dfc / 0x671e0）
 BASE = 0x64800
 END = 0x67600

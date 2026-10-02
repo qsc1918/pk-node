@@ -1,32 +1,14 @@
 'use strict';
 // 手机号 / 密码 / 验证码的 RSA 编码器（复刻原版 Lkv/k 的加密分支）。
+// 算法：RSA/ECB/PKCS1PADDING + 硬编码 X509 公钥（1024 位）→ 标准 Base64。
+// PKCS#1 自带随机填充，同一手机号每次密文都不同（预期行为）。
 //
-// ## 算法（逐行对照 smali 确证）
-//
-//   Cipher("RSA/ECB/PKCS1PADDING") + ENCRYPT_MODE
-//   → 硬编码 X509 公钥（1024 位）
-//   → doFinal(str.getBytes("UTF-8"))
-//   → Base64（标准字母表，NO_WRAP）
-//
-// PKCS#1 v1.5 自带随机填充，所以**同一手机号每次密文都不同**，这是预期行为。
-//
-// ## 哪些字段要加密（别想当然统一处理）
-//
-// | 接口 | 字段 | 加密？ |
-// |---|---|---|
-// | `/verifier/android/sms` | `phone` | **是** |
-// | `/accounts/android/safe/login`（短信） | `phone` | **是** |
-// | `/accounts/android/safe/login`（短信） | `verification` | **是**（容易漏） |
-// | `/accounts/android/safe/login`（密码） | `phone` | **否**（明文） |
-// | `/accounts/android/safe/login`（密码） | `password` | **是** |
-//
-// ## 为什么不用仓库里那份 Java 实现
-//
-// 原项目 `PhoneEncoder.kt` 走 Android 的 `Cipher` + `android.util.Base64`。
-// Node 没有这些，但 `node:crypto` 原生支持 RSA PKCS#1：
-//   crypto.createPublicKey({key: der, format:'der', type:'spki'})
-//   crypto.publicEncrypt({key, padding: RSA_PKCS1_PADDING}, buf)
-// 输出与 Java 的 `Base64.NO_WRAP` 同为标准 Base64（无换行）。
+// 哪些字段要加密（别想当然统一处理）：
+//   /verifier/android/sms            phone               → 是
+//   /accounts/.../safe/login（短信） phone / verification  → 是（verification 易漏）
+//   /accounts/.../safe/login（密码） phone               → 否（明文）
+//   /accounts/.../safe/login（密码） password            → 是
+// Node 用 node:crypto 的 RSA_PKCS1_PADDING + spki 公钥，输出与 Java Base64.NO_WRAP 一致。
 
 const crypto = require('node:crypto');
 

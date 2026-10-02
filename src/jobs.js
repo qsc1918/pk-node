@@ -1,16 +1,9 @@
 'use strict';
 // 任务调度器：串行跑刷局任务，支持停止；每轮结果落库 + 内存事件流。
 //
-// ## 为什么串行
-//
-// 提交接口有**独立频控**（403，窗口约十分钟级）。并发提交只会把所有请求
-// 一起打进频控窗口，反而更慢且更容易被风控标记。所以这里刻意串行：
-// 同一时刻最多一个任务在跑，任务内部一轮一轮来。
-//
-// ## 停止语义
-//
-// `stop(jobId)` 置一个内存标志 + 落库状态；正在 `await` 的轮次结束后
-// 下一轮开始前检查标志并退出。不强行中断在途 HTTP（中断会导致状态不确定）。
+// 为什么串行：提交接口有独立频控（403，窗口约十分钟级），并发只会把请求一起打进频控窗口，
+// 反而更慢且更易被风控标记；同一时刻最多一个任务在跑，任务内部一轮一轮来。
+// 停止语义：置内存标志 + 落库状态，正在 await 的轮次结束后下一轮开始前检查并退出，不强行中断在途 HTTP。
 
 const db = require('./db');
 const leo = require('./leo');
@@ -19,23 +12,15 @@ const engine = require('./pk-engine');
 const exercise = require('./exercise');
 const { config } = require('./config');
 
-/**
- * 默认最大并行任务数。
- *
- * ★ 2026-10-01：改为 **0 = 不限制**（用户要求解除「最多 3 个」的限制）。
- * 仍可用 `PK_MAX_CONCURRENT=<正整数>` 设上限。
- */
+/** 默认最大并行任务数：0 = 不限制（可用 `PK_MAX_CONCURRENT=<正整数>` 设上限）。 */
 const MAX_CONCURRENT = 0;
 
 /** 运行中的任务表：jobId → { stopped:boolean, jar, config } */
 const running = new Map();
 
 /**
- * 「该账号上次**成功出题**的时刻」，按 `leoAccountId` 索引（模块级，跨任务共享）。
- *
- * 用途：出题接口的冷却是账号级的（实测 ≈61.6s，见 config.js）。
- * 记住这个时刻后，下一轮可以直接等到「上次成功 + 冷却」再发车，
- * 既不用猜窗口大小、也不会每次都白撞一次 —— 这就是「最快」的实现方式。
+ * 「该账号上次成功出题的时刻」，按 leoAccountId 索引（模块级，跨任务共享）。
+ * 出题冷却是账号级的；记住这个时刻后下一轮直接等到「上次成功 + 冷却」再发车。
  */
 const lastMatchOkAt = new Map();
 
@@ -47,15 +32,8 @@ const listeners = new Map();
 
 /**
  * 事件回放缓冲：jobId → 最近 N 条事件。
- *
- * ## 为什么必须有它（这是「实时日志不显示」的根因）
- *
- * `startJob()` 会**同步**跑完 `runLoop` 的第一段（async 函数调用后同步执行到
- * 第一个 await），也就是说「任务开始」「第 1/N 轮开始」「等待 Xs」这几条事件
- * 在 HTTP 响应**写出之前**就已经 publish 了。前端要等响应回来才能 `new
- * EventSource()` —— 于是这些事件全部打在空气里，用户看到一片空白。
- *
- * 有了缓冲，`subscribe()` 时先把历史事件补发一遍，前端就能看到完整开头。
+ * 根因：startJob() 同步跑完 runLoop 第一段（到第一个 await），「任务开始」等事件在 HTTP 响应写出前就 publish 了，
+ * 前端要等响应回来才能 new EventSource()，事件全打在空气里；缓冲让 subscribe() 先补发历史。
  */
 const eventBuffers = new Map();
 const EVENT_BUFFER_MAX = 300;
@@ -173,11 +151,8 @@ function startJob(o) {
 
   // 后台跑（不 await，让 HTTP 请求立刻返回）
   runLoop(job, cfg, ctx).catch((e) => {
-    // 被手动结束 → stopped / paused（不是失败），别让用户看到一条吓人的 failed。
-    //
-    // ⚠️ 优先级：**用户显式「暂停」优先于任何异常** —— 暂停时我们在中断在途请求，
-    // 那些请求抛出的网络错误（DNS/超时/连接重置）不应把任务判成 failed，
-    // 否则「暂停」完一刷新就变成「失败」，已刷的进度也白记了。
+    // 被手动结束 → stopped / paused（不是失败）。
+    // ⚠️ 优先级：用户显式「暂停」优先于任何异常 —— 暂停时中断在途请求抛出的网络错误不应判成 failed。
     const aborted = e && e.aborted === true;
     const paused = ctx.paused;
     db.setJobStatus(job.id, paused ? 'paused' : (aborted ? 'stopped' : 'failed'), {
@@ -199,17 +174,9 @@ function startJob(o) {
 
 /**
  * 停止 / 暂停任务。
- *
- * `immediate=true`（默认）→ **立即结束**：中断在途 HTTP + 中断等待中的 sleep，
- * 不用等当前轮次跑完（否则最长要等 60s 的轮间隔）。
- * `immediate=false` → 老行为：等本轮结束再退。
- *
- * ★ 2026-10-01：新增 `mode='pause'`。
- *
- *   管理后台要能「暂停别人的任务」，而原来的语义只有「彻底结束」。
- *   暂停 = 立即中断，但状态记为 **paused**（不是 stopped），且**保留已跑轮数** ——
- *   于是「继续」时可以从 `rounds_done + 1` 接着跑，不浪费已经刷过的局。
- *
+ * `immediate=true`（默认）→ 立即结束：中断在途 HTTP + 等待中的 sleep，不用等当前轮次跑完。
+ * `immediate=false` → 等本轮结束再退。
+ * `mode='pause'`：立即中断但状态记 paused（保留已跑轮数），「继续」时从 rounds_done+1 接着跑。
  * @param {number} jobId
  * @param {boolean} [immediate] 默认 true
  * @param {{mode?:'stop'|'pause'}} [opts]
@@ -251,13 +218,7 @@ function stopJob(jobId, immediate, opts) {
 
 /**
  * 继续一个「已暂停 / 已停止」的任务（从下一轮接着跑，已刷的局不丢）。
- *
- * ## 为什么不是「新建任务」
- *
- * 暂停时 `rounds_done` 已经落库，而主循环是 `for (i = rounds_done + 1; …)`，
- * 所以**沿用同一个 jobId** 重新 `startJob()` 就是天然断点续跑 ——
- * 任务 id 不变、日志流不断、管理页看到的是同一条记录。
- *
+ * 暂停时 rounds_done 已落库，主循环从 rounds_done+1 开始，沿用同一 jobId 重跑即天然断点续跑。
  * @param {number} jobId
  * @returns {{ok:boolean, message?:string, jobId?:number, resumedFrom?:number}}
  */
@@ -290,11 +251,8 @@ function resumeJob(jobId) {
 }
 
 /**
- * 把某用户**所有还没跑完**的任务停掉 / 暂停。
- *
- * 用途：管理员「禁用」或「删除」用户时，必须连带把他正在跑的任务停掉 ——
- * 否则界面上写着「已禁用」，后台还在替他刷局（这正是用户反馈的问题）。
- *
+ * 把某用户所有还没跑完的任务停掉 / 暂停。
+ * 用途：管理员禁用/删除用户时，必须连带停掉他正在跑的任务，否则界面禁用、后台还在刷局。
  * @param {number} userId
  * @param {{mode?:'stop'|'pause'}} [opts]
  * @returns {number} 受影响的任务数
@@ -424,18 +382,9 @@ async function runLoop(job, cfg, ctx) {  const jobId = job.id;
   });
 }
 
-/* ======================== 刷练习任务（2026-10-01 新增） ========================
- *
- * ## 为什么练习也要走这套调度
- *
- * 以前 `/api/exercise/run` 是**裸的 async IIFE**：不登记 running、不落库、
- * 不占并行名额。于是：
- *   · 「任务」页永远看不到刷练习；
- *   · 切到别的 tab（SSE 断开）再回来，日志空白，看起来「没在跑 / 被中断」；
- *   · 没法停止。
- *
- * 现在它和刷局任务**同源**：db 里一条 jobs 记录 + job_rounds 逐轮明细，
- * 共用同一套 `publish` / `subscribe` / `stopJob` / SSE。
+/* ======================== 刷练习任务（与刷局任务同源调度） ========================
+ * 练习任务也登记 running、落库、占并行名额，共用 publish/subscribe/stopJob/SSE，
+ * 这样「任务」页可见、切 tab 不丢日志、可停止。
  */
 
 /**

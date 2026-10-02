@@ -1,17 +1,9 @@
 'use strict';
 // 小猿账号服务：导入登录态 → 探活 → 拉子账号 → 切号。
 //
-// ## 登录方式选型（用户待拍板：方案 A 导入 cookie / 方案 B 短信验证码）
-//
-// 本项目**默认实现方案 A（导入登录态 cookie）**，原因：
-//   1. 逆向结论里短信登录链路（RSA 加密手机号 + verifier）虽已跑通，
-//      但要额外维护公钥/编码器，且每次登录都触发短信，不适合自动刷局；
-//   2. 真机导出的 cookie（`.yuanfudao.com` 域，含 `sess/userid/sid/ks_*`）
-//      一次性导入后可长期复用（会话 cookie，服务端有效期内一直可用）；
-//   3. 方案 B 仍需 cookie 收尾（登录响应也要落 cookie），A 是其子集。
-//
-// 方案 B 的接口已预留：见文件末尾 `TODO(方案B)`，需要时按
-// `ape-api.yuanfudao.com/accounts/android/safe/login` 补即可。
+// 默认方案 A（导入登录态 cookie）：真机导出的 cookie 一次性导入后长期复用，
+// 比短信验证码（方案 B）链路更简单；方案 B 收尾也仍需 cookie。
+// 方案 B 接口预留于文件末尾 TODO(方案B)。
 
 const db = require('../db');
 const leo = require('../leo');
@@ -21,12 +13,8 @@ const REQUIRED_COOKIES = ['sess'];
 const HELPFUL_COOKIES = ['userid', 'g_sess', 'persistent', 'sid', 'ks_sess', 'ks_deviceid', 'ks_persistent'];
 
 /**
- * 解析用户粘贴的 cookie 文本，返回 [leo.CookieJar]。
- *
- * 支持三种输入：
- *   1. 完整 `Cookie:` 头：`sess=xxx; userid=123`
- *   2. 每行 `name=value`（从浏览器 DevTools 复制）
- *   3. JSON 数组：`[{"name":"sess","value":"...","domain":".yuanfudao.com"}]`
+ * 解析用户粘贴的 cookie 文本，返回 leo.CookieJar。
+ * 支持三种输入：完整 `Cookie:` 头 / 每行 `name=value` / JSON 数组。
  *
  * @param {string} text
  * @returns {{ok:boolean, jar?:leo.CookieJar, message?:string, missing?:string[]}}
@@ -65,18 +53,8 @@ function finishJar(jar) {
 
 /**
  * 克隆一个 cookie jar。
- *
- * ## 为什么探活必须用克隆（2026-09-27 真机踩坑）
- *
- * `GET /leo-profile/api/user-infos/context` 的 **`Set-Cookie` 会改写会话**：
- * 调过它之后，服务端认定的「当前子账号」会被踢回**主号**（实测 主账号A，
- * 而真实可用的小号是 小号B）。
- *
- * 也就是说：如果直接用待落库的 jar 去探活，**探活本身就把身份改坏了**，
- * 之后刷局会用错账号（表现为「已封禁，暂时无法使用」）。
- *
- * 所以凡是「只想拿数据、不想改变登录态」的调用，都跑在克隆 jar 上，
- * 副作用随克隆丢弃。
+ * 探活/读资料接口会下发 Set-Cookie 改写服务端会话身份，因此「只想取数据、
+ * 不改登录态」的调用都跑在克隆 jar 上，副作用随克隆丢弃。
  */
 function cloneJar(jar) {
   return new leo.CookieJar(jar.toJSON());
@@ -91,8 +69,8 @@ function cloneJar(jar) {
  * @returns {Promise<{ok:boolean, status:number, allSubUserIds?:number[], primarySubUserId?:number, message?:string}>}
  */
 async function probe(jar, opts) {
-  // ★ capture=true 时在**真实 jar** 上跑：`context` 的 Set-Cookie 会下发 `sid`，
-  //   而默认的 cloneJar 会把这份副作用丢掉（导入瘦身后的真 bug，2026-09-28）。
+  // capture=true 时在**真实 jar** 上跑：context 的 Set-Cookie 会下发 sid，
+  //   而默认 cloneJar 会把这份副作用丢掉，导致落库只有基础 cookie。
   const capture = !!(opts && opts.capture);
   const target = capture ? jar : cloneJar(jar);
   const r = await leo.userInfosContext(target);
@@ -122,8 +100,7 @@ async function fetchSubAccounts(jar) {
   const current = ctx.currentUserId;
   const primary = ctx.primarySubUserId;
 
-  // 明细（名字/头像/年级）—— 2026-09-28 起**可用**：batchGet 现在走 MAIN_COMMON_QUERY
-  // （android37/3.140.1 + sign）→ 实测 200，返回 nickname/avatarUrl。
+  // 明细（名字/头像/年级）：batchGet 走 MAIN_COMMON_QUERY（android37/3.140.1 + sign）→ 200，
   // 仍跑在克隆 jar 上：batchGet 也会 Set-Cookie，别污染待落库的登录态。
   let detailMap = new Map();
   let note = '';
@@ -183,15 +160,14 @@ async function importAccount(o) {
   let grade = null;
 
   // 账号域资料（不需设备链）——拿昵称/头像/年级。
-  // ⚠️ 也用克隆 jar：这条同样是 Set-Cookie 大户，会改写会话绑定的子账号
-  //    （实测会让生效身份从 小号B 变成主号 主账号A）。
+  // 也用克隆 jar：profile 接口同样下发 Set-Cookie，会改写会话绑定的子账号。
   const prof = await leo.ytkUserProfile(cloneJar(jar));
   if (prof.status === 200 && prof.json) {
     const vo = prof.json.data || prof.json;
     if (vo && vo.grade != null) grade = Number(vo.grade);
   }
 
-  // ★ 登录的账号若没有设备链，自动从「设备链池」补一份（多份轮换）
+  // 登录的账号若没有设备链，自动从「设备链池」补一份（多份轮换）。
   const chainInfo = applyDeviceChain(jar);
   if (chainInfo.applied) console.log('[leo] 已自动补齐设备链:', chainInfo.from, chainInfo.deviceId || '');
 
@@ -236,17 +212,12 @@ async function refreshSubAccounts(leoAccountId) {
 }
 
 /**
- * 查询「当前生效身份」——**以服务端回包为准**。
+ * 查询「当前生效身份」——以服务端回包为准。
+ * 用 `GET /leo-game-pk/android/math/pk/home` 的 `baseUserInfoVO.userId`（实测稳定 200，
+ * 回包里的 userId 就是服务端认定的当前身份）。
  *
- * 用 `GET /leo-game-pk/android/math/pk/home` 的 `baseUserInfoVO.userId`：
- * 这条接口实测稳定 200，且回包里的 userId 就是服务端认定的当前身份。
- *
- * ## ⚠️ 为什么不能靠改 `userid` cookie 来切号（2026-09-27 实测反证）
- *
- * 试过把 cookie 里的 `userid` 分别改成 `主账号A` / `小号C` /
- * `小号B` 再打 pk/home，**三次回包都是 `小号B`**，而且响应里的
- * `Set-Cookie` 会把本地值改写回去。
- * 结论：**`userid` cookie 被服务端完全忽略**，身份由服务端会话决定。
+ * ⚠️ 不能靠改 `userid` cookie 切号：服务端完全忽略它，且回包会把它改回去，
+ * 身份由服务端会话决定。
  *
  * @returns {Promise<number|null>} 当前 userId；取不到返回 null
  */
@@ -266,19 +237,13 @@ async function currentIdentity(jar) {
 /**
  * 切换到子账号。
  *
- * ## 现状（2026-09-27 实测，如实记录）
+ * 现状：服务端 `POST .../accounts/switch` 对非 App 客户端一律 417
+ * （`x-block-by: solar-encoder`，卡传输/编码层，至今未闭环）；
+ * 本地改 `userid` cookie 也无效（服务端忽略并改回）。
  *
- * | 手段 | 结果 |
- * |---|---|
- * | 服务端 `POST /leo-gateway/android/accounts/switch` | **一律 417** `No message available`（带不带 sign / YFD_U / 风控头 / HTTP2 都一样） |
- * | 本地改 `userid` cookie | **无效** —— 服务端忽略它，且回包把它改回去 |
- *
- * 417 这条路径在原项目里也是同一个结论（「有 `ks_*` → 417 `x-block-by:
- * solar-encoder`，卡传输/编码层，**至今未闭环**」）。
- *
- * 因此本函数**不假装成功**：
+ * 因此本函数不假装成功：
  *  - 若服务端切号 200 → 正常落库；
- *  - 若失败 → 返回 `ok:false` 并**带上当前生效身份**，让用户知道实际会用哪个账号。
+ *  - 若失败 → 返回 ok:false 并带上当前生效身份，让用户知道实际会用哪个账号。
  *
  * @returns {Promise<{ok:boolean, message:string, userId?:number, currentIdentity?:number|null, blocked?:boolean}>}
  */
@@ -357,22 +322,12 @@ function cookieNamesOf(id) {
 }
 
 /**
- * ★ 切换子账号（2026-09-28 攻破，可用）。
+ * 切换子账号（需 arm64 native 才能算 sign）。
  *
- * ## 为什么之前「做不到」
- * 旧结论说 switch 恒 417、是「传输层指纹」。**错的**。真实原因有两个：
- *   1. 查询串里 `_productId` **必须放最前**（放最后 → 400）；
- *   2. **必须带 sign**（不带 → 417 solar-encoder；带旧/错 sign 也 417）。
- *      ⇒ 417 其实是「sign 校验失败」，不是 TLS 指纹。
- *
- * ## 实测（账号 4，真机 cookie）
- * ```
- * 切换前 cur=1155551346
- * switch -> 200 {"code":1,...}     Set-Cookie: 新 sess + userid + ks_*
- * 切换后 cur=511467407   ★ 成功
- * 切回 -> 200 -> cur=1155551346   ★ 双向可用
- * ```
- * 注意：sign 需要 arm64 native（`bin/native/lre.so`）—— x86/Windows 上算不出，会 417。
+ * 关键约束：
+ *  - 查询串里 `_productId` 必须放最前（放最后 → 400）；
+ *  - 必须带 sign（不带或错 sign → 417 solar-encoder）；417 实为 sign 校验失败，非 TLS 指纹；
+ *  - sign 需要 arm64 native（`bin/native/lre.so`），x86/Windows 算不出会 417。
  *
  * @param {number} leoAccountId 库里的小猿账号
  * @param {number} targetUserId 目标子账号 userId
@@ -451,12 +406,8 @@ function autoPoolDeviceChain(cookieText, label) {
 }
 
 /**
- * ★ 给一个 jar 自动补齐设备链。
- *
- * 优先级：
- *   1. jar 里已经有 `ks_deviceid` → 什么都不做；
- *   2. 设备链池里有 enabled 的份 → 取第 `pick % 池大小` 份（多份轮换，分摊风险）；
- *   3. 池空 → 从库里任意「有设备链的账号」借一份（向后兼容）。
+ * 给一个 jar 自动补齐设备链。
+ * 优先级：jar 已有 ks_deviceid → 设备链池里 enabled 份（按 pick % 池大小轮换）→ 池空则从库里借。
  *
  * @returns {{applied:boolean, from?:string, deviceId?:string}}
  */
@@ -497,22 +448,12 @@ function applyDeviceChain(jar, pick) {
 }
 
 /**
- * ★ 设备链移植（2026-09-28 实测可行）。
+ * 设备链移植：把源账号的 ks_* 复制到目标账号。
  *
- * ## 为什么需要
- * 登录（短信/密码）导入的账号只有 6~7 条 cookie，**没有 ks_**；
- * 而没有设备链时 PK 出题（pk/match）实测**恒定 400**「No message available」，
- * 也就是「登录进来的账号刷不了 PK」。
- *
- * ## 为什么能移植
- * ks_deviceid 是**设备级**标识（真机值是数字串），不是账号级；
- * 把同一台设备/同一个 App 的 ks_* 复制到另一个账号，服务端照样认。
- *
- * ## 实测效果（账号5 移植账号4 的 5 个 ks_*）
- *   pkMatch        400(x3)  ->  200(x3)
- *   完整 PK 一局   跑不了    ->  ok=true，已结算，pkIdStr=869321703547867169
- *   batchGet       401      ->  417（认证层过了，卡传输层 solar-encoder）
- * 注意：只对**读/出题**类有效；switch（切子账号）仍 417，做不到。
+ * 为什么需要：没设备链时 PK 出题（pk/match）实测恒定 400「No message available」，
+ * 登录进来的账号刷不了 PK。为什么能移植：ks_deviceid 是设备级标识（非账号级），
+ * 同设备/同 App 的 ks_* 复制到别的账号服务端照样认。
+ * 注意：只对读/出题类有效；switch（切子账号）仍 417。
  *
  * @param {number} targetId 目标账号（补齐设备链）
  * @param {number} sourceId 源账号（提供 ks_*）
