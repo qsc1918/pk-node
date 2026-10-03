@@ -16,21 +16,64 @@ import { calcT } from './emu.js';
 import { chainMd5 } from './sign.js';
 import { encodeBody, decodeBody } from './codec.js';
 import { buildPathPoints, STROKE_MODES } from './strokes.js';
+import { addLog, recentLogs, trimLogs } from './db.js';
 
-const MAX_LOG = 100;
+const MAX_LOG = 300;
 
-// ---------------------------------------------------------------- KV helpers
+// ---------------------------------------------------------------- 存储
 
+/**
+ * 读取「账号列表」等小配置：仍走 KV（读很便宜，免费层 10 万次/天）。
+ *
+ * ⚠️ 但**写入**必须省着用：KV 免费层只有 **1000 次写/天**，
+ * 线上曾因自动跑频繁写日志把额度耗尽 → 所有写操作报
+ * `KV put() limit exceeded for the day.`。
+ * 所以：账号/开关这类「用户主动操作」才写 KV；**运行日志一律写 D1**。
+ */
 async function getJson(env, key, def) {
   const v = await env.KV.get(key, 'json');
   return v == null ? def : v;
 }
 
+/** 运行日志 → D1（额度 10 万行/天，比 KV 高两个数量级）。 */
 async function pushLog(env, line) {
-  const logs = await getJson(env, 'log', []);
-  logs.unshift({ at: new Date().toISOString(), line: line });
-  if (logs.length > MAX_LOG) logs.length = MAX_LOG;
-  await env.KV.put('log', JSON.stringify(logs));
+  try {
+    await addLog(env.DB, line);
+    // 偶尔修剪，避免无限增长（失败不影响主流程）
+    if (Math.random() < 0.1) await trimLogs(env.DB, MAX_LOG);
+  } catch (e) {
+    // 日志写失败绝不能影响业务
+  }
+}
+
+/**
+ * 计数器的「省写」策略：把 rounds/lastRunAt 记在内存里，
+ * 只在**每 20 轮**或显式需要时才落 KV —— 避免把 1000 次/天的写额度耗光。
+ */
+let memState = null;
+let roundsSinceFlush = 0;
+
+async function loadState(env) {
+  if (memState) return memState;
+  memState = await getJson(env, 'state', { autoRun: false, rounds: 0, lastRunAt: null });
+  return memState;
+}
+
+async function bumpRounds(env, ok) {
+  const st = await loadState(env);
+  if (ok) st.rounds = (st.rounds || 0) + 1;
+  st.lastRunAt = new Date().toISOString();
+  roundsSinceFlush++;
+  if (roundsSinceFlush >= 20) {
+    roundsSinceFlush = 0;
+    try { await env.KV.put('state', JSON.stringify(st)); } catch (e) { /* 额度问题不致命 */ }
+  }
+}
+
+async function saveState(env) {
+  const st = await loadState(env);
+  roundsSinceFlush = 0;
+  try { await env.KV.put('state', JSON.stringify(st)); } catch (e) { /* ignore */ }
 }
 
 // ---------------------------------------------------------------- 业务
@@ -133,14 +176,37 @@ const PAGE = (body) => new Response(
 );
 
 export default {
+  /**
+   * 全局异常兜底：把真实错误写进响应体。
+   * 没有它的话，Cloudflare 只返回一个笼统的 “Worker threw exception”（1101），
+   * 完全看不到是哪一行炸的（这次排查 POST /api/run 就卡在这）。
+   */
   async fetch(request, env, ctx) {
+    try {
+      return await this.handle(request, env, ctx);
+    } catch (e) {
+      return new Response(JSON.stringify({
+        ok: false,
+        layer: 'worker',
+        message: String((e && e.message) || e),
+        stack: String((e && e.stack) || '').split('\n').slice(0, 8),
+        path: new URL(request.url).pathname,
+        method: request.method,
+      }, null, 2), {
+        status: 500,
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+      });
+    }
+  },
+
+  async handle(request, env, ctx) {
     const url = new URL(request.url);
     const p = url.pathname;
 
     if (p === '/' || p === '/index.html') {
       const accts = await getJson(env, 'accts', []);
-      const logs = await getJson(env, 'log', []);
-      const state = await getJson(env, 'state', { autoRun: false, rounds: 0 });
+      const logs = await recentLogs(env.DB, 30);
+      const state = await loadState(env);
       const rows = [];
       for (const id of accts) {
         const a = await getJson(env, 'acct:' + id, null);
@@ -161,7 +227,7 @@ export default {
         + '<form method="post" action="/api/run"><button type="submit">立即跑一轮</button></form>'
         + '<form method="post" action="/api/autorun">'
         + '<button type="submit">' + (state.autoRun ? '关闭自动跑' : '开启自动跑') + '</button></form>'
-        + '<h3>最近日志</h3><pre>' + (logs.length ? logs.slice(0, 30).map((x) => x.at + '  ' + x.line).join('\n') : '(空)') + '</pre>',
+        + '<h3>最近日志</h3><pre>' + (logs.length ? logs.map((x) => x.at + '  ' + x.line).join('\n') : '(空)') + '</pre>',
       );
     }
 
@@ -189,6 +255,7 @@ export default {
       const r = await runOneRound(env, a, {});
       await pushLog(env, (r.ok ? '✅ 一轮成功' : '❌ 一轮失败') + ' ' + JSON.stringify(r.stages)
         + (r.error ? ' ' + r.error : '') + (r.pkIdStr ? ' pk=' + r.pkIdStr : ''));
+      await bumpRounds(env, r.ok);
       if (request.headers.get('accept') && request.headers.get('accept').indexOf('text/html') >= 0) {
         return Response.redirect(new URL('/', url).toString(), 303);
       }
@@ -197,16 +264,16 @@ export default {
 
     // 自动跑开关
     if (p === '/api/autorun' && request.method === 'POST') {
-      const state = await getJson(env, 'state', { autoRun: false, rounds: 0 });
+      const state = await loadState(env);
       state.autoRun = !state.autoRun;
-      await env.KV.put('state', JSON.stringify(state));
+      await saveState(env);
       await pushLog(env, '自动跑已' + (state.autoRun ? '开启' : '关闭'));
       return Response.redirect(new URL('/', url).toString(), 303);
     }
 
     if (p === '/api/status') {
       const accts = await getJson(env, 'accts', []);
-      const state = await getJson(env, 'state', { autoRun: false, rounds: 0 });
+      const state = await loadState(env);
       const list = [];
       for (const id of accts) {
         const a = await getJson(env, 'acct:' + id, null);
@@ -226,10 +293,10 @@ export default {
       const got = request.headers.get('X-Token') || url.searchParams.get('token') || '';
       if (got !== need) return json({ ok: false, message: 'token 不对' }, 403);
 
-      const state = await getJson(env, 'state', { autoRun: false, rounds: 0 });
+      const state = await loadState(env);
       const stamp = new Date().toISOString();
-      // 记录触发时间，便于外部健康检查
-      await env.KV.put('lastTick', stamp);
+      // ⚠️ 不写 KV：/api/tick 每 10 分钟触发一次，写 KV 会把免费层
+      //    **1000 次写/天** 的额度耗光（线上曾因此全线 500）。
       if (!state.autoRun) {
         return json({ ok: true, skipped: 'autoRun 关闭', at: stamp });
       }
@@ -238,19 +305,16 @@ export default {
 
       const a = await getJson(env, 'acct:' + accts[0], null);
       const r = await runOneRound(env, a, {});
-      state.rounds = (state.rounds || 0) + (r.ok ? 1 : 0);
-      state.lastRunAt = stamp;
-      await env.KV.put('state', JSON.stringify(state));
+      await bumpRounds(env, r.ok);
       await pushLog(env, '[tick] ' + (r.ok ? '✅ 成功' : '❌ 失败') + ' ' + JSON.stringify(r.stages)
         + (r.error ? ' ' + r.error : ''));
-      await env.KV.put('lastTickNote', stamp + ' ' + (r.ok ? 'ok' : 'fail: ' + (r.error || '')));
 
       // 返回完整结果：外部调度器的日志里就能直接看到成败与耗时
       return json({ ok: r.ok, at: stamp, result: r });
     }
 
     if (p === '/api/log') {
-      return json({ ok: true, log: await getJson(env, 'log', []) });
+      return json({ ok: true, log: await recentLogs(env.DB, 100) });
     }
 
     // 诊断：算一次 sign 并报告耗时（用于确认免费层 CPU 预算）
@@ -283,32 +347,25 @@ export default {
 
   /** cron 触发：若开关打开，就跑一轮。 */
   async scheduled(event, env, ctx) {
-    // ⚠️ 无论成败都先写一条 KV：这样能精确区分
-    //   「cron 根本没触发」和「触发了但业务失败」——排查时非常关键。
     const stamp = new Date().toISOString();
     try {
-      await env.KV.put('lastCron', stamp);
-
-      const state = await getJson(env, 'state', { autoRun: false, rounds: 0 });
+      const state = await loadState(env);
       if (!state.autoRun) {
-        await env.KV.put('lastCronNote', stamp + ' autoRun=off');
+        await pushLog(env, '[cron] autoRun 关闭 ' + stamp);
         return;
       }
       const accts = await getJson(env, 'accts', []);
       if (!accts.length) {
-        await env.KV.put('lastCronNote', stamp + ' 无账号');
+        await pushLog(env, '[cron] 无账号 ' + stamp);
         return;
       }
       const a = await getJson(env, 'acct:' + accts[0], null);
       const r = await runOneRound(env, a, {});
-      state.rounds = (state.rounds || 0) + (r.ok ? 1 : 0);
-      state.lastRunAt = stamp;
-      await env.KV.put('state', JSON.stringify(state));
+      await bumpRounds(env, r.ok);
       await pushLog(env, '[cron] ' + (r.ok ? '✅ 成功' : '❌ 失败') + ' ' + JSON.stringify(r.stages)
         + (r.error ? ' ' + r.error : ''));
-      await env.KV.put('lastCronNote', stamp + ' ' + (r.ok ? 'ok' : 'fail: ' + (r.error || '')));
     } catch (e) {
-      await env.KV.put('lastCronError', stamp + ' ' + String((e && e.message) || e));
+      await pushLog(env, '[cron] 异常 ' + stamp + ' ' + String((e && e.message) || e));
     }
   },
 };

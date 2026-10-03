@@ -7,9 +7,22 @@
   "kv_namespaces": [
     { "binding": "KV", "id": "239b1e3f174a40bab35460cdae59db8c" }
   ],
+  // ⚠️ 绑定名必须是 DB（deploy/wsrc/db.js 里读 env.DB）
+  //    为什么用 D1：KV 免费层只有 1000 次写/天，自动跑会把额度耗光
+  //    （线上曾报 `KV put() limit exceeded for the day.` -> 全站 500）；
+  //    D1 免费层 10 万行写/天，高两个数量级。
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "pk-node-logs",
+      "database_id": "e7d1aeac-863c-444e-9f19-d4b6cbc467d2"
+    }
+  ],
 
+  // ⚠️ 间隔必须 > 出题频控（账号级 ~61.6s 冷却），否则每轮都 400。
+  //    实测：每分钟一次 → 几乎全失败；改 2 分钟可稳定跑成。
   "triggers": {
-    "crons": ["* * * * *"]
+    "crons": ["*/2 * * * *"]
   },
 
   "observability": { "enabled": true }
