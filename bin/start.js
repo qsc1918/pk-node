@@ -28,8 +28,13 @@ if (!(major >= 22)) {
 // ⚠️ 不能靠 `ss` / `netstat` 判断占用（本机在 proot 里看不到宿主侧的监听），
 // 唯一可靠的办法是**真的 listen 一次**。
 
-const HOST = process.env.PK_HOST || '127.0.0.1';
-const WANT = Number(process.env.PK_PORT || 8792);
+// ⚠️ 托管平台（alwaysdata / Render / Railway 等）会注入 `HOST` + `PORT`，此时
+//    必须**原样监听**，绝不能另挑端口 —— 平台的转发只打到它指定的那个端口。
+//    本地运行时走原来的「自动避让占用端口」逻辑。
+const ENV_PORT = Number(process.env.PORT);
+const FORCED_PORT = Number.isFinite(ENV_PORT) && ENV_PORT > 0 ? ENV_PORT : null;
+const HOST = process.env.PK_HOST || process.env.HOST || '127.0.0.1';
+const WANT = Number(process.env.PK_PORT || FORCED_PORT || 8792);
 const DEFAULT_PORT = Number.isFinite(WANT) && WANT > 0 ? WANT : 8792;
 const SPAN = 40;
 
@@ -60,15 +65,17 @@ async function pickPort(start) {
 /* ------------------------------ 3) 启动 ------------------------------ */
 
 (async () => {
-  const port = await pickPort(DEFAULT_PORT);
+  // 平台指定了端口就直接用（挑别的端口平台转发不过来）；否则本地自动避让。
+  const port = FORCED_PORT || (await pickPort(DEFAULT_PORT));
   if (!port) {
     fail(DEFAULT_PORT + '~' + (DEFAULT_PORT + SPAN - 1) + ' 都被占用了，请指定一个空闲端口：' +
       (process.platform === 'win32' ? 'set PK_PORT=9000 & start.bat' : 'PK_PORT=9000 ./start.sh'));
   }
   if (port !== DEFAULT_PORT) console.log('提示：' + DEFAULT_PORT + ' 已被占用，自动改用 ' + port);
 
-  // 必须在 require server.js 之前写回环境变量 —— config.js 在 require 时读 process.env.PK_PORT。
+  // 必须在 require server.js 之前写回环境变量 —— config.js 在 require 时读 process.env。
   process.env.PK_PORT = String(port);
+  process.env.PK_HOST = HOST;
 
   console.log('== pk-node ==');
   console.log('node      : v' + process.versions.node);
