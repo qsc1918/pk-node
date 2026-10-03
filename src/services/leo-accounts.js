@@ -167,14 +167,35 @@ async function importAccount(o) {
     if (vo && vo.grade != null) grade = Number(vo.grade);
   }
 
-  // 登录的账号若没有设备链，自动从「设备链池」补一份（多份轮换）。
-  const chainInfo = applyDeviceChain(jar);
-  if (chainInfo.applied) console.log('[leo] 已自动补齐设备链:', chainInfo.from, chainInfo.deviceId || '');
+  // 设备链优先级：粘贴内容自带的 ks_* > 该账号已绑定的池内设备链 > 池里轮换 > 同用户其它账号。
+  //
+  // 为什么粘贴内容排第一：用户从 App/浏览器整段复制 cookie 时，里面本来就带着 ks_*，
+  // 既然粘了这份，落库就该用这份（而不是被池里另外一份覆盖）。
+  const pasteChain = extractChainFromItems(jar.toJSON());
+  const existingId = o.existingId == null ? null : Number(o.existingId);
+  const boundChainId = existingId ? db.getLeoAccountChainId(existingId) : null;
+
+  // 粘贴内容里的设备链收进池（已存在则按 ks_deviceid 更新），并记下 id 好回绑该账号
+  let pasteChainId = null;
+  if (pasteChain) {
+    const pooled = autoPoolDeviceChain(pasteChain, o.pasteLabel || ('设备链 ' + deviceIdOf(pasteChain)));
+    pasteChainId = pooled ? pooled.id : null;
+  }
+
+  const chainInfo = applyDeviceChain(jar, {
+    pasteChain: pasteChain,
+    pasteChainId: pasteChainId,
+    boundChainId: boundChainId,
+    appUserId: o.appUserId,
+    accountId: existingId,
+  });
+  if (chainInfo.applied) {
+    console.log('[leo] 已补齐设备链:', chainInfo.from, chainInfo.deviceId || '');
+  }
 
   // 只落「有值」的 cookie：服务端曾用 Set-Cookie 发 ks_deviceid=空 表示设备链无效，
   // 存空值反而会覆盖已有的好值。
   const cookies = jar.toJSON().filter((c) => String(c.value == null ? '' : c.value).length > 0);
-  const existingId = o.existingId == null ? null : Number(o.existingId);
   let id;
   if (existingId) {
     db.updateLeoAccount(existingId, o.name, cookies, { yfdU: yfdU, grade: grade });
@@ -183,8 +204,17 @@ async function importAccount(o) {
     id = db.addLeoAccount(o.appUserId, o.name, cookies, { yfdU: yfdU, grade: grade });
   }
 
+  // 把「这次实际用的设备链」钉到账号上：之后跑任务直接复用这份，不再每次随机换。
+  if (chainInfo.chainId) {
+    try { db.setLeoAccountChain(id, chainInfo.chainId); } catch (e) { /* 不影响导入结果 */ }
+  }
+
   const subs = await fetchSubAccounts(jar);
   db.replaceSubAccounts(id, subs.items);
+
+  const chainMsg = chainInfo.deviceId
+    ? ` · 设备链 ${chainInfo.from === 'paste' ? '（本次粘贴内容）' : ''}${chainInfo.deviceId}`
+    : ' · 无设备链（PK 会 400）';
 
   return {
     ok: true,
@@ -193,7 +223,8 @@ async function importAccount(o) {
     subList: subs.items,
     yfdU: yfdU,
     grade: grade,
-    message: subs.note || ('导入成功，发现 ' + subs.items.length + ' 个子账号'),
+    chain: chainInfo,
+    message: (subs.note || ('导入成功，发现 ' + subs.items.length + ' 个子账号')) + chainMsg,
   };
 }
 
@@ -367,8 +398,28 @@ function rerr(text) {
 }
 
 /**
- * 从任意 cookie 文本里抽出设备链（`ks_*`）。
+ * 从一串 cookie item 里抽出设备链（`ks_*`）。
  * 只要含 `ks_deviceid` 就认为是一份可用设备链。
+ */
+function extractChainFromItems(items) {
+  if (!Array.isArray(items)) return null;
+  const chain = DEVICE_CHAIN_COOKIES
+    .map((n) => items.find((c) => c && c.name === n))
+    .filter((c) => c && String(c.value || '').length > 0)
+    .map((c) => ({ name: c.name, value: c.value, domain: c.domain || '.yuanfudao.com', path: c.path || '/' }));
+  if (!chain.some((c) => c.name === 'ks_deviceid')) return null;
+  return chain;
+}
+
+/** 设备链里的 ks_deviceid。 */
+function deviceIdOf(chain) {
+  const c = (chain || []).find((x) => x.name === 'ks_deviceid');
+  return c ? String(c.value || '') : '';
+}
+
+/**
+ * 从任意 cookie 文本里抽出设备链（`ks_*`）。
+ * 支持：`Cookie:` 整行 / 每行 name=value / JSON 数组 / JSON {items:[...]}。
  */
 function extractDeviceChain(text) {
   const raw = String(text || '').trim();
@@ -387,64 +438,107 @@ function extractDeviceChain(text) {
       }).filter(Boolean);
     }
   } catch (e) { return null; }
-  const chain = DEVICE_CHAIN_COOKIES
-    .map((n) => items.find((c) => c.name === n))
-    .filter((c) => c && String(c.value || '').length > 0)
-    .map((c) => ({ name: c.name, value: c.value, domain: c.domain || '.yuanfudao.com', path: c.path || '/' }));
-  if (!chain.some((c) => c.name === 'ks_deviceid')) return null;
-  return chain;
+  return extractChainFromItems(items);
 }
 
-/** 自动把含设备链的 cookie 文本收进「设备链池」（按 ks_deviceid 去重）。 */
-function autoPoolDeviceChain(cookieText, label) {
-  const chain = extractDeviceChain(cookieText);
+/** 把一份设备链写进 jar（覆盖同名 cookie）。 */
+function setChainToJar(jar, chain) {
+  for (const c of chain) {
+    jar.set({ name: c.name, value: c.value, domain: c.domain || '.yuanfudao.com', path: c.path || '/' });
+  }
+}
+
+/**
+ * 自动把一份设备链收进「设备链池」（按 ks_deviceid 去重：已存在则更新 value）。
+ * @param {string|Array} input cookie 文本 或 已解析的 ks_* 数组
+ * @returns {{id:number,created:boolean}|null}
+ */
+function autoPoolDeviceChain(input, label) {
+  const chain = Array.isArray(input) ? input : extractDeviceChain(input);
   if (!chain) return null;
-  const deviceId = (chain.find((c) => c.name === 'ks_deviceid') || {}).value;
+  const deviceId = deviceIdOf(chain);
   try {
     return db.upsertDeviceChain(label || ('设备链 ' + deviceId), chain, deviceId);
   } catch (e) { return null; }
 }
 
 /**
- * 给一个 jar 自动补齐设备链。
- * 优先级：jar 已有 ks_deviceid → 设备链池里 enabled 份（按 pick % 池大小轮换）→ 池空则从库里借。
+ * 给一个 jar 补齐设备链。优先级（高 → 低）：
  *
- * @returns {{applied:boolean, from?:string, deviceId?:string}}
+ *  1. **粘贴内容自带的设备链** —— 用户从 App/浏览器复制的 cookie 往往一大串、里面就带着 ks_*；
+ *     这次导入就该用这份（写在 importAccount 里，靠 opts.pasteChain 传进来）。
+ *  2. 该账号在设备链池里**指定使用**的那份（device_chain_id）。
+ *  3. 池里 enabled 的份随机挑（多份轮换，分摊风控风险）。
+ *  4. 池空 → 从**同一个用户**已有的账号里借一份（不再跨用户借，避免拿别人的设备链）。
+ *
+ * @param {leo.CookieJar} jar
+ * @param {object} [opts]
+ * @param {Array}  [opts.pasteChain]    粘贴文本里解析出的 ks_*（最高优先级）
+ * @param {number} [opts.pasteChainId]  该粘贴链收进池后得到的 id（用于回绑账号）
+ * @param {number} [opts.boundChainId]  账号指定使用的设备链 id
+ * @param {number} [opts.appUserId]     限定「借」的来源只能是这个用户自己的账号
+ * @param {number} [opts.pick]          池内下标（不传则随机）
+ * @returns {{applied:boolean, from:string, chainId?:number, deviceId?:string, names?:string[]}}
  */
-function applyDeviceChain(jar, pick) {
-  const has = jar.toJSON().some((c) => c.name === 'ks_deviceid' && String(c.value || '').length > 0);
-  if (has) return { applied: false, from: 'self' };
+function applyDeviceChain(jar, opts = {}) {
+  const paste = Array.isArray(opts.pasteChain) ? opts.pasteChain : null;
+  if (paste && paste.length) {
+    setChainToJar(jar, paste);
+    return {
+      applied: true, from: 'paste',
+      chainId: opts.pasteChainId == null ? null : Number(opts.pasteChainId),
+      deviceId: deviceIdOf(paste), names: paste.map((c) => c.name),
+    };
+  }
 
+  if (opts.boundChainId != null && opts.boundChainId !== '') {
+    try {
+      const c = db.getDeviceChain(Number(opts.boundChainId));
+      const cs = Array.isArray(c && c.cookies) ? c.cookies : [];
+      if (c && cs.length) {
+        setChainToJar(jar, cs);
+        return {
+          applied: true, from: 'bound', chainId: Number(c.id),
+          deviceId: c.device_id || deviceIdOf(cs), names: cs.map((x) => x.name),
+        };
+      }
+    } catch (e) { /* 绑定失效 → 往下走池 */ }
+  }
+
+  // 3) 池里轮换一份
   let pool = [];
   try { pool = db.listDeviceChains(true); } catch (e) { pool = []; }
 
-  // 池空则回退：从已有账号借
-  let chain = null;
-  let from = null;
   if (pool.length > 0) {
-    const idx = Number.isFinite(pick) ? (Math.abs(Number(pick)) % pool.length) : Math.floor(Math.random() * pool.length);
-    chain = pool[idx].cookies;
-    from = 'pool#' + pool[idx].id + (pool[idx].device_id ? '(' + pool[idx].device_id + ')' : '');
-  } else {
-    let accs = [];
-    try { accs = db.listLeoAccounts(0); } catch (e) { accs = []; }
-    if (!accs.length) {
-      try { accs = db.get().prepare('SELECT * FROM leo_accounts').all(); } catch (e) { accs = []; }
-    }
-    for (const a of accs) {
-      let items = [];
-      try { items = JSON.parse(a.cookies_json); } catch (e) { continue; }
-      const c = DEVICE_CHAIN_COOKIES.map((n) => items.find((x) => x.name === n)).filter((x) => x && String(x.value || '').length > 0);
-      if (c.some((x) => x.name === 'ks_deviceid')) { chain = c; from = 'account#' + a.id; break; }
-    }
+    const pick = Number(opts.pick);
+    const idx = Number.isFinite(pick)
+      ? Math.abs(pick) % pool.length
+      : Math.floor(Math.random() * pool.length);
+    const entry = pool[idx];
+    setChainToJar(jar, entry.cookies || []);
+    return {
+      applied: true, from: 'pool#' + entry.id,
+      chainId: Number(entry.id),
+      deviceId: entry.device_id || deviceIdOf(entry.cookies || []),
+      names: (entry.cookies || []).map((c) => c.name),
+    };
   }
-  if (!chain) return { applied: false, from: 'none' };
 
-  for (const c of chain) {
-    jar.set({ name: c.name, value: c.value, domain: c.domain || '.yuanfudao.com', path: c.path || '/' });
+  // 4) 池空：从同用户其它账号借
+  let accs = [];
+  try { accs = db.listLeoAccounts(opts.appUserId); } catch (e) { accs = []; }
+  for (const a of accs) {
+    if (a.id != null && Number(a.id) === Number(opts.accountId)) continue;
+    let items = [];
+    try { items = JSON.parse(a.cookies_json); } catch (e) { continue; }
+    const c = extractChainFromItems(items);
+    if (c) {
+      setChainToJar(jar, c);
+      return { applied: true, from: 'account#' + a.id, chainId: null, deviceId: deviceIdOf(c), names: c.map((x) => x.name) };
+    }
   }
-  const dev = (chain.find((c) => c.name === 'ks_deviceid') || {}).value;
-  return { applied: true, from: from, deviceId: dev };
+
+  return { applied: false, from: 'none' };
 }
 
 /**
@@ -498,6 +592,8 @@ module.exports = {
   DEVICE_CHAIN_COOKIES,
   switchToSubAccount,
   extractDeviceChain,
+  extractChainFromItems,
+  deviceIdOf,
   autoPoolDeviceChain,
   applyDeviceChain,
   cookieNamesOf,

@@ -126,6 +126,8 @@ function fmtTime(ts) {
 const state = {
   user: null,
   leoAccounts: [],
+  /** 设备链池（供账号卡片上的「用哪条设备链」下拉复用）。 */
+  leoChains: [],
   subs: [],
   currentJobId: null,
   jobStream: null,
@@ -342,6 +344,12 @@ function renderLeoList(accounts) {
       '<button class="mini" data-act="refresh">刷新子账号</button>' +
       '<button class="mini" data-act="subs">查看</button>' +
       '<button class="mini danger" data-act="del">删除</button>' +
+      '</div>' +
+      // 这个账号固定使用池里哪一份设备链；选「自动」= 跑到时才在池里随机挑一份
+      '<div class="chain-row">' +
+      '<label class="muted small">设备链</label>' +
+      '<select data-chain-sel="' + a.id + '" title="选择这个账号使用的设备链"></select>' +
+      '<span class="chain-tag"></span>' +
       '</div>';
     el.querySelector('.title').textContent = a.name;
     const ks = (a.cookieNames || []).filter((n) => n.indexOf('ks_') === 0);
@@ -401,6 +409,67 @@ function renderLeoList(accounts) {
       } catch (err) { toast(err.message, 'err'); }
     });
     box.appendChild(el);
+  }
+  syncLeoChainSelects();
+}
+
+/** 设备链下拉的选项由 state.leoChains 填充（ chains 与 accounts 先后加载，取值统一放在渲染后再同步）。 */
+function syncLeoChainSelects() {
+  const chains = state.leoChains || [];
+  document.querySelectorAll('#leo-list [data-chain-sel]').forEach((sel) => {
+    const accId = Number(sel.getAttribute('data-chain-sel'));
+    const acc = (state.leoAccounts || []).find((a) => String(a.id) === String(accId));
+    if (!acc) return;
+    const cur = acc.deviceChainId == null || acc.deviceChainId === '' ? '' : String(acc.deviceChainId);
+    const prev = sel.value;
+
+    sel.innerHTML = '';
+    const oAuto = document.createElement('option');
+    oAuto.value = '';
+    oAuto.textContent = '自动（池里轮换一份）';
+    sel.appendChild(oAuto);
+
+    for (const c of chains) {
+      const o = document.createElement('option');
+      o.value = String(c.id);
+      const shortDev = c.deviceId ? String(c.deviceId).slice(0, 10) : '';
+      o.textContent = c.label + '（' + (c.deviceId ? shortDev : '无 deviceid') + (c.enabled ? '' : ' · 停用') + '）';
+      sel.appendChild(o);
+    }
+    // 当前绑定值若还在选项里就选中它，否则退回「自动」
+    sel.value = Array.from(sel.options).some((o) => o.value === cur) ? cur : '';
+    if (prev && !sel.value) sel.value = prev;   // 保存请求的途中别把用户的选择弹回自动
+
+    const tag = sel.parentElement && sel.parentElement.querySelector('.chain-tag');
+    if (tag) {
+      const bound = chains.find((c) => String(c.id) === sel.value);
+      tag.textContent = sel.value === ''
+        ? '未指定（导入/跑任务时自动挑一条）'
+        : '已指定使用：' + (bound ? bound.label : '设备链 #' + sel.value);
+    }
+
+    if (!sel.dataset.bound) {
+      sel.dataset.bound = '1';
+      sel.addEventListener('change', () => { saveLeoChainBinding(accId, sel.value); });
+    }
+  });
+}
+
+/** 保存「某账号使用哪份设备链」；value='' 表示不指定（自动轮换）。 */
+async function saveLeoChainBinding(accId, value) {
+  try {
+    const r = await api('/api/leo/accounts/' + accId + '/chain', {
+      method: 'PUT',
+      body: { deviceChainId: value === '' ? null : Number(value) },
+    });
+    const acc = (state.leoAccounts || []).find((a) => String(a.id) === String(accId));
+    if (acc) acc.deviceChainId = r.deviceChainId == null ? null : Number(r.deviceChainId);
+    const c = (state.leoChains || []).find((x) => String(x.id) === String(r.deviceChainId));
+    toast(r.deviceChainId == null ? '已改为：自动（池里轮换）' : '已指定使用：' + (c ? c.label : ('设备链 #' + r.deviceChainId)), 'ok');
+    syncLeoChainSelects();
+  } catch (e) {
+    toast(e.message, 'err');
+    syncLeoChainSelects();   // 失败就把下拉弹回库里的真实值
   }
 }
 
@@ -533,9 +602,11 @@ $('btn-import').addEventListener('click', async () => {
       method: 'POST',
       body: { name: $('leo-name').value || '小猿账号', cookie: $('leo-cookie').value },
     });
+    // 粘贴内容自带设备链时，服务端会把它收进池并绑到这个账号上 → 池列表要跟着刷新
     msg.textContent = '导入成功：' + (r.message || '') + '（uid ' + r.yfdU + '）';
     toast('导入成功', 'ok');
     $('leo-cookie').value = '';
+    await loadDeviceChains();
     await loadLeoAccounts();
   } catch (err) {
     msg.textContent = '导入失败：' + err.message;
@@ -1698,14 +1769,18 @@ function restorePracticeJob() {
 async function loadDeviceChains() {
   try {
     const r = await api('/api/device-chains');
-    renderDeviceChains(r.chains || []);
+    state.leoChains = r.chains || [];
+    renderDeviceChains(state.leoChains);
+    // 账号卡片上的下拉也跟着刷新（新加/删掉的链会体现在选项里）
+    syncLeoChainSelects();
   } catch (e) { /* 未登录等，忽略 */ }
 }
 function renderDeviceChains(list) {
   const box = $('dc-list');
   box.innerHTML = '';
   if (!list.length) {
-    box.innerHTML = '<p class="muted small">池子里还没有设备链。新登录的账号将没有 ks_*（PK 会 400）。</p>';
+    box.innerHTML = '<p class="muted small">池子里还没有设备链。新登录的账号将没有 ks_*（PK 会 400）；' +
+      '带设备链的 cookie 粘贴进来时会自动收进池里。</p>';
     return;
   }
   for (const c of list) {
@@ -1714,7 +1789,10 @@ function renderDeviceChains(list) {
     el.innerHTML = '<div><div class="title"></div><div class="meta"></div></div>' +
       '<div class="actions"><button class="mini danger" data-dc-del="' + c.id + '">删除</button></div>';
     el.querySelector('.title').textContent = c.label + '（ks_deviceid=' + (c.deviceId || '?') + '）';
-    el.querySelector('.meta').textContent = (c.names || []).join(',') + ' · ' + c.bytes + 'B · ' + (c.enabled ? '启用' : '停用');
+    const use = Number(c.useCount || 0);
+    el.querySelector('.meta').textContent =
+      (c.names || []).join(',') + ' · ' + c.bytes + 'B · ' + (c.enabled ? '启用' : '停用') +
+      ' · 被 ' + use + ' 个账号指定使用';
     box.appendChild(el);
   }
 }
@@ -1734,7 +1812,11 @@ async function addDeviceChain() {
 async function onDeviceChainListClick(ev) {
   const id = ev.target && ev.target.getAttribute && ev.target.getAttribute('data-dc-del');
   if (!id) return;
-  if (!confirm('删除这份设备链？已用它补齐的账号不受影响，但新账号将无法自动补链。')) return;
+  const c = (state.leoChains || []).find((x) => String(x.id) === String(id));
+  const use = Number((c && c.useCount) || 0);
+  if (!confirm('删除这份设备链？' +
+    (use > 0 ? '有 ' + use + ' 个账号正指定使用它，删除后这些账号会退回「自动（池里轮换）」。' : '没有账号正在指定使用它。') +
+    ' 已落在账号 cookie 里的 ks_* 不受影响。')) return;
   try {
     await api('/api/device-chains/' + id, { method: 'DELETE' });
     toast('已删除', 'ok');
