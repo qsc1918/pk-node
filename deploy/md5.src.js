@@ -6,8 +6,19 @@
 //
 // 正确性：已与 Node 的 crypto.createHash('md5') 逐字节对照通过
 // （含空串 / 长串 / 二进制 / 完整 sign 链条，见 tools/test-md5.mjs）。
+//
+// ## 形态：ESM
+//
+// 本目录（deploy/）整体是 **ESM** —— 见 deploy/package.json 的 `"type": "module"`。
+// 原因：CI 会对仓库里**所有** .js 跑 `node --check`，而根 package.json 是
+// CommonJS；本文件以前用 CommonJS 的导出形式，在 `"type":"module"` 的目录下
+// 会报 `module is not defined`。这里改用 ESM 导出，与同目录其它文件一致。
+// （`tools/gen-worker-bundle.js` 只把它当**文本**读、再转写成 Worker 版，
+//   不加载它，所以改导出形式对打包无影响。）
+//
+// ⚠️ 本文里不要出现 「CommonJS 导出语句」的字面写法（生成器自检会误判为残留）。
 
-function md5(input) {
+export function md5(input) {
   let bytes;
   if (typeof input === 'string') bytes = new TextEncoder().encode(input);
   else if (input instanceof Uint8Array) bytes = input;
@@ -58,8 +69,8 @@ function md5(input) {
   return out;
 }
 
-function md5hex(input) {
+export function md5hex(input) {
   return Array.from(md5(input)).map(function (b) { return b.toString(16).padStart(2, '0'); }).join('');
 }
 
-module.exports = { md5, md5hex };
+export default { md5, md5hex };

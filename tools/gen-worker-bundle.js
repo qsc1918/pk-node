@@ -129,9 +129,13 @@ emu = emu.replace(/\s+$/, '') + '\n';
 w('emu.js', emu);
 
 // ---------- 4) md5.js（纯 JS，Worker 的 WebCrypto 无 MD5） ----------
-// 源文件 deploy/md5.src.js 是 CommonJS（便于本地自测），这里转成 ESM。
+// 源文件 deploy/md5.src.js 现在**本身就是 ESM**（见 deploy/package.json 的 type=module）。
+// 这里先把它的导出剥掉、只留函数体，再统一追加具名导出 ——
+// 否则「源文件已有的 export function」+「下面追加的 export {}」会**重复导出**，
+// Worker 启动即报 `Duplicate export of 'md5'`。
 let md5 = fs.readFileSync(path.join(ROOT, 'deploy', 'md5.src.js'), 'utf8').replace(/\s+$/, '') + '\n';
-md5 = md5.replace(/module\.exports\s*=\s*\{\s*md5\s*,\s*md5hex\s*\}\s*;?/, 'export { md5, md5hex };');
+md5 = md5.replace(/^export default \{[\s\S]*?\};?\s*$/m, '');   // 去掉 default 导出
+md5 = md5.replace(/^export function /gm, 'function ');          // 去掉 export 前缀
 if (!/export \{ md5, md5hex \}/.test(md5)) md5 += '\nexport { md5, md5hex };\n';
 w('md5.js', md5);
 

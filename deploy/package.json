@@ -1,0 +1,7 @@
+{
+  "//": "本目录（deploy/）下的 js 全是 **ESM**（Cloudflare Worker / Pages Function 写法：import/export）。",
+  "//why": "根 package.json 是 CommonJS（服务端用 require）。CI 会对仓库里所有 .js 跑 `node --check`，若本目录也按 CommonJS 解析，`import` 语句会报 SyntaxError。就近放一个 type=module 的 package.json 即可让 node 用 ESM 解析本目录。",
+  "//scope": "只影响 deploy/ 这一层（package.json 的 type 作用域是「其所在目录及其子目录」；子目录 deploy/w、deploy/wsrc、deploy/pages 都没有自己的 package.json，继承本文件）。",
+  "//note": "本文件不参与部署（wrangler 只读 main 指定的入口及其 import 链）；它只服务于 CI 的语法检查。",
+  "type": "module"
+}
