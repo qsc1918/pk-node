@@ -4,8 +4,42 @@
  */
 
 const path = require('node:path');
+const os = require('node:os');
 
 const ROOT = path.resolve(__dirname, '..');
+
+/**
+ * 默认监听地址。
+ *
+ * ⚠️ 2026-10-03 修复：**原来是 `127.0.0.1`（只监听回环）**，
+ * 所以「局域网 IP:8792」「公网 IP:8792」一律连不上 —— 请求在 TCP 层就被拒，
+ * 连 401 都收不到（很多人误以为是防火墙/鉴权的锅）。
+ *
+ * 改成 `0.0.0.0`（监听本机所有网卡）后，同一台机器上的多块网卡都能连：
+ *   - 本机        http://127.0.0.1:8792
+ *   - 局域网/手机 http://192.168.x.x:8792
+ *   - 公网（需路由器做端口映射 / 或用内置 Cloudflare 隧道）
+ *
+ * 想改回「只监听本机」：`PK_HOST=127.0.0.1`
+ * 想只监听某一块网卡（更安全）：`PK_HOST=192.168.3.72`
+ */
+const DEFAULT_HOST = '0.0.0.0';
+
+/**
+ * 本机对外可达的 IPv4 地址（局域网卡 + 公网网卡，排除回环/虚拟内部网卡）。
+ * 只用于启动横幅里给出「照着点」的链接，不参与监听。
+ */
+function lanAddresses() {
+  const out = [];
+  const ifs = os.networkInterfaces();
+  for (const name of Object.keys(ifs)) {
+    for (const it of ifs[name] || []) {
+      if (it.family !== 'IPv4' || it.internal) continue;
+      if (out.indexOf(it.address) < 0) out.push(it.address);
+    }
+  }
+  return out;
+}
 
 function envInt(name, def) {
   const v = process.env[name];
@@ -15,8 +49,8 @@ function envInt(name, def) {
 
 const config = {
   root: ROOT,
-  /** 监听地址。默认只监听回环（用户要求 127.0.0.1）；内网/穿透时用 0.0.0.0。 */
-  host: process.env.PK_HOST || '127.0.0.1',
+  /** 监听地址。默认监听所有网卡（局域网/公网可访问）；详见 DEFAULT_HOST 注释。 */
+  host: process.env.PK_HOST || DEFAULT_HOST,
   // 默认 8792，避开本机 8791（MT APK MCP 占用）；仍可用 PK_PORT 覆盖。
   port: envInt('PK_PORT', 8792),
 
@@ -96,6 +130,9 @@ const config = {
   /** cloudflared 可执行文件路径（不存在时会提示下载）。 */
   cloudflaredPath: process.env.PK_CLOUDFLARED || path.join(ROOT, 'bin', 'cloudflared'),
 };
+
+/** 是否监听在「所有网卡」= 局域网/公网能访问。用于启动横幅提示与登录限流强度。 */
+config.isExposed = (config.host === '0.0.0.0' || config.host === '::' || config.host === '');
 
 /**
  * 关键常量：PK 协议。
@@ -178,4 +215,16 @@ const PK = {
  */
 config.maxConcurrentJobs = envInt('PK_MAX_CONCURRENT', 0);
 
-module.exports = { config, PK };
+/**
+ * 登录失败限流：同一个来源 IP 在 [loginFailWindowMs] 内失败超过
+ * [loginFailMax] 次就临时封禁。
+ *
+ * 为什么加：一旦服务暴露到局域网/公网（默认 `0.0.0.0`），登录口就成了
+ * 撞库面。默认的 `admin / admin` 更是几乎等于把后台敞开。
+ * 这只是最轻的一层防护（内存计数、重启即失效），真正的兜底仍然是
+ * 「去管理页把默认密码改掉」。
+ */
+config.loginFailMax = envInt('PK_LOGIN_FAIL_MAX', 20);
+config.loginFailWindowMs = envInt('PK_LOGIN_FAIL_WINDOW_MS', 10 * 60 * 1000);
+
+module.exports = { config, PK, DEFAULT_HOST, lanAddresses };

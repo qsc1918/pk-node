@@ -8,6 +8,9 @@
 
 const net = require('node:net');
 const path = require('node:path');
+// 与 server.js 共用同一份「默认监听地址」定义，避免两边漂移
+// （这里以前也硬编码了 127.0.0.1，会把暴露到局域网的路堵死）。
+const { DEFAULT_HOST, lanAddresses } = require('../src/config');
 
 const ROOT = path.resolve(__dirname, '..');
 
@@ -28,7 +31,7 @@ if (!(major >= 22)) {
 // ⚠️ 不能靠 `ss` / `netstat` 判断占用（本机在 proot 里看不到宿主侧的监听），
 // 唯一可靠的办法是**真的 listen 一次**。
 
-const HOST = process.env.PK_HOST || '127.0.0.1';
+const HOST = process.env.PK_HOST || DEFAULT_HOST;
 const WANT = Number(process.env.PK_PORT || 8792);
 const DEFAULT_PORT = Number.isFinite(WANT) && WANT > 0 ? WANT : 8792;
 const SPAN = 40;
@@ -47,12 +50,11 @@ function tryPort(port, host) {
   });
 }
 
-/** 从 start 起找一个空闲端口；找不到返回 null。 */
+/** 从 start 起找一个空闲端口；找不到返回 null。探针地址直接用 HOST。 */
 async function pickPort(start) {
-  const host = HOST === '0.0.0.0' ? '0.0.0.0' : '127.0.0.1';
   for (let p = start; p < start + SPAN; p++) {
     // eslint-disable-next-line no-await-in-loop
-    if (await tryPort(p, host)) return p;
+    if (await tryPort(p, HOST)) return p;
   }
   return null;
 }
@@ -74,6 +76,18 @@ async function pickPort(start) {
   console.log('node      : v' + process.versions.node);
   console.log('监听      : http://' + HOST + ':' + port);
   console.log('native 目录: ' + path.join(ROOT, 'bin', 'native'));
+  // 直接把局域网地址打出来（照着点就能开），省得用户自己敲 ipconfig
+  const lan = lanAddresses();
+  if (lan.length) {
+    console.log('局域网访问: ' + (lan.length > 1 ? '（任选一个）' : '') +
+      lan.map((ip) => 'http://' + ip + ':' + port).join('  '));
+  }
+  if (HOST === DEFAULT_HOST) {
+    console.log('提示      : 已监听所有网卡（局域网/公网可访问）。公网需路由器做端口映射；' +
+      '打不开多半是 Windows 防火墙拦了入站。');
+  } else if (HOST !== '127.0.0.1') {
+    console.log('提示      : 只监听 ' + HOST + '；本机用 http://127.0.0.1:' + port);
+  }
   console.log('');
 
   const app = require(path.join(ROOT, 'server.js'));
