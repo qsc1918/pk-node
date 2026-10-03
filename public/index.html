@@ -351,6 +351,11 @@
       </div>
 
       <p id="leo-msg" class="muted small"></p>
+      <p class="muted small">
+        粘贴的 cookie 里若<b>自带 <code>ks_*</code>（设备链）</b>，导入时<b>优先使用它</b>，
+        并自动把这份设备链收进下面的池里绑到该账号 —— 之后这个账号刷局/刷练习都用这条链；
+        池里还有别的链时也<b>不会再随机换掉</b>（想换就在下面卡片的下拉里改）。
+      </p>
     </div>
 
     <div class="card">
@@ -358,7 +363,9 @@
       <div id="leo-list" class="list"></div>
       <p class="muted small">
         卡片里的「设备链」标记：<b>✗ 表示该账号没有 <code>ks_*</code> → PK 出题会 400</b>。
-        可点「复制设备链」从池里补一份（登录导入的账号会<b>自动补</b>）。
+        可点「复制设备链」从别的账号搬一份，或在每张卡片的下拉里
+        <b>直接指定这个账号使用池里的哪一条</b>（选「自动」= 跑到时才在池里随机挑一条）。
+        每个账号各用一条链，互不干扰。
       </p>
     </div>
     <div class="card">
@@ -366,6 +373,8 @@
       <p class="muted small">
         设备链 <code>ks_*</code> 是<b>设备级</b>凭据，原版只有 App 的设备注册才发。<br>
         把多个来源的 <code>ks_*</code> 存这里 → <b>新登录的账号自动挑一份补齐</b>（多份轮换，分摊风险）。<br>
+        <b>每条设备链可以被任意多个账号指定使用</b>（在「已导入账号」卡片的下拉里选），
+        也可以放进池子里给没指定过的账号临时轮换。<br>
         ⚠️ 所有 cookie 值在库里都是 <b>AES-256-GCM 加密</b>存储（密钥 <code>data/secret.key</code> 或 <code>PK_SECRET</code>）。
       </p>
       <div class="row">

@@ -424,6 +424,7 @@ async function handleApi(req, res, u, user) {
 
   /* ---------------- 设备链池（多份 ks_*，登录账号自动挑一份补齐） ---------------- */
   if (p === '/api/device-chains' && method === 'GET') {
+    const usage = db.chainUsageMap();
     const list = db.listDeviceChains(false).map((x) => ({
       id: x.id,
       label: x.label,
@@ -431,6 +432,8 @@ async function handleApi(req, res, u, user) {
       enabled: !!x.enabled,
       names: (x.cookies || []).map((c) => c.name),
       bytes: JSON.stringify(x.cookies || []).length,
+      // 被几个账号「指定使用」（不含走自动轮换的）
+      useCount: Number(usage[String(x.id)] || 0),
     }));
     return sendJson(res, 200, { ok: true, chains: list });
   }
@@ -448,6 +451,26 @@ async function handleApi(req, res, u, user) {
     db.deleteDeviceChain(Number(dcItem[1]));
     db.audit(user.id, 'device_chain_del', 'id=' + dcItem[1], clientIp(req));
     return sendJson(res, 200, { ok: true });
+  }
+
+  /* ---------------- 账号 → 设备链（指定这个账号使用池里哪一份） ---------------- */
+  const leoChainBind = /^\/api\/leo\/accounts\/(\d+)\/chain$/.exec(p);
+  if (leoChainBind && method === 'PUT') {
+    const id = Number(leoChainBind[1]);
+    const acc = db.getLeoAccount(id);
+    if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '账号不存在' });
+    const b = await readJson(req);
+    let chainId = null;
+    try {
+      const raw = b.deviceChainId === undefined || b.deviceChainId === null || b.deviceChainId === ''
+        || b.deviceChainId === 'auto' || b.deviceChainId === 'null'
+        ? null : b.deviceChainId;
+      chainId = db.setLeoAccountChain(id, raw);
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, message: e.message });
+    }
+    db.audit(user.id, 'leo_bind_chain', `account=${id} chain=${chainId == null ? 'auto' : chainId}`, clientIp(req));
+    return sendJson(res, 200, { ok: true, id: id, deviceChainId: chainId });
   }
 
   /* ---------------- cookie 加密迁移（旧明文 → 加密） ---------------- */
@@ -1097,6 +1120,9 @@ function publicLeoAccount(a) {
     grade: a.grade,
     createdAt: a.created_at,
     updatedAt: a.updated_at,
+    // 该账号「指定使用」的设备链 id；null = 不指定（到时才在池里随机挑一份）
+    // 只回 id，label 由页面拿 /api/device-chains 自己配对，避免顺带泄露 cookie 值。
+    deviceChainId: a.device_chain_id == null ? null : Number(a.device_chain_id),
     // cookie 只回数量与名字，不回值（避免页面/日志泄露登录态）
     cookieNames: safeCookieNames(a.cookies_json),
   };
