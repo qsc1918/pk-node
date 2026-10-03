@@ -9,7 +9,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { URL } = require('node:url');
 
-const { config, PK } = require('./src/config');
+const { config, PK, DEFAULT_HOST, lanAddresses } = require('./src/config');
 const db = require('./src/db');
 const auth = require('./src/services/auth');
 const leoAccounts = require('./src/services/leo-accounts');
@@ -206,6 +206,46 @@ function clientIp(req) {
   return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
 }
 
+/* ---------------------- 登录爆破防护 ------------------------ */
+//
+// ⚠️ 2026-10-03：服务默认改成监听 0.0.0.0（局域网/公网可访问）之后，
+// 登录口就成了公网撞库面。这里加一层最轻的限流：同一来源 IP 在
+// config.loginFailWindowMs 内失败超过 config.loginFailMax 次 → 429 + Retry-After。
+//
+// 两个细节：
+//  1. 计数键用 **socket 的真实对端**（req.socket.remoteAddress），不用
+//     clientIp() 走的 X-Forwarded-For —— 后者是客户端可随便伪造的头，
+//     拿它计数等于把限流直接绕掉。
+//  2. 只在**失败**时累加，且用滑动窗口淘汰，不会无限涨内存。
+
+/** @type {Map<string, number[]>} IP → 失败时间戳数组 */
+const loginFailMap = new Map();
+
+/** 该来源当前剩余封禁秒数（0 = 未封禁）。 */
+function loginBlockSec(ip) {
+  const now = Date.now();
+  const win = config.loginFailWindowMs;
+  const arr = (loginFailMap.get(ip) || []).filter((t) => now - t < win);
+  if (arr.length < config.loginFailMax) return 0;
+  return Math.ceil((win - (now - arr[0])) / 1000);
+}
+
+/** 记一次失败；返回当前累计次数。 */
+function noteLoginFail(ip) {
+  const now = Date.now();
+  const win = config.loginFailWindowMs;
+  const arr = (loginFailMap.get(ip) || []).filter((t) => now - t < win);
+  arr.push(now);
+  loginFailMap.set(ip, arr);
+  // 顺手清掉早该走的 IP，避免 Map 长期膨胀
+  if (loginFailMap.size > 5000) {
+    for (const [k, v] of loginFailMap) {
+      if (v.every((t) => now - t >= win)) loginFailMap.delete(k);
+    }
+  }
+  return arr.length;
+}
+
 /** 轮数解析：只挡非法值，不截断用户填的大数字（仅保留一个安全上限防内存爆）。 */
 const MAX_ROUNDS = 100000;
 function clampRounds(v, def) {
@@ -339,8 +379,24 @@ async function handleApi(req, res, u, user) {
   }
 
   if (p === '/api/auth/login' && method === 'POST') {
+    // 限流键用真实对端 IP（不能信 X-Forwarded-For，可伪造）
+    const peerIp = String(req.socket.remoteAddress || '');
+    const wait = loginBlockSec(peerIp);
+    if (wait > 0) {
+      return sendJson(res, 429, {
+        ok: false,
+        message: `登录失败次数过多，请 ${wait} 秒后再试`,
+      }, { 'Retry-After': String(wait) });
+    }
     const b = await readJson(req);
     const r = auth.login(b.username, b.password);
+    if (!r.ok) {
+      const n = noteLoginFail(peerIp);
+      if (n >= config.loginFailMax) {
+        console.log('[security] IP ' + peerIp + ' 连续登录失败 ' + n + ' 次，已封禁 ' +
+          Math.round(config.loginFailWindowMs / 1000) + ' 秒');
+      }
+    }
     db.audit(r.user ? r.user.id : null, 'login', r.ok ? '成功' : '失败:' + b.username, clientIp(req));
     if (!r.ok) return sendJson(res, 401, r);
     return sendJson(res, 200, { ok: true, user: r.user }, { 'Set-Cookie': auth.sessionSetCookie(r.token) });
@@ -1247,8 +1303,43 @@ function main() {
     console.error('[pk-node] ⚠️ 编码链路不可用，PK 提交会失败。请检查 ' + config.nativeDir + ' / bin/keystream.bin');
   }
 
+  server.on('error', (e) => {
+    console.error('[pk-node] 监听失败：' + e.message);
+    if (e.code === 'EADDRINUSE') {
+      console.error('[pk-node] 端口 ' + config.port + ' 已被占用。');
+      console.error('[pk-node] 换一个端口再启动：' +
+        (process.platform === 'win32' ? 'set PK_PORT=9000 & start.bat' : 'PK_PORT=9000 ./start.sh'));
+    }
+    process.exit(1);
+  });
+
   server.listen(config.port, config.host, () => {
-    console.log('[pk-node] 已监听 http://' + config.host + ':' + config.port);
+    const port = config.port;
+    console.log('[pk-node] 已监听 http://' + config.host + ':' + port);
+    console.log('[pk-node] 本机   : http://127.0.0.1:' + port);
+
+    // ★ 暴露到局域网/公网时，把「照着点」的地址直接列出来。
+    //   以前只打印监听地址（0.0.0.0），用户拿到 0.0.0.0 根本没法在浏览器里打开，
+    //   这是「改成 0.0.0.0 之后还是不知道怎么访问」的老毛病。
+    const lan = (typeof lanAddresses === 'function' ? lanAddresses() : []);
+    if (lan.length) {
+      console.log('[pk-node] 局域网 : ' + lan.map((ip) => 'http://' + ip + ':' + port).join('  '));
+    }
+    console.log('[pk-node] 公网   : 需路由器「端口映射」把外面端口转发到这台机器 ' +
+      (lan[0] || '<本机局域网 IP>') + ':' + port + '（或用页面里的 Cloudflare 隧道，免配置）');
+
+    if (config.isExposed) {
+      console.log('');
+      console.log('[pk-node] 服务已对局域网/公网开放，三个别忘了：');
+      console.log('  1) 端口通不通 —— Windows 防火墙默认会拦入站，放行一条：');
+      console.log('     netsh advfirewall firewall add rule name="pk-node" dir=in action=allow protocol=TCP localport=' + port);
+      console.log('  2) 公网还需要在路由器里做端口映射（外面:8792 → 这台机器:' + port + '），且家宽多为动态 IP。');
+      console.log('  3) 默认账号是 ' + config.defaultAdminUser + ' / ' + config.defaultAdminPass +
+        '，暴露前请到「系统 → 修改密码」改掉；同一时间在网的会话可以用「管理 → 用户」禁用/删除。');
+    } else {
+      console.log('[pk-node] 只监听本机 ' + config.host + '；如需局域网访问：' +
+        (process.platform === 'win32' ? 'set PK_HOST=0.0.0.0 & start.bat' : 'PK_HOST=0.0.0.0 ./start.sh'));
+    }
     console.log('[pk-node] 管理后台默认账号：' + config.defaultAdminUser + ' / ' + config.defaultAdminPass + '（请尽快改密）');
   });
 
