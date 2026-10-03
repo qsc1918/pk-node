@@ -105,6 +105,18 @@ textarea { font-family: ui-monospace, Menlo, Consolas, monospace; resize: vertic
 
 input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
 
+/* 账号卡片里的「这个账号用哪份设备链」下拉 */
+.chain-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  flex-basis: 100%;   /* 账号卡片是 flex，别让它挤到按钮那一行 */
+}
+.chain-row select { width: auto; min-width: 200px; margin-top: 0; padding: 3px 6px; font-size: 12px; }
+.chain-row .chain-tag { font-size: 12px; color: var(--fg-dim); }
+
 /* ----------------------------- 顶栏 ----------------------------- */
 
 .topbar {

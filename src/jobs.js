@@ -89,10 +89,24 @@ function clearBuffer(jobId) {
   eventBuffers.delete(Number(jobId));
 }
 
-/** 由入库的 leo 账号构造 cookie jar。 */
+/**
+ * 由入库的 leo 账号构造 cookie jar。
+ *
+ * 账号若「指定了使用哪份设备链」（device_chain_id），这里把那份 ks_* 覆盖到 jar 上 ——
+ * 保证刷局/刷练习用的就是这个用户给他选的那条链；没指定才走池里轮换。
+ */
 function jarOf(account) {
   const items = JSON.parse(account.cookies_json);
-  return new leo.CookieJar(items);
+  const jar = new leo.CookieJar(items);
+  try {
+    if (account && account.device_chain_id != null) {
+      leoAccounts.applyDeviceChain(jar, { boundChainId: account.device_chain_id });
+    }
+  } catch (e) {
+    // 绑定链取不出来不该让整个任务起不来：原 cookie 里可能已经自带 ks_*
+    console.warn('[jobs] 应用账号设备链失败（改用 cookie 自带）：' + e.message);
+  }
+  return jar;
 }
 
 /**

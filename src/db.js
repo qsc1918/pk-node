@@ -66,17 +66,22 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 
 -- 小猿账号登录态（cookie，含设备链 sid/ks_*）
+--   device_chain_id 指「这个账号固定用池里哪一份设备链」；NULL = 不指定（_auto：池里随机挑一份补齐）。
+--   导入时若粘贴内容自带 ks_*，会自动把这份收进池并绑到该账号上（见 leo-accounts.applyDeviceChain）。
 CREATE TABLE IF NOT EXISTS leo_accounts (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  name          TEXT    NOT NULL,
-  cookies_json  TEXT    NOT NULL,          -- [{name,value,domain,path}]
-  yfd_u         TEXT,                      -- userid cookie 的值
-  grade         INTEGER,
-  created_at    INTEGER NOT NULL,
-  updated_at    INTEGER NOT NULL
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name            TEXT    NOT NULL,
+  cookies_json    TEXT    NOT NULL,          -- [{name,value,domain,path}]
+  yfd_u           TEXT,                      -- userid cookie 的值
+  grade           INTEGER,
+  device_chain_id INTEGER,                   -- device_chains.id（NULL=自动挑一份）
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_leo_accounts_user ON leo_accounts(user_id);
+-- 注：idx_leo_accounts_chain 依赖 device_chain_id，必须等 init() 里的 ALTER 先跑完，
+-- 否则老库上整段 SCHEMA 会在建索引这句就炸（见 init）。
 
 -- 设备链池：多份 ks_*（同一设备可来自不同 App 账号），登录账号自动挑一份补齐。
 --   value 同样加密存储（见 cookiecrypt）；label 只是给人看的备注。
@@ -156,10 +161,27 @@ CREATE TABLE IF NOT EXISTS audit (
 CREATE INDEX IF NOT EXISTS idx_audit_time ON audit(created_at DESC);
 `;
 
+/**
+ * 给老库补列（CREATE TABLE 对已有表不生效，必须 ALTER）。
+ * 幂等：已存在同名列时直接跳过。
+ */
+function ensureColumn(table, column, ddl) {
+  const cols = get().prepare(`PRAGMA table_info(${table})`).all();
+  if (!cols.some((c) => c.name === column)) get().exec(ddl);
+}
+
 function init() {
   fs.mkdirSync(path.dirname(config.dbFile), { recursive: true });
   db = new DatabaseSync(config.dbFile);
   db.exec(SCHEMA);
+
+  // 老库补列：账号 → 设备链绑定（v1.8.1 新增；老库没有这一列）
+  ensureColumn('leo_accounts', 'device_chain_id',
+    'ALTER TABLE leo_accounts ADD COLUMN device_chain_id INTEGER');
+  // 补列之后才能建依赖它的索引（放前面会让老库上 SCHEMA 直接失败）
+  try {
+    db.exec('CREATE INDEX IF NOT EXISTS idx_leo_accounts_chain ON leo_accounts(device_chain_id)');
+  } catch (e) { /* 索引重复/不支持则忽略 */ }
 
   // 启动即把历史明文 cookie 迁移为加密（幂等，已加密的会跳过）
   try {
@@ -414,7 +436,49 @@ function getDeviceChain(id) {
 }
 
 function deleteDeviceChain(id) {
-  get().prepare('DELETE FROM device_chains WHERE id = ?').run(Number(id));
+  const cid = Number(id);
+  get().prepare('DELETE FROM device_chains WHERE id = ?').run(cid);
+  // 原来绑在它身上的账号退回「自动」（不指定），避免绑定指向已消失的行
+  get().prepare('UPDATE leo_accounts SET device_chain_id = NULL WHERE device_chain_id = ?')
+    .run(cid);
+}
+
+/**
+ * 设置某账号「固定使用哪份设备链」。
+ *
+ * @param {number} leoId  小猿账号 id
+ * @param {number|null} chainId 设备链 id；null/''/'auto' 表示「不指定（自动轮换）」
+ * @throws {Error} 设备链不存在时抛错（让上层返回 400，别悄悄绑成脏 id）
+ */
+function setLeoAccountChain(leoId, chainId) {
+  const cid = chainId === null || chainId === undefined || chainId === '' || chainId === 'auto' || chainId === 'null'
+    ? null
+    : Number(chainId);
+  if (cid != null) {
+    const row = get().prepare('SELECT id FROM device_chains WHERE id = ?').get(cid);
+    if (!row) throw new Error('设备链不存在：' + cid);
+  }
+  get()
+    .prepare('UPDATE leo_accounts SET device_chain_id = ?, updated_at = ? WHERE id = ?')
+    .run(cid, Date.now(), Number(leoId));
+  return cid;
+}
+
+/** 取某账号当前绑定的设备链 id（未绑定返回 null）。 */
+function getLeoAccountChainId(leoId) {
+  const row = get().prepare('SELECT device_chain_id FROM leo_accounts WHERE id = ?').get(Number(leoId));
+  if (!row) return null;
+  return row.device_chain_id == null ? null : Number(row.device_chain_id);
+}
+
+/** 每份设备链被几个账号指定使用（喂给 UI 显示「被 N 个账号使用」）。 */
+function chainUsageMap() {
+  const rows = get()
+    .prepare('SELECT device_chain_id, COUNT(*) AS n FROM leo_accounts WHERE device_chain_id IS NOT NULL GROUP BY device_chain_id')
+    .all();
+  const m = {};
+  for (const r of rows) m[String(r.device_chain_id)] = Number(r.n);
+  return m;
 }
 
 /** 按 ks_deviceid 去重（已存在则更新 value，返回 {id, created}）。 */
@@ -641,6 +705,9 @@ module.exports = {
   getDeviceChain,
   deleteDeviceChain,
   upsertDeviceChain,
+  setLeoAccountChain,
+  getLeoAccountChainId,
+  chainUsageMap,
   addLeoAccount,
   updateLeoAccount,
   listLeoAccounts,
