@@ -617,6 +617,9 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
       enabled: !!x.enabled,
       names: (x.cookies || []).map((c) => c.name),
       bytes: JSON.stringify(x.cookies || []).length,
+      // 归属组织：内置池 = '系统内置'，用户自建 = null
+      org: x.org == null ? null : String(x.org),
+      builtin: Number(x.builtin || 0) === 1,
       // 被几个账号「指定使用」（不含走自动轮换的）
       useCount: Number(usage[String(x.id)] || 0),
     }));

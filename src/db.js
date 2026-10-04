@@ -13,6 +13,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const cookiecrypt = require('./cookiecrypt');
+const builtinChains = require('./builtin-chains');
 const { config } = require('./config');
 
 let db = null;
@@ -85,12 +86,16 @@ CREATE INDEX IF NOT EXISTS idx_leo_accounts_user ON leo_accounts(user_id);
 
 -- 设备链池：多份 ks_*（同一设备可来自不同 App 账号），登录账号自动挑一份补齐。
 --   value 同样加密存储（见 cookiecrypt）；label 只是给人看的备注。
+--   org = 归属组织（NULL=用户自建；'系统内置'=随代码内置的公共池，见 builtin-chains.js）。
+--   内置链让「不会用设备链的用户」开箱即用，不用自己先备一批 ks_*。
 CREATE TABLE IF NOT EXISTS device_chains (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   label      TEXT    NOT NULL DEFAULT '设备链',
   cookies_json TEXT  NOT NULL,          -- [{name,value,domain,path}]（value 加密）
   device_id  TEXT,                      -- ks_deviceid（明文，便于识别/去重）
   enabled    INTEGER NOT NULL DEFAULT 1,
+  org        TEXT,                      -- 归属组织；NULL=用户自建，'系统内置'=内置池
+  builtin    INTEGER NOT NULL DEFAULT 0,-- 1=代码内置（可禁删，删了启动会补回）
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -178,10 +183,16 @@ function init() {
   // 老库补列：账号 → 设备链绑定（v1.8.1 新增；老库没有这一列）
   ensureColumn('leo_accounts', 'device_chain_id',
     'ALTER TABLE leo_accounts ADD COLUMN device_chain_id INTEGER');
+  // 老库补列：设备链归属组织 + 内置标记（内置池新增；老库这两列不存在）
+  ensureColumn('device_chains', 'org', "ALTER TABLE device_chains ADD COLUMN org TEXT");
+  ensureColumn('device_chains', 'builtin', 'ALTER TABLE device_chains ADD COLUMN builtin INTEGER NOT NULL DEFAULT 0');
   // 补列之后才能建依赖它的索引（放前面会让老库上 SCHEMA 直接失败）
   try {
     db.exec('CREATE INDEX IF NOT EXISTS idx_leo_accounts_chain ON leo_accounts(device_chain_id)');
   } catch (e) { /* 索引重复/不支持则忽略 */ }
+  try {
+    db.exec('CREATE INDEX IF NOT EXISTS idx_device_chains_org ON device_chains(org)');
+  } catch (e) { /* 同上 */ }
 
   // 启动即把历史明文 cookie 迁移为加密（幂等，已加密的会跳过）
   try {
@@ -193,6 +204,21 @@ function init() {
     }
   } catch (e) {
     console.warn('[db] cookie 加密迁移失败（不影响启动）：' + e.message);
+  }
+
+  // 内置设备链池（系统内置组织）。放在加密迁移之后：新插入的值由 encryptItems 直接加密。
+  try {
+    const s = seedBuiltinDeviceChains();
+    if (s.inserted > 0 || s.updated > 0) {
+      console.log(
+        `[db] 内置设备链池（${builtinChains.ORG}）：新增 ${s.inserted} 条` +
+        (s.updated > 0 ? `，更新 ${s.updated} 条` : '') +
+        `，当前共 ${s.total} 条可用`,
+      );
+    }
+  } catch (e) {
+    // 内置池失败不该挡住启动：最坏是回到「池为空」，用户仍可手工粘贴设备链
+    console.warn('[db] 内置设备链池初始化失败（不影响启动）：' + e.message);
   }
 
   // 首次启动写入默认管理员。
@@ -426,19 +452,85 @@ function migrateCookieEncryption() {
 }
 
 /* --------------------------- 设备链池 --------------------------- */
+
+/**
+ * 写入内置设备链池（系统内置组织），启动时调用。**幂等**。
+ *
+ * 为什么需要：设备链池默认是空的，从没配过设备链的用户登录后 ks_* 缺失，
+ *   PK 出题（pk/match）实测恒定 400 —— 也就是「不会用设备链的用户根本跑不起来」。
+ *   内置一批公共设备链，让这类用户开箱即用。
+ *
+ * 幂等策略（按 ks_deviceid 对齐）：
+ *   - 库里没有这条 device_id → 插入；
+ *   - 已有但 builtin=0（用户自己建过同设备）→ **不覆盖**，只标记 org，尊重用户自建数据；
+ *   - 已有且 builtin=1（之前版本内置的）→ 更新 cookie 值，让代码里的修订能生效。
+ *   用户手动把内置链停用（enabled=0）不会被启动流程改回来。
+ *
+ * @returns {{inserted:number, updated:number, skipped:number, total:number}}
+ */
+function seedBuiltinDeviceChains() {
+  const list = Array.isArray(builtinChains.CHAINS) ? builtinChains.CHAINS : [];
+  const org = builtinChains.ORG || '系统内置';
+  const findStmt = get().prepare('SELECT id, builtin FROM device_chains WHERE device_id = ?');
+  const insertStmt = get().prepare(
+    `INSERT INTO device_chains (label, cookies_json, device_id, enabled, org, builtin, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?)`,
+  );
+  const updateStmt = get().prepare(
+    'UPDATE device_chains SET label = ?, cookies_json = ?, org = ?, builtin = 1, updated_at = ? WHERE id = ?',
+  );
+  const markStmt = get().prepare('UPDATE device_chains SET org = ?, builtin = 1 WHERE id = ?');
+
+  const now = Date.now();
+  let inserted = 0;
+  let updated = 0;
+  let skipped = 0;
+
+  for (const c of list) {
+    const cookies = Array.isArray(c.cookies) ? c.cookies : [];
+    const deviceId = c.deviceId == null ? null : String(c.deviceId);
+    // 缺 ks_deviceid 的不算可用设备链（与 extractChainFromItems 判定一致）
+    if (!deviceId || !cookies.some((k) => k && k.name === 'ks_deviceid')) continue;
+
+    const exist = deviceId ? findStmt.get(deviceId) : null;
+    const enc = JSON.stringify(cookiecrypt.encryptItems(cookies));
+
+    if (!exist) {
+      insertStmt.run(String(c.label || '内置设备链'), enc, deviceId, 1, org, 1, now, now);
+      inserted++;
+      continue;
+    }
+    if (Number(exist.builtin) === 1) {
+      updateStmt.run(String(c.label || '内置设备链'), enc, org, now, exist.id);
+      updated++;
+      continue;
+    }
+    // 用户自建的同设备链：只补 org 标记，不动它的 cookie / label / enabled
+    markStmt.run(org, exist.id);
+    skipped++;
+  }
+
+  const total = Number(
+    get().prepare('SELECT COUNT(*) AS n FROM device_chains WHERE enabled = 1').get().n,
+  );
+  return { inserted, updated, skipped, total };
+}
+
 /** 新增一份设备链。 */
 function addDeviceChain(label, cookies, extra = {}) {
   const now = Date.now();
   const info = get()
     .prepare(
-      `INSERT INTO device_chains (label, cookies_json, device_id, enabled, created_at, updated_at)
-       VALUES (?,?,?,?,?,?)`,
+      `INSERT INTO device_chains (label, cookies_json, device_id, enabled, org, builtin, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?)`,
     )
     .run(
       String(label || '设备链'),
       JSON.stringify(cookiecrypt.encryptItems(cookies)),
       extra.deviceId == null ? null : String(extra.deviceId),
       extra.enabled === 0 ? 0 : 1,
+      extra.org == null ? null : String(extra.org),
+      extra.builtin ? 1 : 0,
       now,
       now,
     );
@@ -735,6 +827,7 @@ module.exports = {
   getDeviceChain,
   deleteDeviceChain,
   upsertDeviceChain,
+  seedBuiltinDeviceChains,
   setLeoAccountChain,
   getLeoAccountChainId,
   chainUsageMap,

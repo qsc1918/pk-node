@@ -433,7 +433,8 @@ function syncLeoChainSelects() {
       const o = document.createElement('option');
       o.value = String(c.id);
       const shortDev = c.deviceId ? String(c.deviceId).slice(0, 10) : '';
-      o.textContent = c.label + '（' + (c.deviceId ? shortDev : '无 deviceid') + (c.enabled ? '' : ' · 停用') + '）';
+      o.textContent = c.label + '（' + (c.deviceId ? shortDev : '无 deviceid') +
+        (c.org ? ' · ' + c.org : '') + (c.enabled ? '' : ' · 停用') + '）';
       sel.appendChild(o);
     }
     // 当前绑定值若还在选项里就选中它，否则退回「自动」
@@ -1782,18 +1783,39 @@ function renderDeviceChains(list) {
     box.innerHTML = '<p class="muted small">池子里还没有设备链。新登录的账号将没有 ks_*（PK 会 400）；' +
       '带设备链的 cookie 粘贴进来时会自动收进池里。</p>';
     return;
-  }
+  }  // 按组织分组：内置池排前面（系统自带，开箱即用），其余按「自建」归一组
+  const groups = new Map();
   for (const c of list) {
-    const el = document.createElement('div');
-    el.className = 'item';
-    el.innerHTML = '<div><div class="title"></div><div class="meta"></div></div>' +
-      '<div class="actions"><button class="mini danger" data-dc-del="' + c.id + '">删除</button></div>';
-    el.querySelector('.title').textContent = c.label + '（ks_deviceid=' + (c.deviceId || '?') + '）';
-    const use = Number(c.useCount || 0);
-    el.querySelector('.meta').textContent =
-      (c.names || []).join(',') + ' · ' + c.bytes + 'B · ' + (c.enabled ? '启用' : '停用') +
-      ' · 被 ' + use + ' 个账号指定使用';
-    box.appendChild(el);
+    const key = c.org || '自建';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(c);
+  }
+  const ordered = [...groups.entries()].sort((a, b) => {
+    if (a[0] === '系统内置') return -1;
+    if (b[0] === '系统内置') return 1;
+    return a[0] === '自建' ? 1 : b[0] === '自建' ? -1 : a[0].localeCompare(b[0]);
+  });
+
+  for (const [org, items] of ordered) {
+    const isBuiltin = org === '系统内置';
+    const head = document.createElement('div');
+    head.className = 'dc-group-head';
+    head.textContent = org + '（' + items.length + '）' +
+      (isBuiltin ? ' · 随程序内置，登录新账号时会自动从这里挑一份补齐设备链' : '');
+    box.appendChild(head);
+
+    for (const c of items) {
+      const el = document.createElement('div');
+      el.className = 'item';
+      el.innerHTML = '<div><div class="title"></div><div class="meta"></div></div>' +
+        '<div class="actions"><button class="mini danger" data-dc-del="' + c.id + '">删除</button></div>';
+      el.querySelector('.title').textContent = c.label + '（ks_deviceid=' + (c.deviceId || '?') + '）';
+      const use = Number(c.useCount || 0);
+      el.querySelector('.meta').textContent =
+        (c.names || []).join(',') + ' · ' + c.bytes + 'B · ' + (c.enabled ? '启用' : '停用') +
+        ' · 被 ' + use + ' 个账号指定使用';
+      box.appendChild(el);
+    }
   }
 }
 async function addDeviceChain() {
