@@ -700,6 +700,13 @@ async function runRaceLoop(job, cfg, ctx) {
   //   用**上一局的实测值**更新它（单步覆盖，**不是**误差累积 → 不会发散）：
   //   overhead = 上局 costTime / 上局题数 - 上局每题延迟。
   let overheadMs = Number(cfg.aimOverheadMs) > 0 ? Number(cfg.aimOverheadMs) : 184;
+  // 最近 3 局的 overhead 样本（滑动平均，抗单局噪声；不是误差累积 → 不会发散）
+  const overheadHist = [];
+  // ★ 每题延迟的**有界微调**（每次最多 ±8ms）：
+  //   实测 delay=306（overhead 按 184）时成本中位数 ≈4830，系统性低于 4900 约 70ms；
+  //   而单局波动 ±200ms，所以「按误差全量修正」会被噪声带着走（实测越跑越低）。
+  //   改为**每次只动 8ms**：缓慢而单调地爬向目标，绝不会发散。
+  let delayTrimMs = 0;
   // ★★ 2026-10-05：主循环的**每轮边界重读 rounds_total**，而不是用启动时的快照。
   //
   // 这是「叠加轮数」的落地点：用户在 App / 网页上再点一次「开始」时，
@@ -746,6 +753,7 @@ async function runRaceLoop(job, cfg, ctx) {
         pointId: cfg.pointId, questionCount: cfg.questionCount, grade: grade,
         answerDelayMinMs: cfg.answerDelayMinMs, answerDelayMaxMs: cfg.answerDelayMaxMs,
         aimCostMode: cfg.aimCostMode === true, aimSafetyMs: aimSafety, aimOverheadMs: overheadMs,
+        aimDelayTrimMs: delayTrimMs,
         aimPerfectMode: cfg.aimPerfectMode === true,
         useSample: cfg.useSample !== false,
         battleMaxMs: cfg.battleMaxMs,
@@ -803,22 +811,36 @@ async function runRaceLoop(job, cfg, ctx) {
       const selfCost = res.aimSelfCost;
       const baseLimit = res.aim && res.aim.base;          // 榜一原始成绩
       const targetCost = res.aim && res.aim.target;       // 目标（榜一取整到 100）
-      // ★ 「已达完美贴线」= 本局刷新了我的最佳（服务端采纳）**且不低于下限**。
+      // ★ 「已达完美贴线」= **本局实测 costTime 落在贴线窗口** [target, target+tol]。
       //
-      //   为什么不要求「恰好等于 target」：单局 costTime 实测波动 ±200ms
-      //   （同一配置实测 5111 / 5227 / 4670），一次算准不现实。
-      //   所以「完美」= 某一局恰好落在贴线窗口 [target, target+tol]：
-      //     - 低于 target（如 4670 < 4900）→ 被判异常、self 不更新 → newBest=false → 不算达成；
-      //     - 落在窗口内 → 既上榜又贴着下限 → 达成。
+      //   为什么不用 newBest 判：该榜榜一可能就是我自己（best 已是 target），
+      //   此后任何 ≥target 的成绩都“刷不新最佳” → newBest 恒 false → 永远重试到上限。
+      //   （实测踩过：r4=5013 已在窗口内却继续重试）
+      //
+      //   为什么不用 “selfCost <= target”：self 是历史最佳，若历史最佳是过冲值
+      //   （如 4670 < 4900 那种被判异常）。窗口法只认「恰好贴线」那一局。
+      //
+      //   窗口依据：单局 costTime 实测波动 ±200ms（同一配置 5111/5227/4670），
+      //   所以完美贴线靠**多局重试**命中，不是靠一次算准。
       const tol = Math.max(0, Number(cfg.aimPerfectTolMs) || 150);
-      const reachedPerfect = newBest && targetCost != null && selfCost != null &&
-        selfCost >= targetCost && selfCost <= targetCost + tol;
+      const curCost = res.costTimeMs != null ? res.costTimeMs : null;
+      const reachedPerfect = targetCost != null && curCost != null &&
+        curCost >= targetCost && curCost <= targetCost + tol;
 
-      // ★ 用本局实测更新「每题开销」估计（供下一局的开环公式用）
-      if (res.costTimeMs != null && targetCost != null && res.aim && res.aim.delayMs != null) {
-        const n = Math.max(1, Number(res.aim.questionCount) || 10);
-        const est = res.costTimeMs / n - Number(res.aim.delayMs);
-        if (est > 80 && est < 400) overheadMs = Math.round(est);
+      // ★ 用本局实测更新「每题开销」估计（最近 3 局滑动平均，抗噪声）
+      const nQn = Math.max(1, Number((res.aim && res.aim.questionCount) || 10));
+      if (res.costTimeMs != null && res.aim && res.aim.delayMs != null) {
+        const est = res.costTimeMs / nQn - Number(res.aim.delayMs);
+        if (est > 80 && est < 400) {
+          overheadHist.push(est);
+          while (overheadHist.length > 3) overheadHist.shift();
+          overheadMs = Math.round(overheadHist.reduce((a, b) => a + b, 0) / overheadHist.length);
+        }
+      }
+      // ★ 有界微调：未达窗口时按方向每次调 8ms（缓慢爬向目标，不会发散）
+      if (targetCost != null && curCost != null && !reachedPerfect) {
+        if (curCost < targetCost) delayTrimMs = Math.min(400, delayTrimMs + 8);      // 偏低 → 加大延迟
+        else if (curCost > targetCost + tol) delayTrimMs = Math.max(-200, delayTrimMs - 8); // 偏高 → 减小
       }
 
       if (newBest) {

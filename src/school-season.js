@@ -652,7 +652,11 @@ async function runOneRace(jar, cfg, onEvent, signal) {
     // ★ 目标 = 榜一向下取整到 100（= 服务端下限；若榜一不整百则同时超过榜一）
     const target = round100(base) + (Number(cfg.aimSafetyMs) || 0);
     const overhead = Number(cfg.aimOverheadMs) > 0 ? Number(cfg.aimOverheadMs) : 184;
-    const perQ = Math.max(0, Math.round((target / Math.max(1, questionCount)) - overhead));
+    // ★ 有界微调项（aimDelayTrimMs）：由 jobs 侧跨局累积（每次 ±8ms、有界），
+    //   用来抵消「开环公式的固定偏差」（实测成本中位数 ≈4830，系统性低于目标 ≈70ms）。
+    //   注意：它是**独立变量**，不会进 target → 不会正反馈发散。
+    const trim = Number(cfg.aimDelayTrimMs) || 0;
+    const perQ = Math.max(0, Math.round((target / Math.max(1, questionCount)) - overhead + trim));
     delayMinMs = perQ;
     delayMaxMs = perQ;
     aimInfo = {
