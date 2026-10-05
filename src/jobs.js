@@ -268,6 +268,54 @@ function resumeJob(jobId) {
 }
 
 /**
+ * ★ 2026-10-05：**叠加轮数**（用户要求「开始后可以继续点击开始，继续的点击视为叠加轮数」）。
+ *
+ * 把 `jobs.rounds_total` 加上 [extra]。主循环每轮边界会重读该值，所以**立即生效**：
+ * 已经跑完的局不丢，任务会继续跑到新的总轮数。
+ *
+ * 与 [resumeJob] 的分工：
+ *  - 任务**已结束**（done/stopped/failed）→ 用 `resumeJob` 从断点续跑；
+ *  - 任务**还在跑** → 用本函数叠加轮数（不重启任务，不打断当前局）。
+ *
+ * @param {number} jobId
+ * @param {number} extra 要追加的轮数（>=1）
+ * @returns {{ok:boolean, message:string, roundsTotal?:number}}
+ */
+function extendJobRounds(jobId, extra) {
+  const id = Number(jobId);
+  const add = Math.floor(Number(extra));
+  if (!Number.isFinite(add) || add < 1) return { ok: false, message: '追加轮数必须是正整数' };
+  const job = db.getJob(id);
+  if (!job) return { ok: false, message: '任务不存在' };
+
+  const before = Number(job.rounds_total) || 0;
+  const after = before + add;
+  // 上限保护：与 makeRaceConfig 的 clampRounds 一致，防误点成天文数字
+  if (after > 100000) return { ok: false, message: `总轮数不能超过 100000（当前 ${before}）` };
+
+  db.setJobRoundsTotal(id, after);
+  const isRace = (() => {
+    try { return (JSON.parse(job.config_json) || {}).kind === 'race'; } catch (e) { return false; }
+  })();
+  if (isRace) {
+    publishRaceStatus(job, {
+      type: 'status', jobId: id, roundsTotal: after,
+      message: `轮数叠加：${before} → ${after}（+${add}）`,
+      at: Date.now(),
+    });
+  } else {
+    publish(id, { type: 'status', message: `轮数叠加：${before} → ${after}（+${add}）`, at: Date.now() });
+  }
+  return {
+    ok: true,
+    roundsTotal: after,
+    message: running.has(id)
+      ? `已叠加到 ${after} 局，任务继续跑`
+      : `已叠加到 ${after} 局（任务当前不在运行，「继续」后按新轮数跑）`,
+  };
+}
+
+/**
  * 把某用户所有还没跑完的任务停掉 / 暂停。
  * 用途：管理员禁用/删除用户时，必须连带停掉他正在跑的任务，否则界面禁用、后台还在刷局。
  * @param {number} userId
@@ -543,6 +591,24 @@ function isBusy() {
  */
 
 /**
+ * 发一条**竞速状态**事件：同时进「任务通道」与「竞速镜像通道 0」。
+ *
+ * ★ 2026-10-05：这两个通道缺一不可。
+ *  - 任务通道（`publish(job.id, …)`）：pk-node 网页「任务」页、任务详情用；
+ *  - 镜像通道 0（`raceMirror: true`）：**App 的 `/api/race/stream` 只订阅这个**
+ *    （见 server.js 的 `jobs.subscribe(0, …)`）。此前状态事件只发了前者，
+ *    导致 App 收不到「已完成 / 已停止」→ 开始按钮永久禁用、停止无回执。
+ *
+ * @param {object} job 任务行（要 job.id / job.user_id）
+ * @param {object} ev  事件体（`type`/`message`/`finished` 等）
+ */
+function publishRaceStatus(job, ev) {
+  const base = Object.assign({ race: true, jobId: job.id }, ev);
+  publish(job.id, base);
+  publish(0, Object.assign({}, base, { raceMirror: true, userId: job.user_id }));
+}
+
+/**
  * 启动一个开学季竞速任务（异步执行，立即返回）。
  *
  * @param {object} o
@@ -553,7 +619,6 @@ function startRaceJob(o) {
   const job = db.getJob(o.jobId);
   if (!job) return { ok: false, message: '任务不存在' };
   if (running.has(job.id)) return { ok: false, message: '该任务已在运行' };
-
   const cap = Number(config.maxConcurrentJobs) || MAX_CONCURRENT;
   if (cap > 0 && running.size >= cap) {
     return { ok: false, message: `最多同时运行 ${cap} 个任务，请先停掉一些（可在高级参数里调）` };
@@ -574,11 +639,19 @@ function startRaceJob(o) {
   };
   running.set(job.id, ctx);
   db.setJobStatus(job.id, 'running', { startedAt: Date.now() });
-  publish(job.id, {
-    type: 'status', race: true, jobId: job.id,
+  // ★ 2026-10-05：状态事件**必须同时镜像到通道 0**。
+  //   原因：App（`RaceViewModel`）订阅的是 `/api/race/stream` → 服务端
+  //   `jobs.subscribe(0, …)` 只认 `raceMirror: true` 的事件。局内的细粒度日志
+  //   走 `emit()`（本来就镜像），而「任务开始 / 已停止 / 已完成」这类**状态**
+  //   此前只 publish 到 jobId 通道 → App 收不到「完成」→ `running` 永远为 true
+  //   → 开始按钮永久禁用（用户报「一局后无法继续」），停止后也没有回执
+  //   （用户报「停止无效」）。
+  publishRaceStatus(job, {
+    type: 'status', jobId: job.id,
     message: `竞速任务开始：${job.rounds_total} 局（知识点 ${cfg.pointId || '自动'}，` +
       (cfg.aimCostMode
-        ? `贴限模式，安全边距 ${Number(cfg.aimSafetyMs) >= 0 ? Number(cfg.aimSafetyMs) : 40}ms）`
+        ? (cfg.aimPerfectMode ? '完美贴限，' : '贴限模式，') +
+          `安全边距 ${Number(cfg.aimSafetyMs) >= 0 ? Number(cfg.aimSafetyMs) : 40}ms）`
         : `提交延迟 ${cfg.answerDelayMinMs || 0}~${cfg.answerDelayMaxMs || 0}ms）`),
     at: Date.now(),
   });
@@ -589,8 +662,8 @@ function startRaceJob(o) {
     db.setJobStatus(job.id, paused ? 'paused' : (aborted ? 'stopped' : 'failed'), {
       finishedAt: Date.now(), error: (paused || aborted) ? null : e.message,
     });
-    publish(job.id, {
-      type: 'status', race: true, jobId: job.id, finished: !paused,
+    publishRaceStatus(job, {
+      type: 'status', jobId: job.id, finished: true,
       message: paused ? '竞速已暂停' : (aborted ? '竞速已停止' : ('竞速任务异常：' + e.message)),
       at: Date.now(),
     });
@@ -623,22 +696,45 @@ async function runRaceLoop(job, cfg, ctx) {
   // ★ 贴限模式（aimCostMode）：安全边距跨局自调 —— 未上榜加大、上榜后收紧逼近下限
   let aimSafety = Number(cfg.aimSafetyMs) >= 0 ? Number(cfg.aimSafetyMs) : 40;
 
-  for (let i = done + 1; i <= job.rounds_total; i++) {
+  // ★★ 2026-10-05：主循环的**每轮边界重读 rounds_total**，而不是用启动时的快照。
+  //
+  // 这是「叠加轮数」的落地点：用户在 App / 网页上再点一次「开始」时，
+  // 服务端走 `/api/jobs/:id/extend` 把 `jobs.rounds_total` 加上去；主循环
+  // 若还拿着旧快照（`job.rounds_total`），就永远跑不到新轮次。
+  //
+  // ⚠️ 每轮多一次 `db.getJob` 的代价可忽略（一轮 = 一整局竞速，几十秒）。
+  const readTotal = () => {
+    const fresh = db.getJob(jobId);
+    return (fresh && Number(fresh.rounds_total)) || job.rounds_total;
+  };
+  let total = readTotal();
+
+  for (let i = done + 1; i <= total; i++) {
+    // 每轮开头刷新一次总轮数（叠加轮数后立刻生效）
+    const t = readTotal();
+    if (t !== total) {
+      emit({ type: 'ss-total', message: `总轮数更新：${total} → ${t}（叠加生效）`, at: Date.now() });
+      total = t;
+      publishRaceStatus(job, {
+        type: 'status', jobId: jobId, roundsTotal: total,
+        message: `轮数已叠加到 ${total} 局`, at: Date.now(),
+      });
+    }
     if (ctx.stopped) {
       db.setJobStatus(jobId, ctx.paused ? 'paused' : 'stopped', {
         finishedAt: Date.now(), roundsDone: done, roundsFailed: failed,
       });
-      publish(jobId, {
-        type: 'status', race: true, jobId: jobId, finished: !ctx.paused,
+      publishRaceStatus(job, {
+        type: 'status', jobId: jobId, finished: true,
         message: ctx.paused
-          ? `已暂停（完成 ${done}/${job.rounds_total} 局，可点「继续」接着跑）`
-          : `已停止（完成 ${done}/${job.rounds_total} 局）`,
+          ? `已暂停（完成 ${done}/${total} 局，可点「继续」接着跑）`
+          : `已停止（完成 ${done}/${total} 局）`,
         at: Date.now(),
       });
       return;
     }
 
-    emit({ type: 'ss-round', round: i, message: `第 ${i}/${job.rounds_total} 局开始`, at: Date.now() });
+    emit({ type: 'ss-round', round: i, message: `第 ${i}/${total} 局开始`, at: Date.now() });
 
     let res;
     try {
@@ -646,6 +742,7 @@ async function runRaceLoop(job, cfg, ctx) {
         pointId: cfg.pointId, questionCount: cfg.questionCount, grade: grade,
         answerDelayMinMs: cfg.answerDelayMinMs, answerDelayMaxMs: cfg.answerDelayMaxMs,
         aimCostMode: cfg.aimCostMode === true, aimSafetyMs: aimSafety,
+        aimPerfectMode: cfg.aimPerfectMode === true,
         useSample: cfg.useSample !== false,
         battleMaxMs: cfg.battleMaxMs,
       }, (ev) => emit(Object.assign({ round: i, at: Date.now() }, ev)), ctx.signal);
@@ -654,11 +751,11 @@ async function runRaceLoop(job, cfg, ctx) {
         db.setJobStatus(jobId, ctx.paused ? 'paused' : 'stopped', {
           finishedAt: Date.now(), roundsDone: done, roundsFailed: failed,
         });
-        publish(jobId, {
-          type: 'status', race: true, jobId: jobId, finished: !ctx.paused,
+        publishRaceStatus(job, {
+          type: 'status', jobId: jobId, finished: true,
           message: ctx.paused
-            ? `已暂停（完成 ${done}/${job.rounds_total} 局，可点「继续」接着跑）`
-            : `已立即结束（完成 ${done}/${job.rounds_total} 局）`,
+            ? `已暂停（完成 ${done}/${total} 局，可点「继续」接着跑）`
+            : `已立即结束（完成 ${done}/${total} 局）`,
           at: Date.now(),
         });
         return;
@@ -677,15 +774,50 @@ async function runRaceLoop(job, cfg, ctx) {
       detail: res.detail, at: Date.now(),
     });
 
-    // ★ 贴限反馈自调：未上榜（rank=999）→ 下局加大安全边距；
-    //   已上榜但不是榜一 → 缓慢收紧，逼近下限抢更前名次。
+    // ★ 贴限反馈自调 + 完美贴限重试。
+    //
+    // 「完美贴限」（aimPerfectMode）：目标是**榜一（rank=1）**。未达成就自动
+    // 追加一局继续试（上限 cfg.aimPerfectMaxRounds，默认 30），直到拿到 rank=1
+    // 或达到上限 —— 这就是用户要的「没有完美贴限继续自动重试直到完美贴限」。
+    // 非完美模式下只做原有的边距自调，不追加重试。
     if (cfg.aimCostMode) {
+      const perfect = cfg.aimPerfectMode === true;
+      const gotRank1 = res.aimAccepted === true && Number(res.aimRank) === 1;
+      if (perfect && gotRank1) {
+        publishRaceStatus(job, {
+          type: 'status', jobId: jobId,
+          message: `🎯 完美贴限达成：rank=1（${res.aimSelfCost || res.costTimeMs}ms），不再重试`,
+          at: Date.now(),
+        });
+      }
       if (res.aimAccepted === false) {
         aimSafety = Math.min(600, aimSafety + 50);
         emit({ type: 'ss-aim-adjust', message: `贴限自调：本局未上榜（${res.costTimeMs}ms 被判异常）→ 安全边距上调至 ${aimSafety}ms`, at: Date.now() });
       } else if (res.aimAccepted === true && res.aimRank != null && Number(res.aimRank) > 1 && aimSafety > 20) {
         aimSafety = Math.max(20, aimSafety - 10);
         emit({ type: 'ss-aim-adjust', message: `贴限自调：榜单名次 ${res.aimRank} → 安全边距收紧至 ${aimSafety}ms（逼近下限）`, at: Date.now() });
+      }
+
+      // 完美贴限：未达成 → 追加轮次继续（受上限保护）
+      if (perfect && !gotRank1) {
+        const cap = Math.max(1, Number(cfg.aimPerfectMaxRounds) || 30);
+        const attempts = i - (job.rounds_done || 0);
+        if (attempts >= cap) {
+          publishRaceStatus(job, {
+            type: 'status', jobId: jobId,
+            message: `完美贴限：已尝试 ${attempts} 局仍未拿到 rank=1，停止重试（上限 ${cap} 局）`,
+            at: Date.now(),
+          });
+        } else {
+          const next = readTotal() + 1;
+          db.setJobRoundsTotal(jobId, next);
+          total = next;
+          publishRaceStatus(job, {
+            type: 'status', jobId: jobId, roundsTotal: total,
+            message: `完美贴限未达成（本局 rank=${res.aimRank == null ? '?' : res.aimRank}）→ 自动追加第 ${next} 局重试`,
+            at: Date.now(),
+          });
+        }
       }
     }
 
@@ -695,12 +827,12 @@ async function runRaceLoop(job, cfg, ctx) {
         finishedAt: Date.now(), roundsDone: done, roundsFailed: failed,
         error: '连续失败过多（可能是登录态失效或活动已结束）',
       });
-      publish(jobId, { type: 'status', race: true, jobId: jobId, message: '连续失败过多，已中止', at: Date.now() });
+      publishRaceStatus(job, { type: 'status', jobId: jobId, finished: true, message: '连续失败过多，已中止', at: Date.now() });
       return;
     }
 
     // 局间间隔（可配）
-    if (i < job.rounds_total) {
+    if (i < total) {
       const gapMin = Math.max(0, Number(cfg.gapMinMs) || 0);
       const gapMax = Math.max(gapMin, Number(cfg.gapMaxMs) || 0);
       const gap = gapMax > gapMin ? gapMin + Math.floor(Math.random() * (gapMax - gapMin)) : gapMin;
@@ -720,8 +852,8 @@ async function runRaceLoop(job, cfg, ctx) {
   }
 
   db.setJobStatus(jobId, 'done', { finishedAt: Date.now(), roundsDone: done, roundsFailed: failed });
-  publish(jobId, {
-    type: 'status', race: true, jobId: jobId, finished: true,
+  publishRaceStatus(job, {
+    type: 'status', jobId: jobId, finished: true,
     message: `竞速任务完成：成功 ${done} / 失败 ${failed}`,
     at: Date.now(),
   });
@@ -745,6 +877,7 @@ module.exports = {
   startRaceJob,
   stopJob,
   resumeJob,
+  extendJobRounds,
   stopJobsByUser,
   subscribe,
   publish,

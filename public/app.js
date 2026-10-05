@@ -140,6 +140,8 @@ const state = {
   /** 竞速日志流与任务 id（与练习同款）。 */
   raceStream: null,
   raceJobId: null,
+  /** ★ 2026-10-05：竞速任务是否在跑 —— 决定「开始竞速」按钮是「起任务」还是「叠加轮数」。 */
+  raceRunning: false,
   /** 最近一次竞速「获取知识点」缓存的 home 数据（榜单查询要用 pointId）。 */
   raceHome: null,
   /** 事件流心跳看门狗（隧道下判定「流是否还活着」）。 */
@@ -1054,6 +1056,7 @@ $('prac-stop').addEventListener('click', stopPractice);
 $('race-home').addEventListener('click', loadRaceHome);
 $('race-rank-load').addEventListener('click', loadRaceRank);
 $('race-run').addEventListener('click', runRace);
+$('race-extend').addEventListener('click', extendRace);
 $('race-stop').addEventListener('click', stopRace);
 $('race-leo').addEventListener('change', loadRaceSubs);
 $('race-switch').addEventListener('click', switchRaceSub);
@@ -1967,16 +1970,30 @@ async function loadRaceRank() {
   }
 }
 
-/** 「开始竞速」：起后台任务 + 订阅日志流。 */
+/**
+ * 「开始竞速」：起后台任务 + 订阅日志流。
+ *
+ * ★ 2026-10-05：**若当前已有在跑的本页任务，则改为「叠加轮数」** ——
+ * 用户要求「开始后可以继续点击开始，继续的点击视为叠加轮数」。
+ * 这样按钮语义变成：第一次点 = 起任务；任务在跑时再点 = 往当前任务加局数
+ * （不打断正在跑的那一局，也不新开任务）。
+ */
 async function runRace() {
   const id = $('race-leo').value;
   if (!id) return toast('先选择小猿账号', 'err');
+
+  // 已有在跑的任务 → 叠加轮数（复用本页输入框里的「刷多少局」）
+  if (state.raceJobId && state.raceRunning) {
+    return extendRace();
+  }
+
   const log = $('race-runlog');
   log.textContent = '';
   const say = (s, cls) => logLine(log, s, cls);
   stopRaceStream();
   const useSample = document.querySelector('input[name="raceUseSample"]:checked');
   const aimEl = $('race-aim');
+  const aimPerfectEl = $('race-aim-perfect');
   try {
     const r = await api('/api/race/run', {
       method: 'POST',
@@ -1994,19 +2011,58 @@ async function runRace() {
         useSample: !useSample || useSample.value === '1',
         aimCostMode: !!(aimEl && aimEl.checked),
         aimSafetyMs: Number($('race-aimsafety').value || 40),
+        aimPerfectMode: !!(aimPerfectEl && aimPerfectEl.checked),
+        aimPerfectMaxRounds: Number($('race-aimmax').value || 30),
       },
     });
     state.raceJobId = r.jobId;
+    state.raceRunning = true;
     try { localStorage.setItem('pknode.raceJobId', String(r.jobId)); } catch (e) { /* ignore */ }
     setRaceHint(r.message || ('任务 #' + r.jobId + ' 已开始'), true);
     say(r.message || '已开始', 'l-ok');
     $('race-stop').disabled = false;
+    $('race-extend').disabled = false;
+    maybeRenameRunButton();
     attachRaceStream();
     loadJobs();
   } catch (e) {
     say('启动失败：' + e.message, 'l-warn');
     toast(e.message, 'err');
   }
+}
+
+/**
+ * 「＋叠加轮数」：往**正在跑**的任务上追加轮数（不打断当前局）。
+ *
+ * 服务端 `POST /api/jobs/:id/extend {rounds}` —— 主循环每轮边界重读
+ * `rounds_total`，所以立即生效。用户也可以直接把「开始竞速」当叠加用
+ * （见 [runRace] 里的分支）。
+ */
+async function extendRace() {
+  const jobId = state.raceJobId;
+  if (!jobId) return toast('还没有任务可叠加 —— 先点「开始竞速」', 'err');
+  const add = Number($('race-rounds').value || 1);
+  try {
+    const r = await api('/api/jobs/' + jobId + '/extend', {
+      method: 'POST', body: { rounds: add },
+    });
+    toast(r.message || ('已叠加 ' + add + ' 局'), 'ok');
+    const log = $('race-runlog');
+    logLine(log, r.message || ('已叠加 ' + add + ' 局'), 'l-dim');
+    setRaceHint(r.message || '', true);
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+/**
+ * 按钮文案随状态变化：任务在跑时「开始竞速」改为「＋叠加轮数（继续点我）」，
+ * 让「再点一次 = 加局数」的语义一眼可见（用户要求）。
+ */
+function maybeRenameRunButton() {
+  const btn = $('race-run');
+  if (!btn) return;
+  btn.textContent = state.raceRunning ? '＋叠加轮数（继续点我）' : '开始竞速';
 }
 
 /** 顶部提示行。 */
@@ -2039,12 +2095,20 @@ function renderRaceEvent(d, log) {
   let cls = '';
   if (d.type === 'ss-ack-ok' || d.type === 'ok' || d.type === 'ss-finish' || d.type === 'ss-detail-ok' || d.type === 'ss-aim-ok') cls = 'l-ok';
   else if (d.type === 'ss-warn' || d.type === 'fail' || d.type === 'ss-gate' || d.type === 'ss-aim-fail' || d.type === 'ss-aim-warn') cls = 'l-warn';
-  else if (d.type === 'ss-round' || d.type === 'ss-gap' || d.type === 'ss-countdown' || d.type === 'ss-aim' || d.type === 'ss-aim-adjust') cls = 'l-dim';
+  else if (d.type === 'ss-round' || d.type === 'ss-gap' || d.type === 'ss-countdown' || d.type === 'ss-aim' || d.type === 'ss-aim-adjust' || d.type === 'ss-total') cls = 'l-dim';
   logLine(log, (d.message || d.type), cls);
+  // ★ 2026-10-05：服务端现在会把「完成 / 停止 / 暂停」这类状态事件也镜像过来
+  //   （此前只发任务通道，本页收不到 → 「开始」按钮永远显示「停止」态）。
   if (d.finished) {
+    state.raceRunning = false;
     $('race-stop').disabled = true;
+    $('race-extend').disabled = true;
+    maybeRenameRunButton();
     setRaceHint(d.message || '竞速任务已结束', true);
     loadJobs();
+  } else if (d.type === 'status' && d.roundsTotal != null) {
+    // 「轮数已叠加到 N 局」这类状态：只更新提示，不动 running
+    setRaceHint(d.message || '', true);
   }
 }
 
@@ -2218,11 +2282,12 @@ const PERSIST_IDS = [
   // 开学季竞速
   'race-delaymin', 'race-delaymax', 'race-qcount', 'race-grade', 'race-rounds',
   'race-gapmin', 'race-gapmax', 'race-battlemax', 'race-rank-scope',
-  'race-rank-lat', 'race-rank-lng', 'race-aimsafety',
+  'race-rank-lat', 'race-rank-lng', 'race-aimsafety', 'race-aimmax',
 ];
 
-/* 复选框型配置（bindPersist 只处理 value；这里单独持久化） */
-const PERSIST_CHECKS = ['race-aim'];
+/* ★ 2026-10-05：复选框型配置（bindPersist 只处理 value，这里单独持久化）。
+   含竞速的两个开关：贴限模式 / 完美贴限。 */
+const PERSIST_CHECKS = ['race-aim', 'race-aim-perfect'];
 
 function bindPersist() {
   for (const id of PERSIST_IDS) {

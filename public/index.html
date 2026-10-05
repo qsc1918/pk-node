@@ -332,10 +332,15 @@
             <span>贴限模式（抢榜推荐）<em>每个榜有「上榜下限」（低于它判异常不上榜、各榜不同）。
               自动读该榜榜一作为下限 → 目标 = 榜一 + 安全边距 → 按题数反推每题延迟提交。
               实测贴限 4900ms 直接拿下榜一；未上榜自动加大边距，上榜后自动收紧逼近。</em></span></label>
+          <label class="radio"><input type="checkbox" id="race-aim-perfect">
+            <span>完美贴限（自动重试直到榜一）<em>在贴限基础上把目标钉死为 rank=1：
+              本局没拿到榜一就自动追加一局重试，直到拿到 rank=1 或达到「最大尝试局数」。
+              需要上方「贴限模式」一起勾选。</em></span></label>
         </div>
       </div>
       <div class="row">
         <label class="grow">安全边距 ms（贴限模式用）<input id="race-aimsafety" type="number" value="40" min="0" placeholder="40"></label>
+        <label class="grow">最大尝试局数（完美贴限用）<input id="race-aimmax" type="number" value="30" min="1" max="500" placeholder="30"></label>
       </div>
 
       <div class="row">
@@ -380,6 +385,7 @@
 
       <div class="row">
         <button id="race-run" class="primary grow">开始竞速</button>
+        <button id="race-extend" class="ghost" disabled title="任务在跑时点这里 = 叠加轮数（不打断当前局，跑到新的总轮数）">＋叠加轮数</button>
         <button id="race-stop" class="danger" disabled title="立即中断当前竞速任务">停止</button>
       </div>
       <p id="race-runhint" class="muted small">

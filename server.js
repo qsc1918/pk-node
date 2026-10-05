@@ -379,6 +379,9 @@ function makeRaceConfig(b) {
     // ★ 贴限模式：自动读该榜榜一（= 上榜下限）→ 目标 = 榜一 + 安全边距 → 反推每题延迟
     aimCostMode: b.aimCostMode === true || b.aimCostMode === 1 || b.aimCostMode === '1',
     aimSafetyMs: Math.max(0, numOr(b.aimSafetyMs, 40) || 0),
+    // ★★ 完美贴限：目标是榜一（rank=1），未达成自动追加轮次重试（有上限保护）
+    aimPerfectMode: b.aimPerfectMode === true || b.aimPerfectMode === 1 || b.aimPerfectMode === '1',
+    aimPerfectMaxRounds: Math.max(1, Math.min(500, Number(b.aimPerfectMaxRounds) || 30)),
     gapMinMs: Math.max(0, Number(b.gapMinMs) || 0),
     gapMaxMs: Math.max(0, Number(b.gapMaxMs) || 0),
     battleMaxMs: Math.max(10000, Number(b.battleMaxMs) || 5 * 60 * 1000),
@@ -996,6 +999,20 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
     const r = jobs.stopJob(id, true, { mode: 'pause' });
     db.audit(user.id, 'job_pause', 'job=' + id, clientIp(req));
     return sendJson(res, 200, r);
+  }
+
+  // ★ 2026-10-05：叠加轮数（「开始后继续点击开始 = 叠加轮数」）。
+  //   任务在跑 → 主循环每轮边界重读 rounds_total，立即生效；
+  //   已结束 → 前端应先 resume，再 extend（或直接 extend 后 resume）。
+  const jobExtend = /^\/api\/jobs\/(\d+)\/extend$/.exec(p);
+  if (jobExtend && method === 'POST') {
+    const id = Number(jobExtend[1]);
+    const job = db.getJob(id);
+    if (!job || !jobBelongsTo(job, user)) return sendJson(res, 404, { ok: false, message: '任务不存在' });
+    const b = await readJson(req);
+    const r = jobs.extendJobRounds(id, Number(b.rounds));
+    db.audit(user.id, 'job_extend', `job=${id} +${b.rounds} → ${r.roundsTotal || '?'}`, clientIp(req));
+    return sendJson(res, r.ok ? 200 : 400, r);
   }
 
   const jobResume = /^\/api\/jobs\/(\d+)\/resume$/.exec(p);

@@ -563,8 +563,13 @@ const H5_INJECT = `(function () {
       'leoOralPKExerciseUseMerge': 'false',
         // 融合荣誉榜开关：inUse=true 会让结算页「返回」变「继续 PK 打卡」而非返回，真机常规环境为 false。
         'leo.fusion.honor.ranking.config': { content: { inUse: false } },
-      // pk-legacy：校园赛季入口 → e.content.enable
-      'leo.oral.pk.schoolSeason.entry': { content: { enable: false } },
+      // pk-legacy：校园赛季（开学季竞速）入口 → 开关值走 content.enable。
+      // ★ 2026-10-05：客户报「pk 页面没有那个活动入口」（App 与 pk-node 都没看到）。
+      //   真因：这里一直硬编码 enable=false —— H5 的 SchoolSeasonEntry
+      //   （pk-legacy 的 raceActivityBanner）只在开关为 true 时渲染入口横幅。
+      //   本服务的「比赛竞速」页已在跑开学季竞速（/api/race/*），入口却关着，
+      //   用户自然在 H5 里找不到活动 —— 现改为 true，与功能开放保持一致。
+      'leo.oral.pk.schoolSeason.entry': { content: { enable: true } },
       // ready_go：匹配等待文案 → o.content.courses[].imageUrl
       'leo.pk.matching.waiting.text': { content: { courses: [] } },
     };

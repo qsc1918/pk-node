@@ -63,7 +63,7 @@ function get(url) {
     ['getFeatureConfig', { featureKey: 'leoShowPreschool' }, 'false'],
     ['getFeatureConfig', { featureKey: 'leoOralPKExerciseUseMerge' }, 'false'],
     ['getOrionConfig', { orionKey: 'leo.fusion.honor.ranking.config' }, { content: { inUse: false } }],
-    ['getOrionConfig', { orionKey: 'leo.oral.pk.schoolSeason.entry' }, { content: { enable: false } }],
+    ['getOrionConfig', { orionKey: 'leo.oral.pk.schoolSeason.entry' }, { content: { enable: true } }],
     ['getFeatureConfig', { featureKey: '不存在的key' }, null],
     ['getExerciseInfo', {}, { exerciseGradeId: 1, exerciseSemesterId: 1 }],
     ['getExerciseConfig', {}, { grade: 1, semester: 1, bookMath: 1, bookChinese: 4, bookEnglish: 10 }],

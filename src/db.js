@@ -677,6 +677,21 @@ function createJob(userId, leoAccountId, subUserId, cfg, roundsTotal) {
   return Number(info.lastInsertRowid);
 }
 
+/**
+ * ★ 2026-10-05：设置任务的总轮数（**叠加轮数**用）。
+ *
+ * 「开始后可以继续点击开始，继续的点击视为叠加轮数」——
+ * 由 `jobs.extendJobRounds()` 调用，主循环每轮边界重读该值，立即生效。
+ *
+ * @param {number} id
+ * @param {number} roundsTotal 新的总轮数（调用方已做上限校验）
+ */
+function setJobRoundsTotal(id, roundsTotal) {
+  get()
+    .prepare('UPDATE jobs SET rounds_total = ? WHERE id = ?')
+    .run(Number(roundsTotal), Number(id));
+}
+
 function setJobStatus(id, status, patch = {}) {
   const sets = ['status = ?'];
   const args = [status];
@@ -842,6 +857,7 @@ module.exports = {
   getSubAccount,
   createJob,
   setJobStatus,
+  setJobRoundsTotal,
   addJobRound,
   getJob,
   listJobs,
