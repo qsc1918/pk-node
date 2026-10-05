@@ -693,8 +693,12 @@ async function runRaceLoop(job, cfg, ctx) {
     emit({ type: 'ss-status', message: `年级未指定 → 用账号年级 ${grade}`, at: Date.now() });
   }
 
-  // ★ 贴限模式（aimCostMode）：安全边距跨局自调 —— 未上榜加大、上榜后收紧逼近下限
-  let aimSafety = Number(cfg.aimSafetyMs) >= 0 ? Number(cfg.aimSafetyMs) : 40;
+  // ★ 贴限模式（aimCostMode）：安全边距跨局自调。
+  // 默认 0（= 精确瞄准榜一）；未达标时按差值自适应加大，刷新最佳后收紧。
+  let aimSafety = Number(cfg.aimSafetyMs) >= 0 ? Number(cfg.aimSafetyMs) : 0;
+  // ★ 2026-10-05 闭环修正量（**每题延迟**的偏移，不进 target）——
+  //   见下方「贴限闭环」段：用上一局实测偏差折成每题毫秒，修正下一局。
+  let delayAdjMs = 0;
 
   // ★★ 2026-10-05：主循环的**每轮边界重读 rounds_total**，而不是用启动时的快照。
   //
@@ -742,6 +746,7 @@ async function runRaceLoop(job, cfg, ctx) {
         pointId: cfg.pointId, questionCount: cfg.questionCount, grade: grade,
         answerDelayMinMs: cfg.answerDelayMinMs, answerDelayMaxMs: cfg.answerDelayMaxMs,
         aimCostMode: cfg.aimCostMode === true, aimSafetyMs: aimSafety,
+        aimDelayAdjMs: delayAdjMs,
         aimPerfectMode: cfg.aimPerfectMode === true,
         useSample: cfg.useSample !== false,
         battleMaxMs: cfg.battleMaxMs,
@@ -774,38 +779,90 @@ async function runRaceLoop(job, cfg, ctx) {
       detail: res.detail, at: Date.now(),
     });
 
-    // ★ 贴限反馈自调 + 完美贴限重试。
+    // ★★ 贴限反馈自调 + 完美贴限重试（2026-10-05 三次修正后定稿）。
     //
-    // 「完美贴限」（aimPerfectMode）：目标是**榜一（rank=1）**。未达成就自动
-    // 追加一局继续试（上限 cfg.aimPerfectMaxRounds，默认 30），直到拿到 rank=1
-    // 或达到上限 —— 这就是用户要的「没有完美贴限继续自动重试直到完美贴限」。
-    // 非完美模式下只做原有的边距自调，不追加重试。
+    // ## 判据
+    //
+    // `self` 是「**我的历史最佳**」，不是「本局结果」：一旦我在该榜有过成绩，
+    // `self.rank` 永远不是 999，**无论本局是否达标**。所以「已上榜」不能拿来判本局
+    // —— 唯一可靠的是 `aimIsNewBest`（本局 costTime === self.costTime，即刷新了最佳）。
+    //
+    // ## 目标
+    //
+    // 客户口径：「其实你只需要看榜一排名就行了」—— 下限 = 榜一 costTime。
+    // 所以目标是**让我的最佳贴到榜一**（等于榜一 = 并列第一）。
+    //
+    // ## 用闭环代替开环模型（关键）
+    //
+    // 开环模型 `delay = target/N - 184` 里的 184（每题固定开销）实测会漂
+    //（实测 182.9 / 184 / 208.6 —— 随链路耗时波动 ±30ms），导致目标差几百毫秒。
+    //
+    // 改闭环：用**本局实测**修正**下一局的每题延迟**（delayAdjMs）：
+    //
+    //     errMs      = 本局 costTime - 本局目标 costTime
+    //     delayAdjMs -= errMs / N × 0.6      ← 跑慢了(err>0) → **减少**每题延迟
+    //
+    // ⚠️ 两个反面教训（2026-10-05，都实测踩过）：
+    //  ① 把 err 累加到 `aimSafety`（它会先加进 target、再被下一步的 err 重复计入）
+    //     → **正反馈发散**（实测 4989→5080→5795→6209）。
+    //     修正量必须放在**不进 target** 的独立变量里。
+    //  ② **符号不能反**：`err>0` 表示「跑慢了」，要**减少**延迟（`-=`）。
+    //     写成 `+=` 会越跑越慢（实测 5585→6048→6718→7540→8211）。
     if (cfg.aimCostMode) {
       const perfect = cfg.aimPerfectMode === true;
-      const gotRank1 = res.aimAccepted === true && Number(res.aimRank) === 1;
-      if (perfect && gotRank1) {
-        publishRaceStatus(job, {
-          type: 'status', jobId: jobId,
-          message: `🎯 完美贴限达成：rank=1（${res.aimSelfCost || res.costTimeMs}ms），不再重试`,
+      const newBest = res.aimIsNewBest === true;          // 本局刷新了我的最佳
+      const selfCost = res.aimSelfCost;
+      const baseLimit = res.aim && res.aim.base;          // 该榜榜一（= 下限 = 目标）
+      const targetCost = res.aim && res.aim.target;       // 本局的目标 costTime
+      const nQ = Math.max(1, (res.aim && res.aim.questionCount) || 10);
+      // 「已达完美」= 我的最佳已经贴到榜一
+      const reachedPerfect = baseLimit != null && selfCost != null && selfCost <= baseLimit + 1;
+
+      if (newBest) {
+        emit({
+          type: 'ss-aim-adjust',
+          message: `贴限：本局刷新我的最佳 → ${selfCost}ms` +
+            (baseLimit != null ? `（该榜榜一 ${baseLimit}ms，还差 ${selfCost - baseLimit}ms）` : ''),
           at: Date.now(),
         });
       }
-      if (res.aimAccepted === false) {
-        aimSafety = Math.min(600, aimSafety + 50);
-        emit({ type: 'ss-aim-adjust', message: `贴限自调：本局未上榜（${res.costTimeMs}ms 被判异常）→ 安全边距上调至 ${aimSafety}ms`, at: Date.now() });
-      } else if (res.aimAccepted === true && res.aimRank != null && Number(res.aimRank) > 1 && aimSafety > 20) {
-        aimSafety = Math.max(20, aimSafety - 10);
-        emit({ type: 'ss-aim-adjust', message: `贴限自调：榜单名次 ${res.aimRank} → 安全边距收紧至 ${aimSafety}ms（逼近下限）`, at: Date.now() });
+
+      if (perfect && reachedPerfect) {
+        publishRaceStatus(job, {
+          type: 'status', jobId: jobId,
+          message: `🎯 完美贴限达成：我的最佳 ${selfCost}ms 已贴到该榜榜一 ${baseLimit}ms，不再重试`,
+          at: Date.now(),
+        });
+      } else if (targetCost != null && res.costTimeMs != null) {
+        // ★ 闭环修正（阻尼 0.35，折成每题延迟；跑慢了要**减少**延迟）
+        //
+        // 阻尼 0.6 实测会过冲到下限之下（4868/4888 < 4900 → 被判异常），
+        // 所以降到 0.35，并加「**不许低于目标**」的钳制：宁可略高也别被打回。
+        const errMs = res.costTimeMs - targetCost;
+        const delta = Math.round((errMs / nQ) * 0.35);
+        const before = delayAdjMs;
+        // 下限钳制：每题延迟最多只能降到「刚好命中目标」的那个值
+        // （perQ = target/N - overhead + adj，令其为 0 → adj = overhead - target/N）
+        const ovh = Number(res.aim && res.aim.overhead) || 184;
+        const floorAdj = -Math.round(Math.max(0, (targetCost / nQ) - ovh));
+        delayAdjMs = Math.max(floorAdj, Math.min(2000, delayAdjMs - delta));
+        emit({
+          type: 'ss-aim-adjust',
+          message: `贴限闭环：本局实测 ${res.costTimeMs}ms vs 目标 ${targetCost}ms（${errMs > 0 ? '慢了' : '快了'} ` +
+            `${Math.abs(errMs)}ms）→ 下局每题延迟修正 ${before} → ${delayAdjMs}ms`,
+          at: Date.now(),
+        });
       }
 
       // 完美贴限：未达成 → 追加轮次继续（受上限保护）
-      if (perfect && !gotRank1) {
+      if (perfect && !reachedPerfect) {
         const cap = Math.max(1, Number(cfg.aimPerfectMaxRounds) || 30);
         const attempts = i - (job.rounds_done || 0);
         if (attempts >= cap) {
           publishRaceStatus(job, {
             type: 'status', jobId: jobId,
-            message: `完美贴限：已尝试 ${attempts} 局仍未拿到 rank=1，停止重试（上限 ${cap} 局）`,
+            message: `完美贴限：已尝试 ${attempts} 局仍未贴到下限（我的最佳 ${selfCost == null ? '?' : selfCost}ms，` +
+              `下限 ${baseLimit == null ? '?' : baseLimit}ms），停止重试（上限 ${cap} 局）`,
             at: Date.now(),
           });
         } else {
@@ -814,7 +871,8 @@ async function runRaceLoop(job, cfg, ctx) {
           total = next;
           publishRaceStatus(job, {
             type: 'status', jobId: jobId, roundsTotal: total,
-            message: `完美贴限未达成（本局 rank=${res.aimRank == null ? '?' : res.aimRank}）→ 自动追加第 ${next} 局重试`,
+            message: `完美贴限未达成（我的最佳 ${selfCost == null ? '?' : selfCost}ms vs 下限 ` +
+              `${baseLimit == null ? '?' : baseLimit}ms）→ 自动追加第 ${next} 局重试`,
             at: Date.now(),
           });
         }

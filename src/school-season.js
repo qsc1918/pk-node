@@ -609,13 +609,15 @@ async function runOneRace(jar, cfg, onEvent, signal) {
     message: `活动主页 OK：知识点「${point.pointName}」(${point.pointId})，题数 ${questionCount}，session=${gameSessionId}`,
   });
 
-  // ★ 0.5) 贴限模式（aimCostMode）：读该榜榜一（= 上榜下限）→ 目标 costTime → 反推每题提交延迟。
+  // ★ 0.5) 贴限模式（aimCostMode）：读该榜**榜一**（= 上榜下限）→ 目标 costTime → 反推每题延迟。
   //
-  //   背景（2026-10-05 实测）：每个榜有「上榜下限」，低于它的成绩被服务端判异常
-  //   （self.rank=999，不上榜），且各榜不同（2035=4900 / 2037=5600 / 2036=7000，
-  //   恰为该榜榜一值）。服务端按「qStartAt → ANSWER 到达」的物理时间计时
-  //   （帧 ts 无法干预，已实验证伪）。因此「突破」= 精确贴着下限提交：
-  //   目标 = 榜一 + safety，拿到「服务端可接受的最快成绩」，抢榜单前排。
+  //   背景（2026-10-05 实测 + 客户口径确认）：每个榜有「上榜下限」，**就是该榜榜一的成绩**，
+  //   且各榜不同（2035=4900 / 2037·2038·2039=5600 / 2036=7000）。
+  //   低于它的成绩被判异常、不进榜（`self` 里表现为 rank=999 或干脆不出现）。
+  //
+  //   ⚠️ 2026-10-05 二次修正：**必须精确取 `ranks[0]`（rank=1 那条）**，不要用
+  //   `Math.min(所有 costTime)` —— 后者在「榜一缺失 / 列表乱序 / 有并列」时会取错，
+  //   之前就因此把下限算歪过。榜一是服务端排好序的第一条，直接取它最可靠。
   //
   //   模型（实测拟合，N=10 时误差 ±20ms）：costTime ≈ N × (delay + 184ms)
   //   （184ms = 每题固定开销：广播/网络/服务端处理），→ delay = target / N - 184。
@@ -623,27 +625,42 @@ async function runOneRace(jar, cfg, onEvent, signal) {
   let delayMinMs = cfg.answerDelayMinMs;
   let delayMaxMs = cfg.answerDelayMaxMs;
   if (cfg.aimCostMode) {
-    const safety = Number(cfg.aimSafetyMs) >= 0 ? Number(cfg.aimSafetyMs) : 40;
+    const safety = Number(cfg.aimSafetyMs) >= 0 ? Number(cfg.aimSafetyMs) : 0;
     let base = null;
+    let baseRank = null;
     try {
       const rk = await rank(jar, { pointId: point.pointId, scope: 1, signal });
       const ranks = (rk.json && rk.json.ranks) || [];
-      const costs = ranks.map((x) => Number(x && x.costTime)).filter((x) => Number.isFinite(x) && x > 0);
-      if (costs.length) base = Math.min.apply(null, costs);
+      // ★ 直接取 rank=1 那条（服务端已按名次排好）；兜底才退到「第一条有 costTime 的」。
+      const first = ranks.find((x) => Number(x && x.rank) === 1 && Number(x.costTime) > 0)
+        || ranks.find((x) => Number(x && x.costTime) > 0);
+      if (first) {
+        base = Number(first.costTime);
+        baseRank = Number(first.rank);
+      }
     } catch (e) { /* 拉榜失败 → 用兜底值 */ }
     if (base == null) {
       base = Number(cfg.aimFallbackBaseMs) > 0 ? Number(cfg.aimFallbackBaseMs) : 4900;
       emit({ type: 'ss-aim', message: `贴限模式：本榜暂无可读榜一，用兜底下限 ${base}ms` });
     }
+    // 目标 = 榜一 + 安全边距。safety 默认 0（= 精确瞄准榜一）；
+    // 因为服务端计时有 ±几十毫秒抖动，留一点点余量能避免「差 1ms 被打回」。
     const target = base + safety;
     const overhead = Number(cfg.aimOverheadMs) > 0 ? Number(cfg.aimOverheadMs) : 184;
-    const perQ = Math.max(0, Math.round((target / Math.max(1, questionCount)) - overhead));
+    // ★ 闭环修正量（aimDelayAdjMs）：跨局累积的「每题延迟偏移」，
+    //   由 jobs 侧用上一局实测偏差算好后传进来（不进 target，避免正反馈）。
+    const adj = Number(cfg.aimDelayAdjMs) || 0;
+    const perQ = Math.max(0, Math.round((target / Math.max(1, questionCount)) - overhead + adj));
     delayMinMs = perQ;
     delayMaxMs = perQ;
-    aimInfo = { base: base, target: target, delayMs: perQ, safety: safety, overhead: overhead };
+    aimInfo = {
+      base: base, target: target, delayMs: perQ, safety: safety, overhead: overhead,
+      baseRank: baseRank, delayAdjMs: adj, questionCount: questionCount,
+    };
     emit({
       type: 'ss-aim',
-      message: `贴限模式：榜一 ${base}ms → 目标 ${target}ms → 每题延迟 ${perQ}ms（${questionCount} 题）`,
+      message: `贴限模式：榜一（rank=${baseRank == null ? 1 : baseRank}）${base}ms → 目标 ${target}ms ` +
+        `→ 每题延迟 ${perQ}ms（${questionCount} 题${adj ? `，闭环修正 ${adj > 0 ? '+' : ''}${adj}ms/题` : ''}）`,
     });
   }
 
@@ -907,11 +924,33 @@ async function runOneRace(jar, cfg, onEvent, signal) {
         (myCost != null ? `，costTime=${myCost}ms` : '') + `，共提交 ${okCount} 题`,
     });
 
-    // ★ 贴限核验（aimCostMode）：赛后查 self —— rank=999 表示被判异常（未上榜）。
-    //   self 语义（实测）：显示「我的最佳成绩」+ 名次；从未成功则显示最近被拒成绩 + rank=999。
+    // ★★ 贴限核验（aimCostMode）—— 2026-10-05 二次取证后**重写判据**。
+    //
+    // ## 为什么不能用 `self.rank !== 999`
+    //
+    // 实测（2039 负数比大小）：榜上前 3 是 5600/5630/5634，而我的 `self` 一直是
+    // `{rank:40, costTime:5933}` —— 那是**我的历史最佳**。我随后跑的
+    // 4934 / 4984 / 5058 **全部没进榜**（榜上最低仍 5600），
+    // 但 `self.rank` 依旧 = 40（≠ 999）→ 旧判据误判成「已上榜」。
+    //
+    // ⇒ 结论：`self` = **我的历史最佳**，一旦我在该榜有过成绩，`self.rank`
+    //   永远不是 999，**无论本局是否达标**。用它判「本局是否被采纳」是错的。
+    //
+    // ## 唯一可靠的判据
+    //
+    // ```
+    // self.costTime === 本局 costTime  → 本局成了我的新纪录（服务端采纳了，rank 有效）
+    // self.costTime !== 本局 costTime  → 本局没成为新纪录（只能判定「不比历史最佳好」）
+    // ```
+    //
+    // 因此 [aimAccepted] 有三种取值：
+    //  - `true`  ：本局被采纳（刷新了我的最佳）
+    //  - `false` ：本局被明确**丢弃**（== 历史记录仍是旧的，且本局更慢也进不了榜）
+    //  - `null`  ：**不可判定**（榜单只记最佳，无从知道本局是否达标）
     let aimAccepted = null;
     let aimRank = null;
     let aimSelfCost = null;
+    let aimIsNewBest = null;
     if (aimInfo && myCost != null) {
       try {
         await sleep(1500, signal);
@@ -919,15 +958,30 @@ async function runOneRace(jar, cfg, onEvent, signal) {
         const self = (rk2.json && rk2.json.self) || null;
         if (self && self.costTime != null) {
           aimSelfCost = Number(self.costTime);
-          if (Number(self.rank) !== 999) {
+          aimRank = (Number(self.rank) === 999) ? null : Number(self.rank);
+          // 容差 50ms：服务端计时与本地测量有 ±几十毫秒抖动
+          aimIsNewBest = Math.abs(aimSelfCost - Number(myCost)) <= 50;
+          if (aimIsNewBest) {
             aimAccepted = true;
-            aimRank = Number(self.rank);
-            emit({ type: 'ss-aim-ok', message: `贴限核验：已上榜（我的最佳 ${aimSelfCost}ms，名次 ${aimRank}）` });
-          } else if (Math.abs(aimSelfCost - Number(myCost)) <= 100) {
+            emit({
+              type: 'ss-aim-ok',
+              message: `贴限核验：本局被采纳（刷新我的最佳 → ${aimSelfCost}ms，榜上名次 ${aimRank == null ? '?' : aimRank}）`,
+            });
+          } else if (aimRank == null) {
+            // 我从未有过有效成绩，且本局也没刷新 → 明确未达标
             aimAccepted = false;
-            emit({ type: 'ss-aim-fail', message: `贴限核验：未上榜（${aimSelfCost}ms 被判异常 rank=999）` });
+            emit({
+              type: 'ss-aim-fail',
+              message: `贴限核验：未达标（本局 ${myCost}ms，我的记录 ${aimSelfCost}ms 仍为异常态）`,
+            });
           } else {
-            emit({ type: 'ss-aim-warn', message: `贴限核验：self=${aimSelfCost}ms/rank=${self.rank}` });
+            // 我有旧记录且本局没刷新 → 无法判断本局是否达标（榜单只记最佳）
+            aimAccepted = null;
+            emit({
+              type: 'ss-aim-warn',
+              message: `贴限核验：本局未刷新我的最佳（本局 ${myCost}ms vs 最佳 ${aimSelfCost}ms/名次 ${aimRank}）` +
+                ` —— 榜单只记最佳，本局是否达标不可判定`,
+            });
           }
         } else {
           emit({ type: 'ss-aim-warn', message: `贴限核验：self 暂未更新（本局 ${myCost}ms）` });
@@ -951,6 +1005,7 @@ async function runOneRace(jar, cfg, onEvent, signal) {
       aimAccepted: aimAccepted,
       aimRank: aimRank,
       aimSelfCost: aimSelfCost,
+      aimIsNewBest: aimIsNewBest,
       answers: state.answers,
       detail: '本局结算：' + summary,
     };

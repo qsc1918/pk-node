@@ -378,7 +378,7 @@ function makeRaceConfig(b) {
     useSample: b.useSample !== false,               // 默认抄 sample
     // ★ 贴限模式：自动读该榜榜一（= 上榜下限）→ 目标 = 榜一 + 安全边距 → 反推每题延迟
     aimCostMode: b.aimCostMode === true || b.aimCostMode === 1 || b.aimCostMode === '1',
-    aimSafetyMs: Math.max(0, numOr(b.aimSafetyMs, 40) || 0),
+    aimSafetyMs: Math.max(0, numOr(b.aimSafetyMs, 0) || 0),
     // ★★ 完美贴限：目标是榜一（rank=1），未达成自动追加轮次重试（有上限保护）
     aimPerfectMode: b.aimPerfectMode === true || b.aimPerfectMode === 1 || b.aimPerfectMode === '1',
     aimPerfectMaxRounds: Math.max(1, Math.min(500, Number(b.aimPerfectMaxRounds) || 30)),
