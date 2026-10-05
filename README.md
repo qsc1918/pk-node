@@ -515,6 +515,58 @@ platform=android36 → 417      platform=android37 → 200
   - 进程重启时，残留的 `running/queued` 任务会被自动标成「服务重启，任务已中断」，
     不会再有永远「运行中」的僵尸任务。
 
+### 4.7.1 开学季竞速（`school-season`）—— 「比赛逆向接口提交对局」+ 贴限模式（2026-10-05）
+
+纯 Node **直连 WebSocket** 复刻官方 H5 的「开学季竞速」（`2026autumnRace`）全流程：
+`活动主页 → 8 人匹配（机器人补位）→ 对战 WS → 逐题作答 → 结算`，不经浏览器。
+
+页面入口：网页「**比赛竞速**」tab；服务端：`src/school-season.js` +
+`/api/race/{home,rank,run,stream}`；任务：`kind='race'`（正经后台任务）。
+
+#### 协议两个关键点（改代码前必读）
+
+| 点 | 结论 |
+|---|---|
+| WS 握手 417 | match / battle 两个 WS **都必须带公共参数 + sign**（`_productId=611&platform=…&sign=`），只带 `sessionId` 会 `x-block-by: solar-encoder`；`{client}` 占位符替换为 `api` |
+| WS 客户端 | 🚫 不用内置 `WebSocket`（undici 对 xyks 握手必失败）→ 用 `https.request + 'upgrade'` **手写 RFC6455 帧**（客户端掩码、服务端不加、PING/PONG 3s），零依赖 100% 可连 |
+
+#### ★ 上榜下限与「贴限模式」（本次核心）
+
+**每个榜有「上榜下限」**：低于它的成绩被服务端判异常不上榜（`self.rank=999`），
+且**每个榜不同**（实测 2035=4900 / 2037/2038/2039=5600 / 2036=7000ms，
+恰为该榜**榜一值**）。计时按「qStartAt → ANSWER 到达」的**物理时间**差
+（帧 `ts` 无法干预，已实验证伪：秒答 + ts偏移400ms 仍是 1816ms 被拒）。
+
+⇒ **「抢榜」= 精确贴着下限提交**（不是打得更低，更低=被拒）：
+
+```
+目标 costTime = 该榜榜一（=下限）+ 安全边距（默认 40ms）
+每题延迟 = 目标 / 题数 - 184ms        （184ms = 每题固定开销，实测拟合）
+```
+
+实测：`306ms/题 × 10 题 → 4900ms → 榜一 rank=1`（4899ms 差 1ms 都被拒）。
+
+- **「贴限模式」开关**（网页 checkbox / API `aimCostMode: true`）：
+  起跑前自动读该榜榜一 → 反推每题延迟 → 赛后查榜核验 → **跨局自调**：
+  未上榜自动 +50ms 边距、上榜但非榜一自动 −10ms 逼近。
+- 手动模式仍可用：「提交时间 min/max」直接控制每题延迟
+  （秒答 0~0 会因低于所有榜下限而**不上榜**，界面已写明）。
+- 小工具：`tools/race-aim.js`（单局描准）、`tools/race-aimtest.js`（贴限端到端）、
+  `tools/race-self.js`（查自己榜上位置）、`tools/race-threshold.js`（逐榜门槛取证）。
+
+#### 子账号切换
+
+「比赛竞速」tab 内置子账号下拉 + 「切换」按钮（与练习页同机制）：
+`POST /api/leo/accounts/:id/switch {userId}` → `switchToSubAccount`。
+⚠️ 需 arm64 native（`bin/native/lre.so`）算 sign，否则 417。
+
+#### 附：竞速 `costTime` 线性模型（实测五档）
+
+```
+costTime ≈ 题数 × (每题延迟 + 184ms)
+0ms→1829 / 40ms→2261 / 100ms→2846 / 306ms→4900 / 550ms→7330
+```
+
 ### 5. 登录（短信 / 密码）的加密口径 —— **两条路的字段不一样**
 
 | 接口 | 字段 | 加密？ |

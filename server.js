@@ -21,6 +21,7 @@ const signLib = require('./src/sign');
 const strokes = require('./src/strokes');
 const exercise = require('./src/exercise');
 const pkH5 = require('./src/pk-h5-proxy');
+const schoolSeason = require('./src/school-season');
 
 const PUBLIC_DIR = path.join(config.root, 'public');
 
@@ -351,6 +352,38 @@ function makeExerciseConfig(b) {
     gapMaxMs: Math.max(0, Number(b.gapMaxMs) || 0),
     costTimePerQuestionMs: b.costTimePerQuestionMs == null ? undefined : Number(b.costTimePerQuestionMs),
   };
+  cfg.rounds = clampRounds(b.rounds, 1);
+  return cfg;
+}
+
+/**
+ * 开学季竞速参数（kind='race'）。
+ *
+ * 「提交时间」= 每题收到 QUESTION_START 后延迟多久发 ANSWER
+ * （服务端按 qStartAt 计时 costTime）。其余为可选行为开关。
+ *
+ * 「贴限模式」（aimCostMode）：每个榜有「上榜下限」（低于它判异常不上榜），
+ * 自动读该榜榜一作为下限估计，目标 = 榜一 + aimSafetyMs，反推每题延迟 ——
+ * 拿「服务端可接受的最快成绩」抢榜（实测贴限 4900ms 直接 rank=1）。
+ */
+function makeRaceConfig(b) {
+  const numOr = (v, def) => (v == null || v === '' ? def : Number(v));
+  const cfg = {
+    kind: 'race',
+    pointId: Number(b.pointId) || 0,               // 0 = 用活动主页第一个知识点
+    questionCount: Math.max(0, Number(b.questionCount) || 0),  // 0 = 用知识点默认题数
+    grade: Number(b.grade) || 0,                    // 0 = 用账号年级
+    answerDelayMinMs: Math.max(0, numOr(b.answerDelayMinMs, 50)),
+    answerDelayMaxMs: Math.max(0, numOr(b.answerDelayMaxMs, 150)),
+    useSample: b.useSample !== false,               // 默认抄 sample
+    // ★ 贴限模式：自动读该榜榜一（= 上榜下限）→ 目标 = 榜一 + 安全边距 → 反推每题延迟
+    aimCostMode: b.aimCostMode === true || b.aimCostMode === 1 || b.aimCostMode === '1',
+    aimSafetyMs: Math.max(0, numOr(b.aimSafetyMs, 40) || 0),
+    gapMinMs: Math.max(0, Number(b.gapMinMs) || 0),
+    gapMaxMs: Math.max(0, Number(b.gapMaxMs) || 0),
+    battleMaxMs: Math.max(10000, Number(b.battleMaxMs) || 5 * 60 * 1000),
+  };
+  if (cfg.answerDelayMaxMs < cfg.answerDelayMinMs) cfg.answerDelayMaxMs = cfg.answerDelayMinMs;
   cfg.rounds = clampRounds(b.rounds, 1);
   return cfg;
 }
@@ -1121,6 +1154,88 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
       if (!ev || !ev.exercise) return;
       if (ev.userId != null && Number(ev.userId) !== Number(user.id)) return;
       writeEx(JSON.stringify(ev));
+    });
+    const hb = setInterval(() => { try { res.write(':ping\n\n'); } catch (e) { /* ignore */ } }, 15000);
+    req.on('close', () => { clearInterval(hb); unsub(); });
+    return;
+  }
+
+  /* ============================================================
+   * 开学季竞速（school-season / 2026autumnRace）
+   *
+   * 「比赛逆向接口提交对局」：纯 Node 直连 WS 复刻「匹配 → 对战 → 提交」。
+   * - /api/race/home   —— 活动主页（知识点 / gameSessionId / 活动时间）
+   * - /api/race/rank   —— 榜单（全国/城市）
+   * - /api/race/run    —— 起任务（正经后台任务，kind='race'）
+   * - /api/race/stream —— 竞速日志流（同练习的做法）
+   * ============================================================ */
+
+  if (p === '/api/race/home' && method === 'GET') {
+    const leoId = Number(u.searchParams.get('leoAccountId') || 0);
+    const acc = db.getLeoAccount(leoId);
+    if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '小猿账号不存在' });
+    try {
+      const jar = jobs.jarOf(acc);
+      const grade = Number(u.searchParams.get('grade') || acc.grade || 2);
+      const r = await schoolSeason.home(jar, { grade });
+      return sendJson(res, r.status === 200 ? 200 : 502, {
+        ok: r.status === 200, status: r.status,
+        home: r.json, text: r.text.slice(0, 1500),
+      });
+    } catch (e) {
+      return sendJson(res, 502, { ok: false, message: String(e && e.message) });
+    }
+  }
+
+  if (p === '/api/race/rank' && method === 'GET') {
+    const leoId = Number(u.searchParams.get('leoAccountId') || 0);
+    const acc = db.getLeoAccount(leoId);
+    if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '小猿账号不存在' });
+    try {
+      const jar = jobs.jarOf(acc);
+      const r = await schoolSeason.rank(jar, {
+        pointId: Number(u.searchParams.get('pointId') || 0),
+        scope: Number(u.searchParams.get('scope') || 1),   // 1=全国 2=城市
+        lat: u.searchParams.get('lat') == null ? undefined : Number(u.searchParams.get('lat')),
+        lng: u.searchParams.get('lng') == null ? undefined : Number(u.searchParams.get('lng')),
+      });
+      return sendJson(res, r.status === 200 ? 200 : 502, {
+        ok: r.status === 200, status: r.status,
+        rank: r.json, text: r.text.slice(0, 1500),
+      });
+    } catch (e) {
+      return sendJson(res, 502, { ok: false, message: String(e && e.message) });
+    }
+  }
+
+  if (p === '/api/race/run' && method === 'POST') {
+    const b = await readJson(req);
+    const acc = db.getLeoAccount(Number(b.leoAccountId));
+    if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '小猿账号不存在' });
+
+    const cfg = makeRaceConfig(b);
+    const jobId = db.createJob(user.id, acc.id, null, cfg, cfg.rounds);
+    const start = jobs.startRaceJob({ jobId: jobId });
+    db.audit(user.id, 'race_run',
+      `job=${jobId} leo=${acc.id} rounds=${cfg.rounds} point=${cfg.pointId} delay=${cfg.answerDelayMinMs}~${cfg.answerDelayMaxMs} aim=${cfg.aimCostMode ? 'on(' + cfg.aimSafetyMs + 'ms)' : 'off'}`, clientIp(req));
+    if (!start.ok) {
+      db.setJobStatus(jobId, 'failed', { finishedAt: Date.now(), error: start.message });
+      return sendJson(res, 400, { ok: false, jobId: jobId, message: start.message });
+    }
+    return sendJson(res, 200, {
+      ok: true,
+      jobId: jobId,
+      rounds: cfg.rounds,
+      message: `已开始：${cfg.rounds} 局竞速（任务 #${jobId}，可在「任务」页查看进度）`,
+    });
+  }
+
+  if (p === '/api/race/stream' && method === 'GET') {
+    const writeRace = sseStart(res, { retryMs: 3000 });
+    const unsub = jobs.subscribe(0, (ev) => {
+      if (!ev || !ev.raceMirror) return;
+      if (ev.userId != null && Number(ev.userId) !== Number(user.id)) return;
+      writeRace(JSON.stringify(ev));
     });
     const hb = setInterval(() => { try { res.write(':ping\n\n'); } catch (e) { /* ignore */ } }, 15000);
     req.on('close', () => { clearInterval(hb); unsub(); });

@@ -43,6 +43,7 @@
       <button class="nav-btn active" data-tab="grind">刷局</button>
       <button class="nav-btn" data-tab="pkpage">PK 页面</button>
       <button class="nav-btn" data-tab="practice">刷练习</button>
+      <button class="nav-btn" data-tab="race">比赛竞速</button>
       <button class="nav-btn" data-tab="accounts">小猿账号</button>
       <button class="nav-btn" data-tab="jobs">任务</button>
       <button class="nav-btn admin-only hidden" data-tab="tunnel">穿透</button>
@@ -291,6 +292,123 @@
         轮数<b>没有上限</b>（此前填 &gt;99 会被悄悄改成 99）。
       </p>
       <pre id="prac-runlog" class="log tall" style="max-height:360px"></pre>
+    </div>
+  </main>
+
+  <!-- 比赛竞速（开学季 school-season：纯 Node 直连 WS 全流程） -->
+  <main class="panel hidden" id="tab-race">
+    <div class="card">
+      <h2>比赛逆向接口提交对局（开学季竞速）</h2>
+      <p class="muted small">
+        <b>纯 Node 直连复刻「匹配 → 对战 → 提交」全流程</b>：活动主页 → 8 人匹配（机器人补位）
+        → WebSocket 对战 → 逐题作答 → 结算。与官方 H5 同协议（ws v2 帧），<b>不经浏览器</b>。<br>
+        <b>「提交时间」= 每题收到出题信号（QUESTION_START）后延迟多久发答案</b> ——
+        服务端按「题目开始到收到答案」的实际时间记 costTime；<b>但每个榜有上榜下限</b>
+        （低于它不上榜，见下方「贴限模式」）。
+      </p>
+      <div class="row">
+        <label class="grow">小猿账号
+          <select id="race-leo"></select>
+        </label>
+        <button id="race-home" class="primary">获取知识点</button>
+      </div>
+      <div class="row">
+        <label class="grow">子账号（竞速在当前身份下进行）
+          <select id="race-sub"><option value="">（当前身份）</option></select>
+        </label>
+        <button id="race-switch" class="primary">切换</button>
+      </div>
+      <div class="row">
+        <label class="grow">知识点
+          <select id="race-point"><option value="0">（未获取——点上方按钮）</option></select>
+        </label>
+      </div>
+      <pre id="race-home-status" class="log" style="max-height:160px">（点「获取知识点」）</pre>
+
+      <div class="field">
+        <div class="field-label">成绩模式</div>
+        <div class="radios" id="race-aim-mode">
+          <label class="radio"><input type="checkbox" id="race-aim">
+            <span>贴限模式（抢榜推荐）<em>每个榜有「上榜下限」（低于它判异常不上榜、各榜不同）。
+              自动读该榜榜一作为下限 → 目标 = 榜一 + 安全边距 → 按题数反推每题延迟提交。
+              实测贴限 4900ms 直接拿下榜一；未上榜自动加大边距，上榜后自动收紧逼近。</em></span></label>
+        </div>
+      </div>
+      <div class="row">
+        <label class="grow">安全边距 ms（贴限模式用）<input id="race-aimsafety" type="number" value="40" min="0" placeholder="40"></label>
+      </div>
+
+      <div class="row">
+        <label class="grow">提交时间最小 ms<input id="race-delaymin" type="number" value="50" min="0"></label>
+        <label class="grow">提交时间最大 ms<input id="race-delaymax" type="number" value="150" min="0"></label>
+      </div>
+      <p class="muted small">
+        <b>贴限模式下「提交时间」自动计算</b>（上方两个输入框仅非贴限时生效）；
+        想更像真人可手动填 800~2500。<b>注意</b>：秒答（0~0）因低于所有榜的下限，会被判异常<b>不上榜</b>；
+        想上榜请用贴限模式或手动填到下限之上。
+      </p>
+
+      <details class="adv">
+        <summary>高级参数（题数 / 轮数 / 间隔 / 答题策略 / 超时）</summary>
+
+        <div class="row">
+          <label class="grow">每局题数<input id="race-qcount" type="number" value="0" min="0" placeholder="0=用知识点默认"></label>
+          <label class="grow">年级<input id="race-grade" type="number" value="0" min="0" placeholder="0=用账号年级"></label>
+          <label class="grow">刷多少局<input id="race-rounds" type="number" value="1" min="1" max="100000"></label>
+        </div>
+
+        <div class="row">
+          <label class="grow">局间最小间隔 ms<input id="race-gapmin" type="number" value="0" min="0"></label>
+          <label class="grow">局间最大间隔 ms<input id="race-gapmax" type="number" value="0" min="0"></label>
+        </div>
+
+        <div class="field">
+          <div class="field-label">答题策略</div>
+          <div class="radios" id="race-strategy">
+            <label class="radio"><input type="radio" name="raceUseSample" value="1" checked>
+              <span>抄 sample（推荐）<em>题目自带示例答案，直接提交，必对</em></span></label>
+            <label class="radio"><input type="radio" name="raceUseSample" value="0">
+              <span>本地计算优先<em>自己算（仅四则/比大小兜底），算不出回落 sample</em></span></label>
+          </div>
+        </div>
+
+        <div class="row">
+          <label class="grow">单局超时 ms<input id="race-battlemax" type="number" value="300000" min="10000"></label>
+          <button id="race-presets" class="ghost" title="竞赛/佛系/真人三套预设">填入推荐值</button>
+        </div>
+      </details>
+
+      <div class="row">
+        <button id="race-run" class="primary grow">开始竞速</button>
+        <button id="race-stop" class="danger" disabled title="立即中断当前竞速任务">停止</button>
+      </div>
+      <p id="race-runhint" class="muted small">
+        竞速任务是<b>正经后台任务</b>：切页/关浏览器都继续跑；进度与逐局明细在「任务」页可见。
+      </p>
+      <pre id="race-runlog" class="log tall" style="max-height:360px"></pre>
+    </div>
+
+    <div class="card">
+      <h2>榜单数据</h2>
+      <p class="muted small">
+        <code>GET /leo-game-pk/api/game/battle/v2/math/rank</code> ——
+        <b>全国榜 / 城市榜</b>（城市榜需定位；无定位时服务端可能返回 locationAvailable=false）。
+        榜单按知识点查，先在上面「获取知识点」再拉。
+      </p>
+      <div class="row">
+        <label class="grow">榜单范围
+          <select id="race-rank-scope">
+            <option value="1" selected>全国榜</option>
+            <option value="2">城市榜</option>
+          </select>
+        </label>
+        <button id="race-rank-load" class="primary">拉取榜单</button>
+      </div>
+      <div class="row">
+        <label class="grow">纬度（城市榜用）<input id="race-rank-lat" type="number" step="0.0001" placeholder="如 29.5"></label>
+        <label class="grow">经度（城市榜用）<input id="race-rank-lng" type="number" step="0.0001" placeholder="如 106.5"></label>
+      </div>
+      <pre id="race-rank-log" class="log tall" style="max-height:360px">（点「拉取榜单」）</pre>
     </div>
   </main>
 

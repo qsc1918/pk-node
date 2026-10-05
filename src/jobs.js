@@ -10,6 +10,7 @@ const leo = require('./leo');
 const leoAccounts = require('./services/leo-accounts');
 const engine = require('./pk-engine');
 const exercise = require('./exercise');
+const schoolSeason = require('./school-season');
 const { config } = require('./config');
 
 /** 默认最大并行任务数：0 = 不限制（可用 `PK_MAX_CONCURRENT=<正整数>` 设上限）。 */
@@ -253,7 +254,9 @@ function resumeJob(jobId) {
 
   // 清掉上次结束的痕迹，回到「排队中」再由 start*Job 置为 running
   db.setJobStatus(id, 'queued', { finishedAt: null, error: null });
-  const start = kind === 'exercise' ? startExerciseJob({ jobId: id }) : startJob({ jobId: id });
+  const start = kind === 'exercise' ? startExerciseJob({ jobId: id })
+    : kind === 'race' ? startRaceJob({ jobId: id })
+    : startJob({ jobId: id });
   if (!start.ok) return start;
   return {
     ok: true,
@@ -534,6 +537,196 @@ function isBusy() {
   return running.size > 0;
 }
 
+/* ======================== 开学季竞速任务（kind='race'） ========================
+ * 与刷局/刷练习同源调度：登记 running、落库、占并行名额，共用 publish/subscribe/stopJob/SSE。
+ * 单轮 = 一局 8 人竞速（匹配 → 对战 → 逐题作答 → 结算）。
+ */
+
+/**
+ * 启动一个开学季竞速任务（异步执行，立即返回）。
+ *
+ * @param {object} o
+ * @param {number} o.jobId  已入库的任务 id（config_json 里含 kind:'race'）
+ * @returns {{ok:boolean, message?:string}}
+ */
+function startRaceJob(o) {
+  const job = db.getJob(o.jobId);
+  if (!job) return { ok: false, message: '任务不存在' };
+  if (running.has(job.id)) return { ok: false, message: '该任务已在运行' };
+
+  const cap = Number(config.maxConcurrentJobs) || MAX_CONCURRENT;
+  if (cap > 0 && running.size >= cap) {
+    return { ok: false, message: `最多同时运行 ${cap} 个任务，请先停掉一些（可在高级参数里调）` };
+  }
+
+  const account = db.getLeoAccount(job.leo_account_id);
+  if (!account) return { ok: false, message: '小猿账号不存在（可能已被删除）' };
+
+  const cfg = JSON.parse(job.config_json);
+  const controller = new AbortController();
+  const ctx = {
+    stopped: false,
+    paused: false,
+    jar: jarOf(account),
+    config: cfg,
+    controller: controller,
+    signal: controller.signal,
+  };
+  running.set(job.id, ctx);
+  db.setJobStatus(job.id, 'running', { startedAt: Date.now() });
+  publish(job.id, {
+    type: 'status', race: true, jobId: job.id,
+    message: `竞速任务开始：${job.rounds_total} 局（知识点 ${cfg.pointId || '自动'}，` +
+      (cfg.aimCostMode
+        ? `贴限模式，安全边距 ${Number(cfg.aimSafetyMs) >= 0 ? Number(cfg.aimSafetyMs) : 40}ms）`
+        : `提交延迟 ${cfg.answerDelayMinMs || 0}~${cfg.answerDelayMaxMs || 0}ms）`),
+    at: Date.now(),
+  });
+
+  runRaceLoop(job, cfg, ctx).catch((e) => {
+    const aborted = e && e.aborted === true;
+    const paused = ctx.paused;
+    db.setJobStatus(job.id, paused ? 'paused' : (aborted ? 'stopped' : 'failed'), {
+      finishedAt: Date.now(), error: (paused || aborted) ? null : e.message,
+    });
+    publish(job.id, {
+      type: 'status', race: true, jobId: job.id, finished: !paused,
+      message: paused ? '竞速已暂停' : (aborted ? '竞速已停止' : ('竞速任务异常：' + e.message)),
+      at: Date.now(),
+    });
+  }).finally(() => { running.delete(job.id); });
+
+  return { ok: true };
+}
+
+/** 竞速主循环：一局一局跑，每局落库 + 广播。 */
+async function runRaceLoop(job, cfg, ctx) {
+  const jobId = job.id;
+  let done = job.rounds_done || 0;
+  let failed = job.rounds_failed || 0;
+
+  const emit = (ev) => {
+    if (!ev || typeof ev !== 'object') return;
+    const e = Object.assign({}, ev, { race: true, jobId: jobId });
+    publish(jobId, e);
+    // 镜像到「竞速通道 0」：前端订阅 /api/race/stream 时能看到日志（按 jobId 过滤）
+    publish(0, Object.assign({}, e, { raceMirror: true, userId: job.user_id }));
+  };
+
+  // 年级解析：配置 0 = 用账号年级（grade 传 0 会让服务端返回空知识点列表，必须回落到有效值）
+  const leoAcc = db.getLeoAccount(job.leo_account_id);
+  const grade = Number(cfg.grade) > 0 ? Number(cfg.grade) : (Number(leoAcc && leoAcc.grade) || 2);
+  if (Number(cfg.grade) !== grade) {
+    emit({ type: 'ss-status', message: `年级未指定 → 用账号年级 ${grade}`, at: Date.now() });
+  }
+
+  // ★ 贴限模式（aimCostMode）：安全边距跨局自调 —— 未上榜加大、上榜后收紧逼近下限
+  let aimSafety = Number(cfg.aimSafetyMs) >= 0 ? Number(cfg.aimSafetyMs) : 40;
+
+  for (let i = done + 1; i <= job.rounds_total; i++) {
+    if (ctx.stopped) {
+      db.setJobStatus(jobId, ctx.paused ? 'paused' : 'stopped', {
+        finishedAt: Date.now(), roundsDone: done, roundsFailed: failed,
+      });
+      publish(jobId, {
+        type: 'status', race: true, jobId: jobId, finished: !ctx.paused,
+        message: ctx.paused
+          ? `已暂停（完成 ${done}/${job.rounds_total} 局，可点「继续」接着跑）`
+          : `已停止（完成 ${done}/${job.rounds_total} 局）`,
+        at: Date.now(),
+      });
+      return;
+    }
+
+    emit({ type: 'ss-round', round: i, message: `第 ${i}/${job.rounds_total} 局开始`, at: Date.now() });
+
+    let res;
+    try {
+      res = await schoolSeason.runOneRace(ctx.jar, {
+        pointId: cfg.pointId, questionCount: cfg.questionCount, grade: grade,
+        answerDelayMinMs: cfg.answerDelayMinMs, answerDelayMaxMs: cfg.answerDelayMaxMs,
+        aimCostMode: cfg.aimCostMode === true, aimSafetyMs: aimSafety,
+        useSample: cfg.useSample !== false,
+        battleMaxMs: cfg.battleMaxMs,
+      }, (ev) => emit(Object.assign({ round: i, at: Date.now() }, ev)), ctx.signal);
+    } catch (e) {
+      if (e && e.aborted === true) {
+        db.setJobStatus(jobId, ctx.paused ? 'paused' : 'stopped', {
+          finishedAt: Date.now(), roundsDone: done, roundsFailed: failed,
+        });
+        publish(jobId, {
+          type: 'status', race: true, jobId: jobId, finished: !ctx.paused,
+          message: ctx.paused
+            ? `已暂停（完成 ${done}/${job.rounds_total} 局，可点「继续」接着跑）`
+            : `已立即结束（完成 ${done}/${job.rounds_total} 局）`,
+          at: Date.now(),
+        });
+        return;
+      }
+      res = { ok: false, message: '异常：' + e.message, detail: '' };
+    }
+
+    if (res.ok) done++; else failed++;
+    db.addJobRound(jobId, i, res.ok, res.ok ? 200 : null,
+      res.message + (res.rank != null ? `（名次 ${res.rank}/8）` : ''),
+      res.detail || '');
+    db.setJobStatus(jobId, 'running', { roundsDone: done, roundsFailed: failed });
+    publish(jobId, {
+      type: res.ok ? 'ok' : 'fail', race: true, jobId: jobId, round: i,
+      message: `第 ${i} 局${res.ok ? '成功' : '失败'}：${res.message}`,
+      detail: res.detail, at: Date.now(),
+    });
+
+    // ★ 贴限反馈自调：未上榜（rank=999）→ 下局加大安全边距；
+    //   已上榜但不是榜一 → 缓慢收紧，逼近下限抢更前名次。
+    if (cfg.aimCostMode) {
+      if (res.aimAccepted === false) {
+        aimSafety = Math.min(600, aimSafety + 50);
+        emit({ type: 'ss-aim-adjust', message: `贴限自调：本局未上榜（${res.costTimeMs}ms 被判异常）→ 安全边距上调至 ${aimSafety}ms`, at: Date.now() });
+      } else if (res.aimAccepted === true && res.aimRank != null && Number(res.aimRank) > 1 && aimSafety > 20) {
+        aimSafety = Math.max(20, aimSafety - 10);
+        emit({ type: 'ss-aim-adjust', message: `贴限自调：榜单名次 ${res.aimRank} → 安全边距收紧至 ${aimSafety}ms（逼近下限）`, at: Date.now() });
+      }
+    }
+
+    // 连续失败太多就停
+    if (failed >= 5 && done === 0) {
+      db.setJobStatus(jobId, 'failed', {
+        finishedAt: Date.now(), roundsDone: done, roundsFailed: failed,
+        error: '连续失败过多（可能是登录态失效或活动已结束）',
+      });
+      publish(jobId, { type: 'status', race: true, jobId: jobId, message: '连续失败过多，已中止', at: Date.now() });
+      return;
+    }
+
+    // 局间间隔（可配）
+    if (i < job.rounds_total) {
+      const gapMin = Math.max(0, Number(cfg.gapMinMs) || 0);
+      const gapMax = Math.max(gapMin, Number(cfg.gapMaxMs) || 0);
+      const gap = gapMax > gapMin ? gapMin + Math.floor(Math.random() * (gapMax - gapMin)) : gapMin;
+      if (gap > 0) {
+        emit({ type: 'ss-gap', message: `等待 ${(gap / 1000).toFixed(1)}s 后开下一局`, at: Date.now() });
+        try { await require('./pk-engine').sleepAbortable(gap, ctx.signal); }
+        catch (e) {
+          if (e && e.aborted) {
+            db.setJobStatus(jobId, ctx.paused ? 'paused' : 'stopped', {
+              finishedAt: Date.now(), roundsDone: done, roundsFailed: failed,
+            });
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  db.setJobStatus(jobId, 'done', { finishedAt: Date.now(), roundsDone: done, roundsFailed: failed });
+  publish(jobId, {
+    type: 'status', race: true, jobId: jobId, finished: true,
+    message: `竞速任务完成：成功 ${done} / 失败 ${failed}`,
+    at: Date.now(),
+  });
+}
+
 /** 正在运行的任务数 / 上限（cap=0 表示不限制，UI 显示「2 个在跑」）。 */
 function runningCount() {
   const cap = Number(config.maxConcurrentJobs) || MAX_CONCURRENT;
@@ -549,6 +742,7 @@ module.exports = {
   MAX_CONCURRENT,
   startJob,
   startExerciseJob,
+  startRaceJob,
   stopJob,
   resumeJob,
   stopJobsByUser,
