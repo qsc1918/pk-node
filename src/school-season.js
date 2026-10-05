@@ -609,29 +609,35 @@ async function runOneRace(jar, cfg, onEvent, signal) {
     message: `活动主页 OK：知识点「${point.pointName}」(${point.pointId})，题数 ${questionCount}，session=${gameSessionId}`,
   });
 
-  // ★ 0.5) 贴限模式（aimCostMode）：读该榜**榜一**（= 上榜下限）→ 目标 costTime → 反推每题延迟。
+  // ★ 0.5) 贴限模式（aimCostMode）：读该榜**榜一** → 取整到 100 = 目标 costTime → 反推每题延迟。
   //
-  //   背景（2026-10-05 实测 + 客户口径确认）：每个榜有「上榜下限」，**就是该榜榜一的成绩**，
-  //   且各榜不同（2035=4900 / 2037·2038·2039=5600 / 2036=7000）。
-  //   低于它的成绩被判异常、不进榜（`self` 里表现为 rank=999 或干脆不出现）。
+  //   背景（2026-10-05，客户亲授口径）：
   //
-  //   ⚠️ 2026-10-05 二次修正：**必须精确取 `ranks[0]`（rank=1 那条）**，不要用
-  //   `Math.min(所有 costTime)` —— 后者在「榜一缺失 / 列表乱序 / 有并列」时会取错，
-  //   之前就因此把下限算歪过。榜一是服务端排好序的第一条，直接取它最可靠。
+  //   > 「每个榜单基本上都是 00 结尾的下限，直接踩着榜 1 的分然后看最后的是不是 00 就行了，
+  //   >   如果不是那我们就打 00 结尾的也可以超过榜一」
   //
-  //   模型（实测拟合，N=10 时误差 ±20ms）：costTime ≈ N × (delay + 184ms)
-  //   （184ms = 每题固定开销：广播/网络/服务端处理），→ delay = target / N - 184。
+  //   ⇒ **下限 = 榜一 costTime 向下取整到 100**：
+  //     - 榜一本身就整百（4900/5600/7000）→ 取整不变 = 正好踩线；
+  //     - 榜一不整百（如 5075）→ 取整到 4900，既 ≥ 真实下限（下限就是那个整百值）
+  //       又**超过榜一**（比它快，名次能进前面）。
+  //
+  //   ⚠️ 别再搞闭环迭代（我 2026-10-05 试过，踩了正反馈发散 + 符号反两个坑）。
+  //      开环公式一次就算准 —— 这是**已经验证过**的：
+  //
+  //         delay = 4900 / 10 - 184 = 306ms   →   实测 costTime = 4900   ✓
+  //
+  //      模型：costTime ≈ N × (delay + 184ms)（184ms = 每题固定开销）
   let aimInfo = null;
   let delayMinMs = cfg.answerDelayMinMs;
   let delayMaxMs = cfg.answerDelayMaxMs;
   if (cfg.aimCostMode) {
-    const safety = Number(cfg.aimSafetyMs) >= 0 ? Number(cfg.aimSafetyMs) : 0;
-    let base = null;
+    const round100 = (v) => Math.floor(Number(v) / 100) * 100;
+    let base = null;        // 榜一原始成绩
     let baseRank = null;
     try {
       const rk = await rank(jar, { pointId: point.pointId, scope: 1, signal });
       const ranks = (rk.json && rk.json.ranks) || [];
-      // ★ 直接取 rank=1 那条（服务端已按名次排好）；兜底才退到「第一条有 costTime 的」。
+      // 直接取 rank=1 那条（服务端已按名次排好）
       const first = ranks.find((x) => Number(x && x.rank) === 1 && Number(x.costTime) > 0)
         || ranks.find((x) => Number(x && x.costTime) > 0);
       if (first) {
@@ -643,24 +649,23 @@ async function runOneRace(jar, cfg, onEvent, signal) {
       base = Number(cfg.aimFallbackBaseMs) > 0 ? Number(cfg.aimFallbackBaseMs) : 4900;
       emit({ type: 'ss-aim', message: `贴限模式：本榜暂无可读榜一，用兜底下限 ${base}ms` });
     }
-    // 目标 = 榜一 + 安全边距。safety 默认 0（= 精确瞄准榜一）；
-    // 因为服务端计时有 ±几十毫秒抖动，留一点点余量能避免「差 1ms 被打回」。
-    const target = base + safety;
+    // ★ 目标 = 榜一向下取整到 100（= 服务端下限；若榜一不整百则同时超过榜一）
+    const target = round100(base) + (Number(cfg.aimSafetyMs) || 0);
     const overhead = Number(cfg.aimOverheadMs) > 0 ? Number(cfg.aimOverheadMs) : 184;
-    // ★ 闭环修正量（aimDelayAdjMs）：跨局累积的「每题延迟偏移」，
-    //   由 jobs 侧用上一局实测偏差算好后传进来（不进 target，避免正反馈）。
-    const adj = Number(cfg.aimDelayAdjMs) || 0;
-    const perQ = Math.max(0, Math.round((target / Math.max(1, questionCount)) - overhead + adj));
+    const perQ = Math.max(0, Math.round((target / Math.max(1, questionCount)) - overhead));
     delayMinMs = perQ;
     delayMaxMs = perQ;
     aimInfo = {
-      base: base, target: target, delayMs: perQ, safety: safety, overhead: overhead,
-      baseRank: baseRank, delayAdjMs: adj, questionCount: questionCount,
+      base: base, target: target, delayMs: perQ, overhead: overhead,
+      baseRank: baseRank, questionCount: questionCount,
+      // 记录「目标是否刚好等于榜一」（整百时成立），供 UI/日志说明
+      exact: target === base,
     };
     emit({
       type: 'ss-aim',
-      message: `贴限模式：榜一（rank=${baseRank == null ? 1 : baseRank}）${base}ms → 目标 ${target}ms ` +
-        `→ 每题延迟 ${perQ}ms（${questionCount} 题${adj ? `，闭环修正 ${adj > 0 ? '+' : ''}${adj}ms/题` : ''}）`,
+      message: `贴限模式：榜一（rank=${baseRank == null ? 1 : baseRank}）${base}ms → 取整到 100 → 目标 ${target}ms ` +
+        `（${target === base ? '正好踩线' : `低于榜一 ${base - target}ms，可超过榜一`}）` +
+        ` → 每题延迟 ${perQ}ms（${questionCount} 题）`,
     });
   }
 
