@@ -79,8 +79,56 @@ function start(port) {
     let settled = false;
     const done = (r) => { if (!settled) { settled = true; resolve(r); } };
 
-    const proc = spawn(av.path, ['tunnel', '--url', target, '--no-autoupdate'], {
-      env: process.env,
+    // ★★★ 2026-10-05 定案：DNS 问题**已在二进制层面解决**，这里无需任何 hack。
+    //
+    // ## 历史（三条死路，别再走）
+    //
+    // cloudflared 官方 `linux-arm64` 是 **GOOS=linux 纯静态**构建，DNS 用 Go 自己的
+    // resolver，**只读 `/etc/resolv.conf`** —— 而 Android 没有这个文件（`/` 是 erofs
+    // 只读、`/etc` 是只读软链，**连 root 都 remount 不了**）。它于是退化到查本机 `:53`：
+    //   `lookup api.trycloudflare.com on [::1]:53: connection refused`
+    //
+    // 为此走过的三条死路（**全部实测失败**）：
+    //   ① 写 `/etc/resolv.conf` —— 只读分区，写不进去；
+    //   ② `--dns-resolver-addrs` / `TUNNEL_DNS_RESOLVER_ADDRS` —— 只作用于
+    //      `tunnel run`（命名隧道），**对 quick tunnel 无效**（实测仍报原错误）；
+    //   ③ `HTTPS_PROXY` + 自建 CONNECT 代理 —— cloudflared **不遵循任何代理环境变量**
+    //      （给它一个必然连不上的坏代理，它照样成功 ⇒ 那条代码路径根本没走）。
+    //
+    // ## 正解（已落地在 `bin/get-cloudflared.sh`）
+    //
+    // 换成 **Termux 的 `GOOS=android` 构建**：它的 DNS 走 bionic 的 `getaddrinfo`
+    // → netd 的 `dnsproxyd` socket（`/dev/socket/dnsproxyd` 属 `inet` 组，
+    // **所有 App 都在这个组里**）⇒ **不需要 root、不需要改系统文件、任何设备都能用**。
+    // 这正是「Termux 里不 root 也能用」的原因。
+    //
+    // 所以这里只管启动，DNS 交给二进制自己（它知道怎么问 Android）。
+    const args = [
+      'tunnel', '--url', target, '--no-autoupdate',
+      // 避免优先走 IPv6（部分网络下 IPv6 到 Cloudflare 边缘不稳）。
+      '--edge-ip-version', '4',
+      // QUIC 默认 `auto` 可能选 UDP；http2 走 TCP 更可靠。
+      '--protocol', 'http2',
+    ];
+    // 环境变量：把代理相关全清掉（避免上层环境里残留的代理影响直连）。
+    const env = { ...process.env };
+    for (const k of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']) {
+      delete env[k];
+    }
+    spawnTunnel(av, args, env, done);
+  });
+}
+
+
+
+/**
+ * 启动 cloudflared 进程并解析输出。
+ *
+ * 抽出来是为了让 start() 的流程更清晰（参数/环境准备 vs 进程与输出）。
+ */
+function spawnTunnel(av, args, env, done) {
+    const proc = spawn(av.path, args, {
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     state.proc = proc;
@@ -94,8 +142,8 @@ function start(port) {
         if (m && !state.url) {
           state.url = m[1];
           done({ ok: true, url: state.url });
-        }
       }
+    }
     };
     proc.stdout.on('data', onChunk);
     proc.stderr.on('data', onChunk);
@@ -117,7 +165,6 @@ function start(port) {
     setTimeout(() => {
       done({ ok: !!state.url, url: state.url, message: state.url ? undefined : '等待公网地址超时（20s），请看日志' });
     }, 20000);
-  });
 }
 
 /** 停止隧道。 */
@@ -132,3 +179,10 @@ function stop() {
 }
 
 module.exports = { available, status, start, stop };
+
+// ★ 2026-10-05：本文件曾尝试过三种 DNS 绕过方案（写 resolv.conf / HTTPS_PROXY 代理 /
+// `--dns-resolver-addrs`），**全部实测失败**（原因见 start() 里的完整记录）。
+//
+// 最终方案在**二进制层面**：把 cloudflared 换成 Termux 的 `GOOS=android` 构建
+// （DNS 走 bionic → netd，App 天生可用）。下载/换装脚本：`bin/get-cloudflared.sh`。
+// 所以 `src/tunnel.js` 现在很干净 —— 只管启动，不碰 DNS。

@@ -4,6 +4,7 @@
  */
 
 const path = require('node:path');
+const fs = require('node:fs');
 const os = require('node:os');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -127,8 +128,26 @@ const config = {
   /** 是否默认启用 cloudflared 穿透（也可在网页里勾选开关）。 */
   tunnelByDefault: process.env.PK_TUNNEL === '1',
 
-  /** cloudflared 可执行文件路径（不存在时会提示下载）。 */
-  cloudflaredPath: process.env.PK_CLOUDFLARED || path.join(ROOT, 'bin', 'cloudflared'),
+  /**
+   * cloudflared 可执行文件路径。
+   *
+   * # 为什么要有两个候选（Android 特有）
+   *
+   * Android 10+ 的 **W^X + SELinux** 下，App 私有目录（`files/`）里的文件
+   * 标签是 `app_data_file` —— **App 自己的进程不能执行它**。
+   * 真机实测：`spawn .../files/pk-node/bin/cloudflared → EACCES`；
+   * 用 `runcon u:r:untrusted_app` 直接验证也是 Permission denied。
+   *
+   * 而 APK 的 `nativeLibraryDir`（`/data/app/.../lib/arm64`）标签是
+   * `apk_data_file` —— **可执行**。内置 node 就是这么跑起来的（`libnode.so`）。
+   *
+   * 所以 App 把 cloudflared 打包成 `jniLibs/arm64-v8a/libcloudflared.so`，
+   * 安装器会把它解压到 nativeLibraryDir（由 App 通过 PK_NATIVE_LIB_DIR 告知），
+   * 这里优先用它。找不到才回落到开发环境用的 `bin/cloudflared`。
+   *
+   * 优先级：`PK_CLOUDFLARED` 环境变量 > nativeLibraryDir > `bin/cloudflared`。
+   */
+  cloudflaredPath: resolveCloudflaredPath(),
 };
 
 /** 是否监听在「所有网卡」= 局域网/公网能访问。用于启动横幅提示与登录限流强度。 */
@@ -255,3 +274,19 @@ config.linkToken = process.env.PK_LINK_TOKEN || require('node:crypto').randomByt
 config.linkTokenIsRandom = !process.env.PK_LINK_TOKEN;
 
 module.exports = { config, PK, DEFAULT_HOST, lanAddresses };
+
+/**
+ * 按优先级挑一个 cloudflared 路径。
+ *
+ * 注意：这里只挑「首选路径」，**是否存在由 tunnel.js 的 available() 判断**
+ * （那里还会兜底查 PATH，并给出下载提示）。
+ */
+function resolveCloudflaredPath() {
+  if (process.env.PK_CLOUDFLARED) return process.env.PK_CLOUDFLARED;
+  const nativeDir = process.env.PK_NATIVE_LIB_DIR;
+  if (nativeDir) {
+    const p = path.join(nativeDir, 'libcloudflared.so');
+    if (fs.existsSync(p)) return p;
+  }
+  return path.join(ROOT, 'bin', 'cloudflared');
+}

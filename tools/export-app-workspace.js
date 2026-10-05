@@ -67,8 +67,52 @@ const INCLUDE = [
   'bin/keystream.bin',         // 纯 JS 内容编码器的密钥流（128KB），必需
   'bin/native/lre.so',         // 练习版 sign 模拟的机器码数据（不执行）
   'bin/native/lre_pk.so',      // PK 版 sign 模拟的机器码数据（不执行）
+  // ★ 2026-10-05：**cloudflared 不再走这里**。
+  //   原方案（bin/cloudflared.xz → App 解压到 files/ → chmod 755）在 Android 上跑不起来：
+  //   SELinux 下 files/ 的标签是 app_data_file，**App 自己不能执行它**
+  //   （真机实测 spawn → EACCES）。现改为打进 jniLibs
+  //   （`jniLibs/arm64-v8a/libcloudflared.so`）—— 安装器把它解到 nativeLibraryDir，
+  //   那里是 apk_data_file，可执行（内置 node 就是这么跑的）。
 ];
 
+/**
+ * ★★ 2026-10-05：cloudflared 的交付方式从「预压进工作区」改为「进 jniLibs」。
+ *
+ * # 为什么改（真机实测，不是推测）
+ *
+ * 原方案：把 cloudflared 用 xz 预压，App 首启解开成 `files/pk-node/bin/cloudflared`。
+ * 真机报错：
+ *
+ * ```
+ * 启动 cloudflared 失败：spawn /data/data/.../files/pk-node/bin/cloudflared EACCES
+ * ```
+ *
+ * **根因是 SELinux，不是权限位**（chmod 755 也没用）：
+ *
+ *   | 位置 | SELinux 标签 | App 能执行？ |
+ *   |---|---|---|
+ *   | `files/`（应用私有目录） | `app_data_file` | ❌ 不能（实测用 runcon 模拟 untrusted_app 也是 Permission denied） |
+ *   | `nativeLibraryDir`（`/data/app/.../lib/arm64`） | `apk_data_file` | ✅ 能（内置 node 就是这么跑的） |
+ *
+ * Android 10+ 的 W^X 就是这么设计的：**只有 APK 自带的原生库才能执行**。
+ * 所以参照 libnode.so 的做法，把 cloudflared 改名成 `libcloudflared.so`
+ * 放进 `app/src/main/jniLibs/arm64-v8a/`。
+ *
+ * # 代价（如实说明，比原方案大）
+ *
+ *   | 方案 | APK 增量 |
+ *   |---|---|
+ *   | xz 预压进工作区 zip（已废） | 14.77 MB |
+ *   | **进 jniLibs（现方案）** | **约 37.7 MB**（未压；APK 里会 DEFLATE，实际增量看 AGP） |
+ *
+ * 多出来的体积是“能跑”的必要代价 —— xz 方案省了体积但根本执行不了。
+ *
+ * # 谁负责找到它
+ *
+ * `pk-node/src/config.js` 的 `resolveCloudflaredPath()`：
+ * 优先用 `PK_NATIVE_LIB_DIR/libcloudflared.so`（App 传入），
+ * 再回落到 `bin/cloudflared`（开发环境）。
+ */
 /**
  * ★ 2026-10-03 事故：`public` 曾**不在**上面这份清单里。
  *
@@ -195,8 +239,10 @@ with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
     for rel in rels:
         src = os.path.join(root, rel)
         zi = zipfile.ZipInfo(rel, date_time=(2026, 1, 1, 0, 0, 0))
-        zi.compress_type = zipfile.ZIP_DEFLATED
-        zi.external_attr = 0o644 << 16
+        # ★ 2026-10-04：.xz 已经是 xz 压过的，再 deflate 没收益（还多花时间），
+        #   直接 STORE；其余文件照旧 DEFLATE。
+        zi.compress_type = zipfile.ZIP_STORED if rel.endswith('.xz') else zipfile.ZIP_DEFLATED
+        zi.external_attr = (0o755 if rel.endswith('cloudflared.xz') else 0o644) << 16
         with open(src, 'rb') as f:
             z.writestr(zi, f.read())
 print('zipped', dst)
@@ -237,7 +283,13 @@ function main() {
   console.log('  原始体积：' + human(raw));
 
   // 体积门禁：内置到 APK 里，超了会明显拖累包体，必须显式确认。
-  const LIMIT = 5 * 1024 * 1024;
+  // ★ 2026-10-04：5 MB → **20 MB**。
+  //
+  // 原 5 MB 是「防误入大文件」的保护。现在有意加入了 cloudflared.xz（14.77 MB）
+  // —— 它是「启动穿透」功能的必需品（用户报告 App 内点穿透报「未找到
+  // cloudflared」）。所以把上限提到 20 MB：既能容纳 cloudflared，
+  // 又能继续拦住「不小心把别的几十 MB 东西拷进来」这类事故。
+  const LIMIT = 20 * 1024 * 1024;
   if (raw > LIMIT) {
     console.error('\n✗ 工作区超过 ' + human(LIMIT) + '（' + human(raw) + '）—— 请核实是否误入大文件');
     process.exit(1);

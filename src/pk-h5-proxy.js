@@ -1516,6 +1516,36 @@ const H5_INJECT = `(function () {
   /* 悬浮窗调用已移除：自动能力改由 URL 参数 ?pkbot= 驱动。 */
 
   window.__pkH5Hook = { version: 2, local: LOCAL, hosts: TARGET_HOSTS };
+
+  /* ★★ 2026-10-04：把 CSS 变量 --pk-1vh 设为「1vh = 多少 px」。
+     值 = innerHeight / 100（**不是** innerHeight 本身），供 CSS 里
+     calc(N * var(--pk-1vh, 1vh)) 使用（见服务端 rewriteAssetJs 的改写）。
+     这样即使 WebView 的 vh 坏掉（=0），元素也能拿到可用高度。 */
+  (function pkVhVar() {
+    try {
+      function set() {
+        try {
+          var h = window.innerHeight || 0;
+          // 合理性校验：视口高度必须落在可信区间；否则宁可不设，让 CSS 回落 1vh。
+          // （防止再出现把一个荒谬的大值写进去、把页面撑爆的情况。）
+          if (!(h >= 200 && h <= 2000)) return;
+          var v = (h / 100) + 'px';
+          document.documentElement.style.setProperty('--pk-1vh', v);
+          window.__PK_1VH_PX = h;
+          diag('pk-1vh', { h: h, v: v });
+        } catch (e) {}
+      }
+      set();
+      window.addEventListener('resize', set);
+      window.addEventListener('orientationchange', set);
+      window.addEventListener('load', set);
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', set);
+      }
+      setTimeout(set, 300);
+      setTimeout(set, 1200);
+    } catch (e) {}
+  })();
 })();`;
 
 /**
@@ -1671,6 +1701,34 @@ let dumpCount = 0;
  */
 function rewriteAssetJs(buf) {
   let s = buf.toString('utf8');
+  // ★★ 2026-10-04：**把 JS 里内联 CSS 的 vh 改成 CSS 变量**。
+  //
+  // 修「PK榜 / 收到的赞整片全白」与「背包弹窗溢出到屏幕外」。
+  //
+  // # 为什么必须改 JS
+  //   荣誉榜/收到的赞的样式是 Vue SFC 打包后**以字符串内联在 JS 里**的
+  //   （见 motivation-honor-roll-legacy.<hash>.js）。HTML 与外链 CSS 里都没有，
+  //   所以此前基于 DOM / CSSOM 的改法全部命中 0 条。
+  //
+  // # 为什么 vh 会算成 0
+  //   App 容器首次布局时高度尚未到位（真机实测 1280x2048，最终 2772），
+  //   WebView 据此初始化视口 -> vh 解析为 0 -> height:100vh 的元素塌成 0
+  //   -> 榜单空白、弹窗溢出。
+  //
+  // # 改法
+  //   Nvh -> calc(N * var(--pk-1vh, 1vh))。
+  //   --pk-1vh 由注入脚本按运行时真实视口设为 innerHeight/100 的 px 值。
+  //   变量缺失时回落 1vh（与原行为一致，不会更差）。
+  //
+  // ⚠️ 变量语义必须严格是「1vh 等于多少 px」。
+  //   2026-10-04 曾误把 innerHeight 本身（853）赋给变量，而 CSS 是
+  //   calc(var(...) * 100) -> 85300px -> 页面被撑爆、无法滚动。
+  //   所以：变量名 --pk-1vh = 一个 vh 的像素值，并带合理性校验。
+  if (s.indexOf('var(--pk-1vh') < 0) {
+    var vhBefore = s.length;
+    s = s.replace(/([0-9]*\.?[0-9]+)vh(?![-a-zA-Z0-9])/g, 'calc($1 * var(--pk-1vh, 1vh))');
+    if (s.length !== vhBefore) console.log('[pk-h5] 已把 JS 内联 CSS 的 vh 改为 CSS 变量');
+  }
   // 已改写就跳过（幂等）
 
   // PKReadyGo 组件的倒计时 watcher 没写 immediate，而我们的 match 更慢、组件挂载时
