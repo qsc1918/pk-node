@@ -212,6 +212,16 @@ label em.hint {
 .item .meta { color: var(--fg-dim); font-size: 12px; }
 .item .actions { margin-left: auto; display: flex; gap: 6px; }
 
+/* 设备链池的分组标题（系统内置 / 自建 …） */
+.dc-group-head {
+  font-size: 12px;
+  color: var(--fg-dim);
+  padding: 10px 2px 2px;
+  border-top: 1px solid var(--line);
+  margin-top: 4px;
+}
+.dc-group-head:first-child { border-top: none; margin-top: 0; padding-top: 0; }
+
 .badge {
   display: inline-block;
   font-size: 11px;

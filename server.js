@@ -650,6 +650,9 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
       enabled: !!x.enabled,
       names: (x.cookies || []).map((c) => c.name),
       bytes: JSON.stringify(x.cookies || []).length,
+      // 归属组织：内置池 = '系统内置'，用户自建 = null
+      org: x.org == null ? null : String(x.org),
+      builtin: Number(x.builtin || 0) === 1,
       // 被几个账号「指定使用」（不含走自动轮换的）
       useCount: Number(usage[String(x.id)] || 0),
     }));
@@ -1050,13 +1053,21 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
 
   /* -------------------------- 隧道 -------------------------- */
 
+  // ★ 穿透（Cloudflare 隧道）会把本服务暴露到公网，属高风险运维操作，
+  //   仅管理员可用。非管理员连状态查询也一并拒绝 —— 状态里含隧道公网地址
+  //   与 cloudflared 运行日志，不应让普通用户看到。
   if (p === '/api/tunnel' && method === 'GET') {
+    if (!user || user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
     return sendJson(res, 200, { ok: true, tunnel: tunnel.status() });
   }
 
   if (p === '/api/tunnel' && method === 'POST') {
+    if (!user || user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
     const b = await readJson(req);
-    if (b.action === 'stop') return sendJson(res, 200, tunnel.stop());
+    if (b.action === 'stop') {
+      db.audit(user.id, 'tunnel_stop', '停止穿透', clientIp(req));
+      return sendJson(res, 200, tunnel.stop());
+    }
     const r = await tunnel.start(config.port);
     db.audit(user.id, 'tunnel_start', r.ok ? r.url : r.message, clientIp(req));
     return sendJson(res, r.ok ? 200 : 400, r);
