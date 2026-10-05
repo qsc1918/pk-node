@@ -1073,6 +1073,9 @@ $('dc-list').addEventListener('click', onDeviceChainListClick);
 /* ---------------------------- 穿透页 ---------------------------- */
 
 async function loadTunnel() {
+  // 纵深防御：穿透仅管理员可用。导航按钮已由 .admin-only 隐藏，
+  // 这里再挡一次（例如会话加载后角色变化、或直接调用 loadTunnel）。
+  if (!state.user || state.user.role !== 'admin') return;
   try {
     const r = await api('/api/tunnel');
     const t = r.tunnel;
