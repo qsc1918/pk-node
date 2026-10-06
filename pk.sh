@@ -5,9 +5,12 @@
 #  用法：
 #    ./pk.sh               启动私服（等价 ./pk.sh start）
 #    ./pk.sh start         启动（后台运行，端口被占自动往后找）
-#    ./pk.sh stop          停止
+#    ./pk.sh serve         ★ 开启公网入口，拿到 https://xxx.trycloudflare.com
+#    ./pk.sh tunnel [..]   公网入口管控：start / stop / status / log
+#    ./pk.sh addr          只打印当前公网地址（给脚本用）
+#    ./pk.sh stop          停止（连公网入口一起关）
 #    ./pk.sh restart       重启
-#    ./pk.sh status        查看运行状态
+#    ./pk.sh status        查看运行状态（含公网地址）
 #    ./pk.sh log           跟踪日志（Ctrl-C 退出）
 #    ./pk.sh open          浏览器打开管理后台
 #    ./pk.sh push [说明]   提交并推送到 GitHub
@@ -31,6 +34,11 @@ RUN_DIR="$ROOT/run"
 LOG="$RUN_DIR/pk-node.log"
 PIDFILE="$RUN_DIR/pk-node.pid"
 PORTFILE="$RUN_DIR/pk-node.port"
+# 隧道（私服公网入口）相关
+TUNNEL_LOG="$RUN_DIR/tunnel.log"
+TUNNEL_PIDFILE="$RUN_DIR/tunnel.pid"
+TUNNEL_URLFILE="$RUN_DIR/tunnel.url"
+CLOUDFLARED="$ROOT/bin/cloudflared"
 DEFAULT_PORT="${PK_PORT:-8792}"
 
 # ---------- 颜色（非 tty 自动关闭）----------
@@ -200,6 +208,19 @@ cmd_start() {
 cmd_stop() {
   local pid port stopped=0
 
+  # 公网入口要一起关 —— 否则隧道还指向一个已停的服务，
+  # 外部访问会拿到 502，而且临时域名会一直被占着。
+  if tunnel_running; then
+    local tp; tp="$(tunnel_pid)"
+    info "正在关闭公网入口 pid $tp ..."
+    kill "$tp" 2>/dev/null || true
+    local j
+    for j in $(seq 1 20); do pid_alive "$tp" || break; sleep 0.2; done
+    pid_alive "$tp" && kill -9 "$tp" 2>/dev/null || true
+    rm -f "$TUNNEL_PIDFILE" "$TUNNEL_URLFILE"
+    stopped=1
+  fi
+
   pid="$(read_pid)" || true
   if [ -n "${pid:-}" ] && pid_alive "$pid"; then
     info "正在停止 pid $pid ..."
@@ -278,6 +299,15 @@ cmd_status() {
     printf '    启动      : ./pk.sh start\n'
   fi
 
+  # 隧道状态（私服标志：有没有公网入口）
+  if tunnel_running; then
+    printf '\n    公网入口  : %s已开启%s (pid %s)\n' "$C_OK" "$C_0" "$(tunnel_pid)"
+    printf '    公网地址  : %s\n' "$(tunnel_url 2>/dev/null || echo '解析中…')"
+  else
+    printf '\n    公网入口  : %s未开启%s\n' "$C_DIM" "$C_0"
+    printf '    开启      : ./pk.sh serve   %s（拿一个公网地址）%s\n' "$C_DIM" "$C_0"
+  fi
+
   # git 概况（不打印 remote，避免泄露 token）
   if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
     local branch dirty ahead
@@ -300,6 +330,168 @@ cmd_open() {
   local port; port="$(detect_port 2>/dev/null || echo "$DEFAULT_PORT")"
   local url="http://127.0.0.1:$port/"
   if open_browser "$url"; then ok "已打开 $url"; else warn "无法自动打开，请手动访问 $url"; fi
+}
+
+# ==============================================================================
+#  私服：公网入口（Cloudflare 快速隧道）
+# ==============================================================================
+#
+#  「私服」的关键不是绑 0.0.0.0，而是**别人在公网上能连到**。
+#  这里用 cloudflared 快速隧道（免账号），起完拿到 https://xxx.trycloudflare.com。
+#  注意：进程停即失效，域名每次随机；地址本身无鉴权，任何拿到的人都能打开登录页。
+#       所以暴露前务必改掉默认 admin/admin（见 README 第七节）。
+# ==============================================================================
+
+tunnel_available() {
+  [ -x "$CLOUDFLARED" ] && return 0
+  command -v cloudflared >/dev/null 2>&1 && return 0
+  return 1
+}
+
+tunnel_bin() {
+  if [ -x "$CLOUDFLARED" ]; then printf '%s' "$CLOUDFLARED"; else command -v cloudflared; fi
+}
+
+tunnel_pid() {
+  [ -f "$TUNNEL_PIDFILE" ] || return 1
+  local p; p="$(tr -dc '0-9' < "$TUNNEL_PIDFILE" 2>/dev/null)"
+  [ -n "$p" ] || return 1
+  printf '%s' "$p"
+}
+
+tunnel_running() {
+  local p; p="$(tunnel_pid)" || return 1
+  pid_alive "$p"
+}
+
+# 公网地址：优先读文件，退回扫日志
+tunnel_url() {
+  if [ -f "$TUNNEL_URLFILE" ]; then
+    local u; u="$(cat "$TUNNEL_URLFILE" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "$u" ] && { printf '%s' "$u"; return 0; }
+  fi
+  [ -f "$TUNNEL_LOG" ] || return 1
+  local u
+  u="$(grep -oE 'https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com' "$TUNNEL_LOG" 2>/dev/null | tail -1)"
+  [ -n "$u" ] || return 1
+  printf '%s' "$u" > "$TUNNEL_URLFILE"
+  printf '%s' "$u"
+}
+
+# 起隧道（需先把服务起起来）
+cmd_serve() {
+  cd "$ROOT" || die "无法进入项目目录：$ROOT"
+
+  if ! is_running; then
+    info "服务还没起，先启动它"
+    cmd_start || return 1
+    info ""
+  fi
+
+  if ! tunnel_available; then
+    err "未找到 cloudflared（$CLOUDFLARED）"
+    info "    下载它：sh bin/get-cloudflared.sh"
+    return 1
+  fi
+
+  if tunnel_running; then
+    warn "隧道已在运行（pid $(tunnel_pid)）"
+    info "    公网地址: $(tunnel_url 2>/dev/null || echo '解析中…')"
+    return 0
+  fi
+
+  local port; port="$(detect_port 2>/dev/null || echo "$DEFAULT_PORT")"
+  local bin; bin="$(tunnel_bin)"
+
+  info "${C_B}==> 开启公网入口（Cloudflare 快速隧道）${C_0}"
+  info "    转发 : http://127.0.0.1:$port"
+  info "    日志 : $TUNNEL_LOG"
+
+  : > "$TUNNEL_LOG"
+  rm -f "$TUNNEL_URLFILE"
+  # 参数与 src/tunnel.js 保持一致：
+  #   --edge-ip-version 4  避免部分网络下 IPv6 到 CF 边缘不稳
+  #   --protocol http2     QUIC 默认 auto 可能选 UDP，http2 走 TCP 更可靠
+  # 代理环境变量要清掉（cloudflared 不遵循它们，留着反而干扰直连）。
+  env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy \
+    nohup "$bin" tunnel --url "http://127.0.0.1:$port" --no-autoupdate \
+      --edge-ip-version 4 --protocol http2 >>"$TUNNEL_LOG" 2>&1 &
+  local tpid=$!
+  printf '%s' "$tpid" > "$TUNNEL_PIDFILE"
+
+  info "    等待分配公网地址 ..."
+  local i u
+  for i in $(seq 1 60); do
+    if ! pid_alive "$tpid"; then
+      err "隧道进程已退出，日志尾部："
+      tail -n 20 "$TUNNEL_LOG" 2>/dev/null | sed 's/^/    /' >&2
+      rm -f "$TUNNEL_PIDFILE"
+      return 1
+    fi
+    u="$(tunnel_url)" || true
+    if [ -n "${u:-}" ]; then
+      info ""
+      ok "私服已在公网可用"
+      printf '\n  %s公网地址: %s%s\n' "$C_B" "$u" "$C_0"
+      # 就绪信号以 cloudflared 自己为准：它连上 Cloudflare 边缘后会打
+      # `Registered tunnel connection`。这比在本机 curl 自测可靠 ——
+      # 本机 DNS 可能被容器/vpn 劫持，拿不到真地址，会误报失败。
+      local k
+      for k in $(seq 1 25); do
+        grep -q 'Registered tunnel connection' "$TUNNEL_LOG" 2>/dev/null && { info "  ${C_DIM}（隧道已连上 Cloudflare 边缘）${C_0}"; break; }
+        sleep 1
+      done
+      info ""
+      info "  ${C_WARN}⚠ 地址无鉴权，拿到就能打开登录页；务必先改掉默认 admin/admin${C_0}"
+      info "  ${C_DIM}停止: ./pk.sh tunnel stop    临时地址，进程停即失效${C_0}"
+      return 0
+    fi
+    sleep 1
+  done
+
+  err "等待公网地址超时（60s），日志尾部："
+  tail -n 20 "$TUNNEL_LOG" 2>/dev/null | sed 's/^/    /' >&2
+  return 1
+}
+
+cmd_tunnel() {
+  local a="${1:-start}"
+  case "$a" in
+    start|up|on)   cmd_serve ;;
+    stop|down|off)
+      if tunnel_running; then
+        local p; p="$(tunnel_pid)"
+        info "正在停止隧道 pid $p ..."
+        kill "$p" 2>/dev/null || true
+        local i
+        for i in $(seq 1 20); do pid_alive "$p" || break; sleep 0.2; done
+        pid_alive "$p" && kill -9 "$p" 2>/dev/null || true
+        ok "隧道已停止"
+      else
+        warn "隧道没在运行"
+      fi
+      rm -f "$TUNNEL_PIDFILE" "$TUNNEL_URLFILE"
+      ;;
+    status|st)
+      if tunnel_running; then
+        ok "隧道运行中（pid $(tunnel_pid)）"
+        info "    公网地址: $(tunnel_url 2>/dev/null || echo '解析中…')"
+      else
+        info "隧道未运行"
+        info "    开启: ./pk.sh serve"
+      fi
+      ;;
+    log|logs)
+      [ -f "$TUNNEL_LOG" ] || die "还没有隧道日志（先 ./pk.sh serve）"
+      tail -n 60 -f "$TUNNEL_LOG"
+      ;;
+    *) err "用法：./pk.sh tunnel [start|stop|status|log]"; return 1 ;;
+  esac
+}
+
+# 取公网地址（给脚本串联用；没有就空输出）
+cmd_addr() {
+  tunnel_url 2>/dev/null || true
 }
 
 # ==============================================================================
@@ -406,10 +598,14 @@ cmd_all() {
 }
 
 cmd_help() {
-  sed -n '3,24p' "$ROOT/pk.sh" | sed 's/^# \{0,1\}//'
+  sed -n '3,27p' "$ROOT/pk.sh" | sed 's/^# \{0,1\}//'
   info ""
   info "  默认端口 ${DEFAULT_PORT}（被占用自动往后找 40 个）；环境变量 PK_PORT / PK_HOST 可改。"
   info "  PK_YES=1 跳过发布确认；PK_NO_OPEN=1 启动后不自动开浏览器。"
+  info ""
+  info "  ${C_B}私服要点${C_0}：./pk.sh serve 会调 cloudflared 开一条快速隧道，"
+  info "  拿到形如 https://xxx.trycloudflare.com 的${C_B}公网地址${C_0}，别人在任何网络都能连。"
+  info "  地址无鉴权 —— 暴露前先改掉默认 admin/admin。"
 }
 
 # ==============================================================================
@@ -427,6 +623,9 @@ main() {
     status|st)      cmd_status "$@" ;;
     log|logs)       cmd_log "$@" ;;
     open)           cmd_open "$@" ;;
+    serve|public|share) cmd_serve "$@" ;;
+    tunnel)         cmd_tunnel "$@" ;;
+    addr|url)       cmd_addr "$@" ;;
     push|upload)    cmd_push "$@" ;;
     tag|release)    cmd_tag "$@" ;;
     test|selftest)  cmd_test "$@" ;;
