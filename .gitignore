@@ -14,6 +14,8 @@ node_modules/
 # tools/make-release.js 的产物
 dist/
 *.log
+# ---- pk.sh / pk.bat 的运行时目录（pid / 端口 / 日志）----
+run/
 
 # ---- 编辑器 / 系统 ----
 .DS_Store

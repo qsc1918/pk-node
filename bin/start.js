@@ -10,7 +10,15 @@ const net = require('node:net');
 const path = require('node:path');
 // 与 server.js 共用同一份「默认监听地址」定义，避免两边漂移
 // （这里以前也硬编码了 127.0.0.1，会把暴露到局域网的路堵死）。
-const { DEFAULT_HOST, lanAddresses } = require('../src/config');
+//
+// ⚠️ 这个 require 必须放在**挑端口之前**，而且挑完必须回写 config.port。
+//    config.js 在 require 的那一刻就把 PK_PORT 读进了 `config.port`（一次快照）。
+//    之前这里只写 `process.env.PK_PORT = port`，以为 require server.js 时会重新读 ——
+//    但 config.js 已经被缓存，那个对象里的 port 永远是 8792。
+//    结果「首选端口被占 → 自动改 8793」时，横幅打 8793、服务却仍然去 listen 8792，
+//    实际报 EADDRINUSE 退出。也就是说自动避让一直是坏的（start.sh 同病）。
+//    现在改为挑定后**直接改 config.port**，这才是 server.js 实际读的那份值。
+const { config, DEFAULT_HOST, lanAddresses } = require('../src/config');
 
 const ROOT = path.resolve(__dirname, '..');
 
@@ -76,10 +84,16 @@ async function pickPort(start) {
       (process.platform === 'win32' ? 'set PK_PORT=9000 & start.bat' : 'PK_PORT=9000 ./start.sh'));
   }
   if (port !== DEFAULT_PORT) console.log('提示：' + DEFAULT_PORT + ' 已被占用，自动改用 ' + port);
-
-  // 必须在 require server.js 之前写回环境变量 —— config.js 在 require 时读 process.env。
+  // 必须同时写回两处：
+  //   1) process.env —— 供 server.js 之后才 require 的模块（如 tunnel.js 读 config.port 的路径）保持一致
+  //   2) config 对象 —— ★ 这才是 server.js 真正 listen 用的值，config.js 早已被缓存，改 env 不会影响它
   process.env.PK_PORT = String(port);
   process.env.PK_HOST = HOST;
+  config.port = port;
+  config.host = HOST;
+  // isExposed 是按 host 在 config.js 里算好的，host 变了要重算，否则
+  // 「只监听 127.0.0.1 却按公网暴露做限流」之类的判断会错。
+  config.isExposed = (HOST === '0.0.0.0' || HOST === '::' || HOST === '');
 
   console.log('== pk-node ==');
   console.log('node      : v' + process.versions.node);
