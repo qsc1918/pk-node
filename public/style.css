@@ -320,4 +320,24 @@ input.pick { width: auto; margin: 0; flex: none; accent-color: var(--accent); }
   max-width: 90vw;
 }
 .toast.err { border-color: var(--danger); color: #ffd9d9; }
+/* ----------------------------- 表格（私服页等） ----------------------------- */
+.tbl {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 10px;
+  font-size: 13px;
+}
+.tbl th, .tbl td {
+  padding: 6px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.tbl th {
+  color: var(--fg-dim);
+  font-weight: 500;
+  border-bottom: 1px solid var(--line-strong, var(--line));
+}
+.tbl tbody tr:hover { background: var(--bg-3); }
+.tbl td:first-child { color: var(--fg-dim); }
 .toast.ok { border-color: var(--ok); }

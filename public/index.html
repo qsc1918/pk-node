@@ -46,6 +46,7 @@
       <button class="nav-btn" data-tab="race">比赛竞速</button>
       <button class="nav-btn" data-tab="accounts">小猿账号</button>
       <button class="nav-btn" data-tab="jobs">任务</button>
+      <button class="nav-btn admin-only hidden" data-tab="localsever">私服</button>
       <button class="nav-btn admin-only hidden" data-tab="tunnel">穿透</button>
       <button class="nav-btn admin-only hidden" data-tab="admin">管理</button>
     </nav>
@@ -521,6 +522,50 @@
     <div class="card">
       <h2>任务明细</h2>
       <div id="job-detail" class="log tall"></div>
+    </div>
+  </main>
+
+  <!-- 穿透 -->
+  <main class="panel hidden" id="tab-localsever">
+    <div class="card">
+      <h2>pk-h5 私服</h2>
+      <p class="muted small">
+        <b>自己写业务逻辑</b>：H5 页面的出题、判分、结算、榜单全部由本服务生成，
+        <b>不访问小猿服务器</b>，不需要小猿账号。加密（H5 的 dataEncrypt/dataDecrypt）
+        由本机的设备口径实现完成，H5 无感知。
+      </p>
+      <p class="muted small">
+        关闭时走原来的<b>代理模式</b>：把 H5 请求转发到真实小猿服务器（需要小猿账号登录态）。
+        两种模式随时切换，互不影响数据。
+      </p>
+      <div class="row">
+        <button id="btn-ls-local" class="primary">切到私服模式</button>
+        <button id="btn-ls-proxy" class="ghost">切到代理模式</button>
+        <button id="btn-ls-test" class="ghost">跑一遍自测</button>
+        <button id="btn-ls-open" class="ghost">打开 PK 首页</button>
+      </div>
+      <p class="muted small">当前模式：<code id="ls-mode">（读取中）</code></p>
+      <div id="ls-testout" class="log"></div>
+    </div>
+    <div class="card">
+      <h2>题库与对局</h2>
+      <p class="muted small">
+        私服内置 7 个题型（加减法 / 乘除 / 混合运算）。每局的题由本服务现场生成，
+        答案只留在服务端 —— H5 交卷时按服务端的答案重判，<b>忽略页面自报的对错</b>。
+      </p>
+      <p class="muted small">
+        对局数：<code id="ls-matches">0</code>　
+        出题总数：<code id="ls-questions">0</code>　
+        已结算：<code id="ls-graded">0</code>
+      </p>
+      <div class="row">
+        <button id="btn-ls-refresh" class="ghost">刷新</button>
+        <button id="btn-ls-reset" class="ghost">清空私服数据</button>
+      </div>
+      <table class="tbl" id="ls-recent">
+        <thead><tr><th>对局</th><th>题型</th><th>题数</th><th>得分</th><th>耗时</th><th>结果</th></tr></thead>
+        <tbody></tbody>
+      </table>
     </div>
   </main>
 

@@ -21,6 +21,7 @@ const signLib = require('./src/sign');
 const strokes = require('./src/strokes');
 const exercise = require('./src/exercise');
 const pkH5 = require('./src/pk-h5-proxy');
+const pkH5Local = require('./src/pk-h5-localserver');
 const schoolSeason = require('./src/school-season');
 
 const PUBLIC_DIR = path.join(config.root, 'public');
@@ -453,6 +454,73 @@ function needAdmin(pathname) {
   return pathname.startsWith('/api/admin/');
 }
 
+/* --------------------------- pk-h5 私服模式 --------------------------- */
+
+/**
+ * 私服模式开关 —— 决定 H5 的业务请求由「我们自己的实现」应答还是转发到小猿。
+ *
+ * 优先级（高 → 低）：
+ *   1. URL 上的 `__local=1` / `__local=0`（H5 跳转时带上即可单页生效，便于对比调试）
+ *   2. 环境变量 `PK_H5_LOCAL`（`1`/`true` 开，`0`/`false` 强关）
+ *   3. 持久化设置 `data/pk-h5-mode.txt`（后台「私服」页切换）
+ *   4. 默认：关（保持原有代理行为，不改变既有用户的使用）
+ */
+let localModeCache = null;
+const MODE_FILE = path.join(config.root, 'data', 'pk-h5-mode.txt');
+
+function readModeFile() {
+  if (localModeCache !== null) return localModeCache;
+  try {
+    localModeCache = fs.readFileSync(MODE_FILE, 'utf8').trim() === 'local';
+  } catch (e) {
+    localModeCache = false;
+  }
+  return localModeCache;
+}
+
+function setLocalServerMode(on) {
+  localModeCache = !!on;
+  try {
+    fs.mkdirSync(path.dirname(MODE_FILE), { recursive: true });
+    fs.writeFileSync(MODE_FILE, localModeCache ? 'local' : 'proxy', 'utf8');
+  } catch (e) { /* 忽略：内存态仍然生效 */ }
+  return localModeCache;
+}
+
+function localServerMode(u) {
+  try {
+    const v = u && u.searchParams ? u.searchParams.get('__local') : null;
+    if (v === '1' || v === 'true') return true;
+    if (v === '0' || v === 'false') return false;
+  } catch (e) { /* ignore */ }
+  const env = String(process.env.PK_H5_LOCAL || '').toLowerCase();
+  if (env === '1' || env === 'true') return true;
+  if (env === '0' || env === 'false') return false;
+  return readModeFile();
+}
+
+/**
+ * 读原始请求体（Buffer）。私服的提交体是**设备口径密文**，不能当 JSON 解析，
+ * 所以必须拿原始字节。
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {number} [limit] 上限，默认 4MB
+ * @returns {Promise<Buffer>}
+ */
+function readRawBody(req, limit = 4 * 1024 * 1024) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let n = 0;
+    req.on('data', (c) => {
+      n += c.length;
+      if (n > limit) { resolve(Buffer.alloc(0)); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', () => resolve(Buffer.alloc(0)));
+  });
+}
+
 async function handleApi(req, res, u, user) {
   const p = u.pathname;
   const method = req.method.toUpperCase();
@@ -874,12 +942,145 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
   // `/api/pk/h5/api` —— 这里就是那个终点，用**该小猿账号**的 jar 补
   // sign/风控头后转发。
   if (p === '/api/pk/h5/api') {
+    // ★★ 私服模式：H5 的业务请求由**我们自己的实现**应答，不转发到小猿。
+    //
+    // 开关：`PK_H5_LOCAL=1`（或后台「私服」页切换，见 /api/localserver/*）。
+    // 与代理模式的区别：代理会把请求打到真实小猿服务器（需要真账号 cookie），
+    // 私服则就地生成数据 —— 出题/判分/榜单全是我们自己的。
+    //
+    // H5 hook 用 `X-PK-Path` 传真实路径（形如
+    // `xyks.yuanfudao.com/leo-game-pk/api/math/pk/home?grade=2`），
+    // 私服只关心路径部分，host 忽略（我们自己就是「服务器」）。
+    const wantLocal = localServerMode(u);
+    if (wantLocal) {
+      const raw = req.headers['x-pk-path'] || req.headers['X-PK-Path'] || '';
+      const slash = String(raw).indexOf('/');
+      const pathAndQuery = slash > 0 ? String(raw).slice(slash) : String(raw);
+      const body = await readRawBody(req);
+      const r = pkH5Local.handle({
+        method: req.method.toUpperCase(),
+        url: pathAndQuery || u.searchParams.get('path') || '/',
+        rawBody: body,
+      });
+      if (r) {
+        res.writeHead(r.status, Object.assign({
+          'Cache-Control': 'no-store',
+          // 私服不经过浏览器 CORS —— H5 是同源页面，这里只是显式声明一下。
+          'Access-Control-Allow-Origin': '*',
+        }, r.headers || {}));
+        res.end(r.body);
+        return;
+      }
+      // handle 返回 null = 路径不归私服管 → 落到下面的通用空应答，**绝不转发**。
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ code: 200, message: 'ok', data: {} }));
+      return;
+    }
+
     const leoId = Number(u.searchParams.get('leoAccountId') || 0);
     const acc = db.getLeoAccount(leoId);
     // 不要求「小猿账号属于当前管理后台用户」：H5 页面不带后台会话，否则业务请求全被拒。
     // 代理只用选定小猿账号的 cookie 出站，账号在库中存在即可。
     if (!acc) return sendJson(res, 404, { ok: false, message: '账号不存在' });
     return pkH5.proxyApi(req, res, u, { jar: jobs.jarOf(acc) });
+  }
+
+  /* -------------------- pk-h5 私服：模式与数据管理 -------------------- */
+
+  // 查询/切换私服模式。GET 查询（管理员），POST 切换（管理员）。
+  if (p === '/api/localserver/mode') {
+    if (!user || user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
+    if (method === 'GET') {
+      return sendJson(res, 200, {
+        ok: true,
+        mode: localServerMode(u) ? 'local' : 'proxy',
+        env: process.env.PK_H5_LOCAL || null,
+      });
+    }
+    if (method === 'POST') {
+      const b = await readJson(req);
+      const on = b.mode === 'local' || b.mode === true;
+      setLocalServerMode(on);
+      db.audit(user.id, 'localserver_mode', on ? '切换到私服' : '切换到代理', clientIp(req));
+      return sendJson(res, 200, { ok: true, mode: on ? 'local' : 'proxy' });
+    }
+  }
+
+  // 私服概览：题库、对局数、最近对局（管理员）。
+  if (p === '/api/localserver/overview' && method === 'GET') {
+    if (!user || user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
+    const st = pkH5Local.state();
+    const ids = Object.keys(st.matches);
+    return sendJson(res, 200, {
+      ok: true,
+      mode: localServerMode(u) ? 'local' : 'proxy',
+      stats: st.stats,
+      matchCount: ids.length,
+      topics: pkH5Local.TOPICS.map((t) => ({ pointId: t.pointId, name: t.name })),
+      recent: ids.slice(-20).reverse().map((id) => {
+        const m = st.matches[id];
+        return {
+          pkIdStr: id,
+          pointId: m.pointId,
+          pointName: m.pointName,
+          questionCnt: m.questionCnt,
+          submitted: !!m.submitted,
+          correctCnt: m.correctCnt || 0,
+          costTime: m.costTime || 0,
+          win: !!m.win,
+          createdAt: m.createdAt,
+        };
+      }),
+    });
+  }
+
+  // 清空私服数据（管理员）。
+  if (p === '/api/localserver/reset' && method === 'POST') {
+    if (!user || user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
+    pkH5Local.reset();
+    db.audit(user.id, 'localserver_reset', '清空私服数据', clientIp(req));
+    return sendJson(res, 200, { ok: true });
+  }
+
+  // 自测：跑一遍「出题 → 判分」闭环，确认加密链路可用（管理员）。
+  if (p === '/api/localserver/selftest' && method === 'POST') {
+    if (!user || user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
+    const out = [];
+    let ok = true;
+    try {
+      const m = pkH5Local.handle({ method: 'POST', url: '/leo-game-pk/api/math/pk/match/v2?pointId=2035', rawBody: Buffer.alloc(0) });
+      const paper = pkH5Local.open(m.body);
+      if (!paper || !paper.examVO || !paper.examVO.questions.length) throw new Error('出题解密失败');
+      out.push('出题 OK：' + paper.pkIdStr + ' / ' + paper.examVO.questions.length + ' 题 / 密文 ' + m.body.length + 'B');
+
+      const qs = paper.examVO.questions;
+      const body = {
+        pkIdStr: paper.pkIdStr,
+        examVO: {
+          questions: qs.map((q) => ({ questionId: q.questionId, content: q.content, userAnswer: q.answer, status: 3, script: '[]' })),
+          costTime: 6000,
+          correctCnt: 0,
+        },
+      };
+      const r = pkH5Local.handle({ method: 'PUT', url: '/leo-game-pk/api/math/pk/submit', rawBody: pkH5Local.seal(body) });
+      const rd = JSON.parse(r.body.toString());
+      if (rd.data.correctCnt !== qs.length) throw new Error('判分不符：' + rd.data.correctCnt + '/' + qs.length);
+      out.push('判分 OK：全对 ' + rd.data.correctCnt + '/' + rd.data.questionCnt + '，且忽略了 H5 谎报的 status/correctCnt');
+
+      // 第二卷：验证「错题判分」——用**新出的卷**（同一 pkIdStr 只能判一次）
+      const m2 = pkH5Local.handle({ method: 'POST', url: '/leo-game-pk/api/math/pk/match/v2?pointId=2036', rawBody: Buffer.alloc(0) });
+      const p2 = pkH5Local.open(m2.body);
+      const q2 = p2.examVO.questions;
+      const body2 = { pkIdStr: p2.pkIdStr, examVO: { questions: q2.map((q, i) => ({ questionId: q.questionId, content: q.content, userAnswer: i < 3 ? '###' : q.answer, script: '[]' })), costTime: 9000 } };
+      const r2 = pkH5Local.handle({ method: 'PUT', url: '/leo-game-pk/api/math/pk/submit', rawBody: pkH5Local.seal(body2) });
+      const rd2 = JSON.parse(r2.body.toString());
+      if (rd2.data.correctCnt !== q2.length - 3) throw new Error('错题判分不符：' + rd2.data.correctCnt);
+      out.push('错题 OK：故意错 3 题 → ' + rd2.data.correctCnt + '/' + rd2.data.questionCnt);
+    } catch (e) {
+      ok = false;
+      out.push('失败：' + e.message);
+    }
+    return sendJson(res, 200, { ok, lines: out });
   }
 
   /* -------------------------- PK 探测 -------------------------- */

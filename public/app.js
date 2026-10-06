@@ -211,7 +211,7 @@ $('btn-logout').addEventListener('click', async () => {
 document.querySelectorAll('.nav-btn').forEach((btn) => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.nav-btn').forEach((b) => b.classList.toggle('active', b === btn));
-    ['grind', 'pkpage', 'practice', 'race', 'accounts', 'jobs', 'tunnel', 'admin'].forEach((t) => {
+    ['grind', 'pkpage', 'practice', 'race', 'accounts', 'jobs', 'localsever', 'tunnel', 'admin'].forEach((t) => {
       $('tab-' + t).classList.toggle('hidden', t !== btn.dataset.tab);
     });
     const t = btn.dataset.tab;
@@ -221,6 +221,7 @@ document.querySelectorAll('.nav-btn').forEach((btn) => {
     if (t === 'accounts') { loadDeviceChains(); }
     if (t === 'accounts') { loadLeoAccounts(); }
     if (t === 'jobs') { loadJobs(); }
+    if (t === 'localsever') { loadLocalServer(); }
     if (t === 'tunnel') { loadTunnel(); }
     if (t === 'admin') { loadAdmin(); }
   });
@@ -1139,7 +1140,85 @@ $('prac-switch').addEventListener('click', switchPracticeSub);
 $('dc-add').addEventListener('click', addDeviceChain);
 $('dc-list').addEventListener('click', onDeviceChainListClick);
 
-/* ---------------------------- 穿透页 ---------------------------- */
+/* ---------------------------- 私服页 ---------------------------- */
+
+async function loadLocalServer() {
+  // 纵深防御：私服页仅管理员可用（导航按钮已由 .admin-only 隐藏）。
+  if (!state.user || state.user.role !== 'admin') return;
+  try {
+    const r = await api('/api/localserver/overview');
+    $('ls-mode').textContent = r.mode === 'local' ? '私服（自己出题判分）' : '代理（转发到小猿）';
+    $('ls-matches').textContent = r.matchCount;
+    $('ls-questions').textContent = (r.stats && r.stats.totalQuestions) || 0;
+    $('ls-graded').textContent = (r.stats && r.stats.totalMatches) || 0;
+    const tb = $('ls-recent').querySelector('tbody');
+    tb.innerHTML = '';
+    for (const m of r.recent || []) {
+      const tr = document.createElement('tr');
+      // 全部用 textContent 写入 —— 与项目其它地方一致，天然免疫 XSS。
+      const cells = [
+        m.pkIdStr,
+        m.pointName || '',
+        String(m.questionCnt),
+        m.submitted ? (m.correctCnt + '/' + m.questionCnt) : '—',
+        m.costTime ? (m.costTime + 'ms') : '—',
+        m.submitted ? (m.win ? '胜' : '负') : '未交卷',
+      ];
+      for (const v of cells) {
+        const td = document.createElement('td');
+        td.textContent = v;
+        tr.appendChild(td);
+      }
+      tb.appendChild(tr);
+    }
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+$('btn-ls-local').addEventListener('click', async () => {
+  try {
+    await api('/api/localserver/mode', { method: 'POST', body: { mode: 'local' } });
+    toast('已切到私服模式：出题/判分/榜单都由本服务提供', 'ok');
+    loadLocalServer();
+  } catch (err) { toast(err.message, 'err'); }
+});
+
+$('btn-ls-proxy').addEventListener('click', async () => {
+  try {
+    await api('/api/localserver/mode', { method: 'POST', body: { mode: 'proxy' } });
+    toast('已切回代理模式：请求转发到真实小猿服务器', 'ok');
+    loadLocalServer();
+  } catch (err) { toast(err.message, 'err'); }
+});
+
+$('btn-ls-test').addEventListener('click', async () => {
+  const box = $('ls-testout');
+  box.innerHTML = '';
+  logLine(box, '开始自测：出题 → 判分 …', 'l-dim');
+  try {
+    const r = await api('/api/localserver/selftest', { method: 'POST', body: {} });
+    for (const l of r.lines || []) logLine(box, l, r.ok ? 'l-ok' : 'l-err');
+    toast(r.ok ? '自测通过' : '自测失败', r.ok ? 'ok' : 'err');
+    loadLocalServer();
+  } catch (err) {
+    logLine(box, err.message, 'l-err');
+    toast(err.message, 'err');
+  }
+});
+
+$('btn-ls-open').addEventListener('click', () => {
+  window.open('/pk-h5/pk.html', '_blank');
+});
+
+$('btn-ls-refresh').addEventListener('click', () => loadLocalServer());
+
+$('btn-ls-reset').addEventListener('click', async () => {
+  if (!confirm('清空私服的全部对局与榜单数据？题库不受影响。')) return;
+  try {
+    await api('/api/localserver/reset', { method: 'POST', body: {} });
+    toast('已清空', 'ok');
+    loadLocalServer();
+  } catch (err) { toast(err.message, 'err'); }
+});
 
 async function loadTunnel() {
   // 纵深防御：穿透仅管理员可用。导航按钮已由 .admin-only 隐藏，
