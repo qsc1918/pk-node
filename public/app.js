@@ -305,7 +305,16 @@ $('pkpage-reload').addEventListener('click', openPkPage);
 
 /* ---------------------------- 刷局页 ---------------------------- */
 
-async function loadLeoAccounts() {
+/**
+ * 刷新账号列表（下拉 / 账号卡 / 批量选号器）。
+ *
+ * @param {number|null} preferId 希望选中的账号 id（导入成功后传入刚建的那个）。
+ *   没有传、或该 id 已不在列表里时，退回「保持原选中」；
+ *   若原本就没有选中（`prev` 为空，例如**首次导入**），则自动选中第一个 ——
+ *   否则用户导入完会发现下拉还停在「（尚未导入小猿账号）」，
+ *   还得手动再选一次，属于误导性状态。
+ */
+async function loadLeoAccounts(preferId) {
   const r = await api('/api/leo/accounts');
   state.leoAccounts = r.accounts;
 
@@ -325,7 +334,18 @@ async function loadLeoAccounts() {
     o.textContent = a.name + '（uid ' + (a.yfdU || '?') + '）';
     sel.appendChild(o);
   }
-  if (prev && r.accounts.some((a) => String(a.id) === prev)) sel.value = prev;
+  // 优先级：刚导入的 > 原来选中的 > 第一个
+  const want = preferId != null ? String(preferId) : '';
+  if (want && r.accounts.some((a) => String(a.id) === want)) {
+    sel.value = want;
+  } else if (prev && r.accounts.some((a) => String(a.id) === prev)) {
+    sel.value = prev;
+  } else if (r.accounts.length > 0) {
+    sel.value = String(r.accounts[0].id);
+    // 同步批量选号器的默认勾选（首个账号），避免「下拉有号、批量里空着」
+    if (batchSel.grind.size === 0) batchSel.grind.add(r.accounts[0].id);
+    if (batchSel.prac.size === 0) batchSel.prac.add(r.accounts[0].id);
+  }
 
   renderLeoList(r.accounts);
   // 批量开任务的多选列表（刷局 / 刷练习各一份，共用同一批账号）
@@ -617,7 +637,15 @@ $('btn-import').addEventListener('click', async () => {
     toast('导入成功', 'ok');
     $('leo-cookie').value = '';
     await loadDeviceChains();
-    await loadLeoAccounts();
+    // ★ 传刚导入的 id：让它成为当前选中（首次导入时尤其重要，
+    //   否则下拉会停在「（尚未导入小猿账号）」，看着像没导入成功）
+    await loadLeoAccounts(r.id);
+    // 「无设备链」的提示服务端已经写在 message 里了（`chainMsg`），
+    // 这里只在确实没有时补一句「去哪儿补」，避免重复念一遍同样的信息。
+    if (!(r.chain && r.chain.deviceId)) {
+      msg.textContent += '　→ 可在下方「设备链池」粘贴一份补齐；' +
+        '或在账号卡片的下拉里指定池中某一条。';
+    }
   } catch (err) {
     msg.textContent = '导入失败：' + err.message;
     toast(err.message, 'err');
