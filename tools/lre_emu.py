@@ -32,6 +32,7 @@ T 由 so 里这个函数生成，只依赖 `time()/60`（分钟数 M）。原项
   分派外部函数语义。
 """
 
+import os
 import struct
 import sys
 from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
@@ -56,7 +57,8 @@ SRET_BUF = 0x0209_0000
 STUB_BASE = 0x0F00_0000
 
 # T 生成函数入口（`JNI_OnLoad + 0x2dc8`）
-T_ENTRY = 0x657B4
+# T 函数入口。可用 LRE_T_ENTRY 覆盖（小猿升级 so 后地址会平移）。
+T_ENTRY = int(os.environ.get('LRE_T_ENTRY', '0x657B4'), 0)
 
 
 def s64(v):

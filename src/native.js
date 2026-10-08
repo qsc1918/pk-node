@@ -161,7 +161,7 @@ function selfTest() {
   }
 
   try {
-    const T = calcT(Math.floor(Date.now() / 1000));
+    const T = calcT(Math.floor(Date.now() / 60000) * 60);
     // T 是大数的十进制展开，位数随分钟浮动（实测 408/409/410 都可能出现），
     // 判据是「全是数字 + 位数在合理区间」，精确性由 sign.js 的 fixture 自校验保证。
     if (typeof T !== 'string' || !/^[0-9]+$/.test(T) || T.length < 380 || T.length > 460) {

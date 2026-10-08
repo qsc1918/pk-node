@@ -93,21 +93,88 @@ function clearBuffer(jobId) {
 /**
  * 由入库的 leo 账号构造 cookie jar。
  *
- * 账号若「指定了使用哪份设备链」（device_chain_id），这里把那份 ks_* 覆盖到 jar 上 ——
- * 保证刷局/刷练习用的就是这个用户给他选的那条链；没指定才走池里轮换。
+ * ## 设备链注入的两个来源（缺一不可）
+ *
+ * 1. **账号显式绑定**（`account.device_chain_id`）：用户在后台给该账号指定了链 → 用那条。
+ * 2. **★ 兜底：内置池轮换**（2026-10-08 新增）
+ *
+ *   原来只有第 1 条。若账号没绑链，就直接用 cookie 自带的 ks_*。
+ *   但新登录的账号**根本没有 ks_*** —— 于是请求缺设备链 →
+ *     · 练习上报 `/leo-star/.../rank/login/attend` → **417**
+ *     · PK 出题 → 400
+ *
+ *    实测（2026-10-08）：库里账号数为 0 / 未绑链时，attend 恒定 417
+ *    `{"status":417,"message":"No message available"}`。
+ *
+ *    现在：没绑链就**自动从池里挑一条可用的轮换**，
+ *    让「没有设备链也能用」成为默认体验（与内置池的设计意图一致）。
+ *
+ * 轮换用 `chainUsageMap` 的用量做加权，避免所有账号都压在同一条链上。
+ *
+ * @param {object} account 库里的 leo 账号行
+ * @param {object} [deps]  可注入依赖（测试用）
  */
-function jarOf(account) {
+function jarOf(account, deps) {
+  const d = deps || {};
+  const listChains = d.listDeviceChains || db.listDeviceChains;
+  const applyChain = d.applyDeviceChain
+    || require('./services/leo-accounts').applyDeviceChain;
+
   const items = JSON.parse(account.cookies_json);
   const jar = new leo.CookieJar(items);
-  try {
-    if (account && account.device_chain_id != null) {
-      leoAccounts.applyDeviceChain(jar, { boundChainId: account.device_chain_id });
+
+  // 账号 cookie 里自带的 ks_*
+  const hasKs = items.some((c) => String(c.name || '').indexOf('ks_') === 0);
+
+  // ---- 1) 显式绑定的链优先 ----
+  if (account && account.device_chain_id != null) {
+    try {
+      applyChain(jar, { boundChainId: account.device_chain_id });
+      return jar;
+    } catch (e) {
+      console.warn('[jobs] 应用账号设备链失败（改用兜底）：' + e.message);
     }
-  } catch (e) {
-    // 绑定链取不出来不该让整个任务起不来：原 cookie 里可能已经自带 ks_*
-    console.warn('[jobs] 应用账号设备链失败（改用 cookie 自带）：' + e.message);
   }
+
+  // ---- 2) 兜底：没绑链「且 cookie 里没有 ks_*」时，从池里轮换一条 ----
+  //
+  // 只在「确实缺链」时才补：cookie 里已有 ks_* 的账号保持原样，
+  // 不去覆盖它自己那份（避免把好链换成池里那条而改变身份）。
+  if (!hasKs) {
+    try {
+      const chains = (listChains() || []).filter((c) => c && c.enabled !== 0 && c.enabled !== false);
+      if (chains.length) {
+        // 按用量升序挑（用得少的优先），同用量随机 —— 摊薄单链被风控标记的风险
+        let usage = {};
+        try { usage = db.chainUsageMap() || {}; } catch (e) { usage = {}; }
+        const pick = pickByUsage(chains, usage);
+        applyChain(jar, { boundChainId: pick.id });
+        console.log('[jobs] 账号未绑设备链 → 自动补池内链 #' + pick.id
+          + '（' + (pick.device_id || '') + '），避免 417');
+      } else {
+        console.warn('[jobs] 账号未绑设备链，且设备链池为空 → 请求可能 417/400');
+      }
+    } catch (e) {
+      console.warn('[jobs] 兜底注入设备链失败：' + e.message);
+    }
+  }
+
   return jar;
+}
+
+/**
+ * 按用量挑一条链：用得最少的优先，并列则随机。
+ * @param {Array} chains
+ * @param {object} usage  chainId -> 用量
+ */
+function pickByUsage(chains, usage) {
+  let min = Infinity;
+  for (const c of chains) {
+    const u = Number(usage[c.id] || 0);
+    if (u < min) min = u;
+  }
+  const least = chains.filter((c) => Number(usage[c.id] || 0) === min);
+  return least[Math.floor(Math.random() * least.length)];
 }
 
 /**

@@ -38,8 +38,10 @@ if len(sys.argv) > 2:
     OUT = sys.argv[2]
 
 # 导出区间：T 函数本体 + 它 bl 到的内部函数（0x64990 / 0x65614 / 0x65be8 / 0x65dfc / 0x671e0）
-BASE = 0x64800
-END = 0x67600
+# 导出区间：T 函数本体 + 它 bl 到的内部函数。
+# 可用 LRE_BASE / LRE_END 覆盖（小猿升级 so 后地址会平移）。
+BASE = int(os.environ.get('LRE_BASE', '0x64800'), 0)
+END = int(os.environ.get('LRE_END', '0x67600'), 0)
 
 ALIAS = {'fp': 'x29', 'lr': 'x30', 'ip0': 'x16', 'ip1': 'x17',
          'wfp': 'w29', 'wlr': 'w30'}

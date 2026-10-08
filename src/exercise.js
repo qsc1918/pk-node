@@ -207,9 +207,24 @@ async function getExam(jar, keypointId, limit, opts) {
 }
 
 /**
- * 提交整卷成绩：`PUT /leo-math/android/exams/{examId}`（旧路径，不是 /v2/），JSON 明文不编码。
- * 注意与 PK 区别：PK 提交必须 gzip+c()+octet-stream；练习必须 JSON 明文（编码纪律相反）。
- * 作答填 `userAnswer` / `status`(1对/-1错) / `costTime`（下限5ms）；`script`(笔迹) 不填也能过。
+ * 提交整卷成绩：`PUT /leo-math/android/exams/v2/{examId}`（**真机实测路径**）。
+ *
+ * ## ★ 2026-10-08 修正：提交路径必须带 `/v2/`
+ *
+ * 真机 App 原生日志（auto_oral-2026-10-01.log，644 条练习流量）实测：
+ *
+ *     POST /leo-math/android/exams            154 次   ← 出题
+ *     PUT  /leo-math/android/exams/v2/{id}      7 次   ← **提交**
+ *
+ * 旧代码提交到 `/leo-math/android/exams/{id}`（少了 `/v2/`）→ 服务端不认 → **401**。
+ *
+ * 注意与 PK 的区别：
+ *   · PK 提交必须 密文 + octet-stream
+ *   · 练习提交必须 **JSON 明文**（编码纪律相反）
+ *
+ * 作答填 `userAnswer` / `status`(1对/-1错) / `costTime`（下限 5ms）；
+ * `script`（笔迹）服务端会校验——点太少会被判「非真人书写」。
+ *
  * @returns {Promise<{status:number, json:object|null, text:string}>}
  */
 async function submitExam(jar, examId, exam, opts) {
@@ -247,18 +262,32 @@ function answerAll(exam, costTimePerQuestionMs) {
     const answer = q.answer == null ? '' : String(q.answer);
     // 每题用不同 seed，避免笔迹完全雷同（服务端会比对）
     const pathPoints = strokes.buildPathPoints(answer, idx + 1, 'ARC').strokes;
-    return Object.assign({}, q, {
+    /**
+     * ★ 2026-10-08 修正：字段必须与真机 `QuestionVO` 完全一致。
+     *
+     * 真机出题响应里每题的真实字段（App 原生日志逐字）：
+     *   id / content / answer / userAnswer / answers / script
+     *   / wrongScript / status / errorState / costTime
+     *
+     * 旧代码多塞了一个 `curTrueAnswer` —— 那是项目自造的字段，
+     * 真机 QuestionVO **没有它**（真机日志报过
+     *   `curTrueAnswer fallback failed: curTrueAnswer in class QuestionVO`），
+     * 字段对不上会让服务端反序列化失败 → 400 `{"status":400,"message":"error"}`。
+     *
+     * 现在只回传真机有的字段，其余保持出题时的原值。
+     */
+    return {
+      id: q.id,
+      content: q.content,
+      answer: q.answer,
       userAnswer: answer,
-      status: 1,                              // 1 = 答对
+      answers: q.answers || [answer],
+      script: JSON.stringify(pathPoints),        // 笔迹（服务端据此判卷）
+      wrongScript: q.wrongScript == null ? null : q.wrongScript,
+      status: 1,                                 // 1 = 答对
+      errorState: 0,
       costTime: per,
-      script: JSON.stringify(pathPoints),     // 服务端据此判卷
-      curTrueAnswer: {
-        recognizeResult: answer,
-        pathPoints: pathPoints,
-        answer: 1,
-        showReductionFraction: 0,
-      },
-    });
+    };
   });
   return Object.assign({}, exam, {
     questions: questions,

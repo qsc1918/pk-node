@@ -1,6 +1,8 @@
 'use strict';
 // PK 提交笔迹生成：两种算法（移植自 cn.apixiaoyuan.app）。
-// PK 服务端会校验笔迹「像不像真人手写」，稀疏折线上当判作弊直接 403；练习提交只看 userAnswer，笔迹纯展示。
+// 服务端会校验笔迹「像不像真人手写」：稀疏折线会被判作弊（PK 403 / 练习 400）。
+// ⚠️ 2026-10-08 修正：原注释说「练习提交只看 userAnswer，笔迹纯展示」是**错的** ——
+//    实测练习提交同样校验笔迹，点太少会 400（`{"status":400,"message":"error"}`）。
 // 两种模式坐标口径不同（改代码易踩）：ARC 用像素坐标（x≈150-240、y≈450-500）；SEVEN_SEGMENT 用归一化 0..1 乘 CANVAS_SIZE=1000。
 // 回退：ARC 模式下答案不是 `>`/`<` 时自动回落七段码（弧线模板只有比较符字形）。
 
@@ -38,6 +40,28 @@ const ARC_LT = [
   [41.3, 40.74], [30.2, 48.40], [20.4, 54.62], [12.2, 59.45], [5.3, 63.43],
   [0.2, 66.45], [-4.6, 68.87], [-13.1, 72.91], [-20.0, 76.34],
 ];
+
+/**
+ * `=` 形（**两横**，真机同款）。
+ *
+ * ⚠️ 为什么必须补：原实现只认 `<` / `>`，`=` 会回落到七段码，
+ *   而七段码对 `=` 只能出 2 个点 → 服务端判「非真人书写」→ 提交 400/401。
+ *   比大小题里 `=` 很常见（如 `0\circle0`、`5\circle5`）。
+ *
+ * 坐标：[(dx, dy)] 相对第一点，单位像素；上一横 10 点、下一横 10 点，中间隔 ~13px。
+ */
+const ARC_EQ = {
+  // 上一横：左→右
+  upper: [
+    [0.0, 0.0], [9.4, 0.6], [19.8, 1.1], [30.2, 1.5], [40.6, 1.8],
+    [51.0, 2.0], [61.2, 2.1], [70.8, 2.0], [79.6, 1.7], [86.4, 1.3],
+  ],
+  // 下一横：左→右（相对「上横第一点」的偏移）
+  lower: [
+    [1.2, 12.6], [10.4, 13.2], [20.6, 13.7], [30.8, 14.0], [41.0, 14.2],
+    [51.2, 14.3], [61.0, 14.2], [70.4, 13.9], [78.8, 13.4], [85.2, 12.9],
+  ],
+};
 
 /** `>` 形（右上→中→左上，然后折回）。 */
 const ARC_GT = [
@@ -78,17 +102,36 @@ function roundTo(v, n) {
  */
 function arcPathPoints(answer, seed) {
   const a = String(answer == null ? '' : answer).trim();
-  const tmpl = a === '<' ? ARC_LT : (a === '>' ? ARC_GT : null);
-  if (!tmpl) return null;
-
+  // 单笔模板：`<` / `>`
+  const single = a === '<' ? ARC_LT : (a === '>' ? ARC_GT : null);
   const next = rng(seed * 2654435761 + 1);
   const ox = 150 + next() * 90;   // x 150..240
   const oy = 450 + next() * 50;   // y 450..500
-  const pts = tmpl.map(([dx, dy]) => ({
-    x: roundTo(ox + dx + (next() * 3 - 1.5), 4),
-    y: roundTo(oy + dy + (next() * 3 - 1.5), 4),
-  }));
-  return [pts];
+  const jitter = () => (next() * 3 - 1.5);
+  const round = (v) => roundTo(v, 4);
+
+  if (single) {
+    const pts = single.map(([dx, dy]) => ({
+      x: round(ox + dx + jitter()),
+      y: round(oy + dy + jitter()),
+    }));
+    return [pts];
+  }
+
+  // `=` 是**两笔**（两横），真机同款
+  if (a === '=') {
+    const upper = ARC_EQ.upper.map(([dx, dy]) => ({
+      x: round(ox + dx + jitter()),
+      y: round(oy + dy + jitter()),
+    }));
+    const lower = ARC_EQ.lower.map(([dx, dy]) => ({
+      x: round(ox + dx + jitter()),
+      y: round(oy + dy + jitter()),
+    }));
+    return [upper, lower];
+  }
+
+  return null;   // 其它答案（数字等）→ 调用方回落七段码
 }
 
 /* --------------------- SEVEN_SEGMENT：七段码字形表 --------------------- */
@@ -186,21 +229,43 @@ function sevenSegmentPathPoints(answer, canvasSize) {
   const text = String(answer == null ? '' : answer);
   const size = canvasSize || CANVAS_SIZE;
   if (!text) return [];
-
   const chars = Array.from(text);
   const cellW = size / chars.length;
   const cellH = size;
   const sx = cellW * INSET_X;
   const sy = cellH * INSET_Y;
-
   const out = [];
+  /**
+   * 把一段直线插值成多点的折线。
+   *
+   * ⚠️ 为什么要插值：七段码的字形是「两点一段」的直线，
+   *   直接输出会导致整个 script 只有几个点（如 `42` 仅 2 点）——
+   *   服务端会判「非真人书写」而拒绝提交。
+   *   真机手写每个笔画有 8~12 个采样点，这里按段长近似还原。
+   */
+  const densify = (a, b) => {
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    // 约每 0.06 归一化单位一个采样点，最少 3 个、最多 12 个
+    const n = Math.max(3, Math.min(12, Math.round(dist / 0.06) + 1));
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+      const t = n === 1 ? 0 : i / (n - 1);
+      pts.push([a[0] + dx * t, a[1] + dy * t]);
+    }
+    return pts;
+  };
+
   chars.forEach((ch, ci) => {
     const glyph = GLYPHS[ch];
     if (!glyph) return;                       // 未收录字符：跳过（与原版一致）
     const ox = cellW * ci + (cellW - sx) / 2;
     const oy = (cellH - sy) / 2;
     for (const stroke of glyph) {
-      out.push(stroke.map(([nx, ny]) => ({
+      // stroke 是 [[x,y],[x,y]]（两点一段）；插值后映射到画布
+      const dense = densify(stroke[0], stroke[1]);
+      out.push(dense.map(([nx, ny]) => ({
         x: roundTo(ox + nx * sx, 3),
         y: roundTo(oy + ny * sy, 3),
       })));
