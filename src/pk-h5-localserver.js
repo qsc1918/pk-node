@@ -510,12 +510,43 @@ function open(buf) {
 
 /**
  * 判断一个请求路径是否属于私服。
- * 支持带 `/api` 前缀（H5 的 `{client}` 会被换成 `api`）。
+ *
+ * ## ★ 2026-10-08 修正：`{client}` 的真实取值是 `android`，不是 `api`
+ *
+ * 旧实现写的是 `/(api|\{client\})/` —— 只认**字面量** `{client}` 或 `api`。
+ * 但真机 H5 bundle（`index-legacy.DqAYjRZL.js`）里是：
+ *
+ *     R = t => { client: "android", productId: C.android }
+ *
+ * 也就是运行时会替换成 **`android`**：
+ *     /leo-game-pk/android/math/pk/home      ← 没有 /api/ 那一层
+ *
+ * 后果：真机 25 个接口**全部未命中** → 私服返回空兜底 `data:{}` → 页面全报错。
+ *
+ * 现在按「服务名 + 任意 client 段」匹配，`api` / `android` / `iphone` 都放行。
+ *
+ * ★ 服务名必须**列全**：真机 H5 首页会并发拉十几个服务
+ *   （leo-reward / leo-goblin-mall / leo-activity / leo-profile …），
+ *   少列一个就整个模块空白。
+ *   这份名单来自真机 App 原生日志实测（auto_oral-2026-10-08.log）。
  */
+const LOCAL_SERVICES = [
+  'game-pk', 'star', 'activity', 'profile', 'reward', 'goblin-mall',
+  'alchemy-account', 'cm-auth', 'cm-oauth', 'auth', 'error-book',
+  'exam', 'homework', 'math', 'msg', 'mis', 'data', 'literacy',
+  'english', 'ai-chat', 'rn-bfe', 'gateway', 'cms',
+];
+const LOCAL_SERVICE_RE = new RegExp(
+  '^/leo-(?:' + LOCAL_SERVICES.join('|') + ')/[a-z0-9_-]+/',
+  'i');
+
 function isLocalApi(p) {
-  return /^\/leo-game-pk\/(api|\{client\})\//.test(p) ||
-         /^\/leo-star\/(api|\{client\})\//.test(p) ||
-         /^\/leo-activity\/(api|\{client\})\//.test(p);
+  return LOCAL_SERVICE_RE.test(p) ||
+         /^\/solar-(?:activity|vip)\/[a-z0-9_-]+\//i.test(p) ||
+         // `/profile/...`（无 leo- 前缀）：真机 App 原生也打这个域，
+         // H5 的 user-info 可能走它，纳入以免显示「未登录」。
+         /^\/profile\/[a-z0-9_-]+\//i.test(p) ||
+         /^\/leo-game-pk\/(api|\{client\})\//.test(p);   // 旧写法保留（向后兼容）
 }
 
 /** 取 pathname（去掉 query）。 */
@@ -605,6 +636,364 @@ function handle(o) {
   /* ---- 排行榜 ---- */
   if (/\/game\/rank$/.test(p) && method === 'GET') {
     return json(200, { code: 200, message: 'ok', data: buildRank(q) });
+  }
+
+  /* ==================================================================
+   * 周边接口实现
+   *
+   * 真机 H5 首页并发拉 20+ 个接口，任何一个返回「字段全空」都会让
+   * 对应模块渲染报错（页面上就是「全都是报错」）。
+   *
+   * 下方每个应答的结构都**照抄真机 App 原生日志**里同接口的真实 body
+   * （auto_oral-2026-10-08.log），字段名/类型一致，数值本地化。
+   * ================================================================== */
+
+  const uid = Number((o.user && o.user.userId) || 0);
+  const uname = (o.user && o.user.userName) || '私服玩家';
+
+  /* ---------------- PK 战绩 / 成就 / 历史 ---------------- */
+
+  // GET /leo-game-pk/{client}/math/pk/achievement
+  // 真机结构：totalCount/totalScore/weekScore + 各题型明细
+  if (/\/math\/pk\/achievement$/.test(p) && method === 'GET') {
+    const s2 = load();
+    const done = Object.keys(s2.matches).length;
+    return json(200, {
+      code: 200,
+      message: 'ok',
+      data: {
+        userId: uid,
+        userName: uname,
+        avatarUrl: '',
+        totalCount: done,
+        totalScore: done * 100,
+        totalWinCount: done,
+        weekCount: 0,
+        weekScore: 0,
+        weekWinCount: 0,
+        monthScore: 0,
+        capacity: 9999,
+        rankScore: done * 100,
+        maxWinStreak: done,
+        title: '',
+        achievementList: [],
+      },
+    });
+  }
+
+  // GET /leo-game-pk/{client}/math/pk/history  —— 战绩列表
+  if (/\/math\/pk\/history$/.test(p) && method === 'GET') {
+    const s2 = load();
+    const list = Object.keys(s2.matches)
+      .slice(-20)
+      .reverse()
+      .map((k) => {
+        const m2 = s2.matches[k];
+        return {
+          pkIdStr: k,
+          pointId: m2.pointId || 0,
+          pointName: m2.pointName || '',
+          correctCnt: m2.correctCnt || 0,
+          questionCnt: m2.questionCnt || 10,
+          costTime: m2.costTime || 0,
+          createTime: m2.createdAt || Date.now(),
+          win: (m2.correctCnt || 0) >= (m2.questionCnt || 10),
+          ruleType: m2.ruleType || 0,
+        };
+      });
+    return json(200, {
+      code: 200,
+      message: 'ok',
+      data: { list, hasMore: false, cursorTime: 0, total: list.length },
+    });
+  }
+
+  // GET /leo-game-pk/{client}/math/pk/props/home  —— 道具背包
+  if (/\/math\/pk\/props\/home$/.test(p) && method === 'GET') {
+    return json(200, {
+      code: 200,
+      message: 'ok',
+      data: {
+        propsList: [
+          { propId: 1, propName: '护盾', count: 3, iconUrl: '', desc: '答错不扣分' },
+          { propId: 2, propName: '加速', count: 3, iconUrl: '', desc: '减少答题时间' },
+          { propId: 3, propName: '跳过', count: 1, iconUrl: '', desc: '跳过当前题' },
+        ],
+        coin: 1000,
+        selectedProps: [],
+      },
+    });
+  }
+
+  /* ---------------- 挑战赛 ---------------- */
+
+  // POST /leo-game-pk/{client}/math/challenge/start
+  if (/\/math\/challenge\/start$/.test(p) && (method === 'POST' || method === 'PUT')) {
+    const m3 = makeMatch({ pointId: q.pointId });
+    return json(200, {
+      code: 200,
+      message: 'ok',
+      data: {
+        challengeId: m3.pkIdStr,
+        pkIdStr: m3.pkIdStr,
+        pointId: m3.pointId,
+        pointName: m3.pointName,
+        ruleType: m3.ruleType,
+        questionCnt: m3.questionCnt,
+        examVO: m3.examVO,
+        startTime: Date.now(),
+        endTime: Date.now() + 300000,
+      },
+    });
+  }
+
+  // GET /leo-game-pk/{client}/math/challenge/info
+  if (/\/math\/challenge\/info$/.test(p) && method === 'GET') {
+    return json(200, {
+      code: 200,
+      message: 'ok',
+      data: {
+        challengeId: 0,
+        status: 0,
+        progress: { finished: 0, total: 10 },
+        bestScore: 0,
+        bestCostTime: 0,
+        rewardClaimed: false,
+        startTime: 0,
+        endTime: 0,
+      },
+    });
+  }
+
+  // GET /leo-game-pk/{client}/math/challenge/history
+  if (/\/math\/challenge\/history$/.test(p) && method === 'GET') {
+    return json(200, { code: 200, message: 'ok', data: { list: [], hasMore: false, cursorTime: 0 } });
+  }
+
+  /* ---------------- 练习（leo-star） ---------------- */
+
+  // GET /leo-star/{client}/exercise/homepage
+  // 真机结构逐字：continuousDays/checkinToday/rankId/curRank/curWeekExp/...
+  if (/\/exercise\/homepage$/.test(p) && method === 'GET') {
+    return json(200, {
+      ver: '1.0',
+      timestamp: Date.now(),
+      status: 200,
+      message: '',
+      data: {
+        continuousDays: 1,
+        checkinToday: false,
+        rankId: 5342280,
+        curRank: 1,
+        curWeekExp: 0,
+        preWeekRankLevel: 600,
+        curWeekRankLevel: 600,
+        rankStat: 0,
+        content: '',
+        nextMultiplier: 2,
+        todayObtainedPoints: 0,
+        timeTillNextRankCycle: 283619045,
+        everInRank: true,
+      },
+      success: true,
+    });
+  }
+
+  // GET /leo-star/{client}/exercise/rank/pre-fetch  —— 分数的权威读数
+  // 真机返回的是**裸对象**（不是 {code,message,data} 包裹）
+  if (/\/exercise\/rank\/pre-fetch$/.test(p) && method === 'GET') {
+    return json(200, {
+      userId: uid,
+      userName: uname,
+      score: 0,
+      weekScore: 0,
+      rank: 0,
+      capacity: 9999,
+      continuousDays: 1,
+    });
+  }
+
+  // GET /leo-star/{client}/exercise/task/home
+  if (/\/exercise\/task\/home$/.test(p) && method === 'GET') {
+    return json(200, {
+      code: 200,
+      message: 'ok',
+      data: { tasks: [], finishedCount: 0, totalCount: 0 },
+    });
+  }
+
+  // GET /leo-star/{client}/exercise/item/status  —— 奖励道具
+  // 真机逐字：{hasItem, item:{itemType,itemName,multiple,duration}}
+  if (/\/exercise\/item\/status$/.test(p) && method === 'GET') {
+    return json(200, {
+      hasItem: true,
+      item: { itemType: 2, itemName: '三倍奖励', multiple: 3, duration: 600000 },
+    });
+  }
+
+  // GET /leo-star/{client}/rank/entrance
+  // 真机逐字：{onRank, rankValue, message, defaultRankType}
+  if (/\/rank\/entrance$/.test(p) && method === 'GET') {
+    return json(200, {
+      onRank: false,
+      rankValue: -1,
+      message: '填写学校 开启榜单',
+      defaultRankType: 0,
+    });
+  }
+
+  /* ---------------- 活动 / 奖励 ---------------- */
+
+  // GET /leo-activity/{client}/activity/pk/daily/award  —— 每日奖励
+  if (/\/activity\/pk\/daily\/award$/.test(p) && method === 'GET') {
+    return json(200, {
+      code: 200,
+      message: 'ok',
+      data: {
+        signed: false,
+        continuousDays: 1,
+        todayAward: { points: 5, claimed: false },
+        awardList: [
+          { day: 1, points: 5, claimed: false },
+          { day: 2, points: 10, claimed: false },
+          { day: 3, points: 15, claimed: false },
+        ],
+      },
+    });
+  }
+
+  // GET /leo-activity/{client}/activity/pk/sign-act/status
+  if (/\/activity\/pk\/sign-act\/status$/.test(p) && method === 'GET') {
+    return json(200, { code: 200, message: 'ok', data: { signed: false, continuousDays: 0, canSign: true } });
+  }
+
+  // POST /leo-activity/{client}/activity/pk/sign-act/claim  —— 领取
+  if (/\/activity\/pk\/sign-act\/claim$/.test(p) && (method === 'POST' || method === 'PUT')) {
+    return json(200, { code: 200, message: 'ok', data: { success: true, points: 5 } });
+  }
+
+  // GET /leo-activity/{client}/backpack  —— 背包
+  if (/\/backpack$/.test(p) && method === 'GET') {
+    return json(200, { code: 200, message: 'ok', data: { items: [], coin: 1000 } });
+  }
+
+  // GET /leo-activity/{client}/pet/card  —— 宠物卡
+  // 真机结构逐字（含 ver/timestamp/status/message/data/success 外壳）
+  if (/\/pet\/card$/.test(p) && method === 'GET') {
+    return json(200, {
+      ver: '1.0',
+      timestamp: Date.now(),
+      status: 200,
+      message: '',
+      data: {
+        currentLevel: 1,
+        currentExp: 0,
+        currentLevelExp: 0,
+        nextLevelExp: 4,
+        maxLevelReached: false,
+        initialized: false,
+        noviceSuitLotteried: false,
+        status: 4,
+        speech: '肚子扁扁的…快来救我',
+        buttonText: '去投喂',
+        petImageUrl: '',
+      },
+      success: true,
+    });
+  }
+
+  // GET /leo-reward/{client}/task/hp  —— 今日任务
+  // 真机结构逐字
+  //
+  // ⚠️ 模式必须从服务名开始（`/leo-reward/...`）。
+  //    若写成 `/\/reward\/[a-z0-9_-]+\/task\/hp$/`，它会去匹配 `/reward/<client>/task/hp`，
+  //    而实际路径是 `/leo-reward/<client>/task/hp` —— 前面多了 `leo-`，永远不命中。
+  if (/^\/leo-reward\/[a-z0-9_-]+\/task\/hp$/.test(p) && method === 'GET') {
+    return json(200, {
+      ver: '1.0',
+      timestamp: Date.now(),
+      status: 200,
+      message: '',
+      data: {
+        cardInfo: { title: '今日任务', subTitle: '更多金币', jumpUrl: '' },
+        tasks: [
+          { name: '今日首次数学练习', points: 5, jumpUrls: [''], jumpDesc: '去完成', imageUrl: '', pointType: 41, order: 3, petFoods: 1 },
+          { name: '今日首次语文练习', points: 5, jumpUrls: [''], jumpDesc: '去完成', imageUrl: '', pointType: 42, order: 4, petFoods: 1 },
+        ],
+      },
+      success: true,
+    });
+  }
+
+  // GET /leo-reward/{client}/points/available-rewards-misc
+  if (/\/points\/available-rewards-misc$/.test(p) && method === 'GET') {
+    return json(200, {
+      balanceVO: { ytkUserId: uid, balance: 254 },
+      availableRewards: [
+        { type: 2, points: 5, availableTime: Date.now() },
+        { type: 3, points: 5, availableTime: Date.now() },
+        { type: 4, points: 10, availableTime: Date.now() },
+      ],
+    });
+  }
+
+  // GET /leo-goblin-mall/{client}/order/props
+  if (/\/order\/props$/.test(p) && method === 'GET') {
+    return json(200, { code: 200, message: 'ok', data: { orderList: [], hasMore: false } });
+  }
+
+  /* ---------------- 身份 / 账号 ---------------- */
+
+  // GET /leo-profile/{client}/user-id-card
+  // 真机逐字：{"verify":false}
+  if (/\/user-id-card$/.test(p) && method === 'GET') {
+    return json(200, { verify: false });
+  }
+
+  // GET /leo-profile/{client}/user-infos/context  —— H5 判断登录态的依据
+  // 真机返回裸对象，H5 直接读 ytkUserId / deviceId
+  if (/\/user-infos\/context$/.test(p) && method === 'GET') {
+    return json(200, {
+      ytkUserId: uid,
+      userId: uid,
+      deviceId: 1,
+      leoUserId: uid,
+      userName: uname,
+      nickName: uname,
+      productId: 611,
+    });
+  }
+
+  // GET /leo-profile/{client}/user-infos  —— 用户信息
+  if (/\/user-infos$/.test(p) && method === 'GET') {
+    return json(200, {
+      userId: uid,
+      ytkUserId: uid,
+      userName: uname,
+      nickName: uname,
+      avatarUrl: '',
+      grade: Number(q.grade) || 1,
+      productId: 611,
+    });
+  }
+
+  // GET /solar-vip/{client}/users/self  —— 会员状态
+  if (/\/users\/self$/.test(p) && method === 'GET') {
+    return json(200, { payUserStatus: 1, userId: uid, isVip: false });
+  }
+
+  /* ---------------- 活动位（solar-activity / 首页 banner） ---------------- */
+
+  // GET /solar-activity/{client}/activity/6  —— 活动位列表（**裸数组**）
+  if (/\/solar-activity\/[a-z0-9_-]+\/activity\/\d+$/i.test(p) && method === 'GET') {
+    return json(200, []);
+  }
+
+  /* ---------------- 其它（H5 会并发拉，不能 404） ---------------- */
+
+  // /core/user-info 之类：给一个含身份的最小对象，避免 undefined 取值
+  if (/\/user-info$/.test(p) && method === 'GET') {
+    return json(200, { userId: uid, ytkUserId: uid, userName: uname, grade: Number(q.grade) || 1 });
   }
 
   /* ---- 其余接口：给一个「成功但空」的通用应答，避免 H5 卡住 ---- */
