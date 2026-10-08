@@ -1594,13 +1594,26 @@ function collectPkBody() {
 
 /** 收集「刷练习」面板当前这套参数。 */
 function collectExerciseBody() {
-  return {
+  const body = {
     keypointId: Number($('prac-kp').value || 16),
     limit: Number($('prac-limit').value || 100),
     rounds: Number($('prac-rounds').value || 1),
     gapMinMs: Number($('prac-gapmin').value || 0),
     gapMaxMs: Number($('prac-gapmax').value || 0),
   };
+  // 提交节奏：
+  //   fast = 0.2s/题（实测够过提交）｜rank = 0.5s/题（上榜，结算时间卡 0.5s/题）
+  // 单题间隔输入框留空则按所选模式；填了就优先用它（毫秒）。
+  const pace = $('prac-pace');
+  if (pace && pace.value) body.submitPaceMode = pace.value;
+  const paceMs = $('prac-pacems');
+  if (paceMs && paceMs.value.trim() !== '') body.submitGapPerQMs = Number(paceMs.value);
+  // 出题等待（轮次之间）：留空则按冷却自动配速（第一轮恒不等）。
+  const mwMin = $('prac-mwmin');
+  const mwMax = $('prac-mwmax');
+  if (mwMin && mwMin.value.trim() !== '') body.matchWaitMinMs = Number(mwMin.value);
+  if (mwMax && mwMax.value.trim() !== '') body.matchWaitMaxMs = Number(mwMax.value);
+  return body;
 }
 
 /**

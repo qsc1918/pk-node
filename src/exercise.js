@@ -323,6 +323,59 @@ function answerAll(exam, costTimePerQuestionMs) {
   });
 }
 
+/**
+ * 解析本次提交节奏（「上榜模式」）。
+ *
+ * ## 为什么要可配
+ *   实测两个档位：
+ *     · 0.2s/题 → 提交通过（日常刷分够用）
+ *     · 0.5s/题 → **上榜**需要（结算时间要卡到这个数）
+ *
+ *   固定的一个值要么慢（拖累日常）、要么上不了榜，所以做成模式。
+ *
+ * ## 优先级
+ *   1. `opts.submitGapPerQMs`  —— 直接给毫秒（最高优先级，供实验/高级用户）
+ *   2. `opts.submitPaceMode`   —— `fast`（默认）｜`rank`
+ *   3. `PK_EX_SUBMIT_GAP_PER_Q_MS` 环境变量 —— 全局覆盖单题毫秒
+ *   4. `PK_EX_SUBMIT_GAP_MODE` 环境变量 —— 全局覆盖模式
+ *   5. config.exerciseSubmitPace 的默认值
+ *
+ * @param {object} [opts] runPractice 的选项
+ * @returns {{perQMs:number, padMs:number, label:string, mode:string}}
+ */
+function resolveSubmitPace(opts) {
+  const o = opts || {};
+  const cfgPace = (config.exerciseSubmitPace) || {};
+  const modes = cfgPace.modes || { fast: 200, rank: 500 };
+  const padMs = Math.max(0, Number(o.submitPadMs) || Number(cfgPace.fixedPadMs) || 500);
+
+  // 1) 显式毫秒
+  const explicit = Number(o.submitGapPerQMs);
+  if (Number.isFinite(explicit) && explicit >= 0) {
+    return { perQMs: explicit, padMs: padMs, label: '自定义', mode: 'custom' };
+  }
+  // 3) 环境变量毫秒
+  const envMs = Number(process.env.PK_EX_SUBMIT_GAP_PER_Q_MS);
+  if (Number.isFinite(envMs) && envMs >= 0) {
+    return { perQMs: envMs, padMs: padMs, label: 'env-毫秒', mode: 'custom' };
+  }
+  // 2)/4) 模式
+  const mode = String(
+    o.submitPaceMode || process.env.PK_EX_SUBMIT_GAP_MODE || cfgPace.defaultMode || 'fast',
+  ).toLowerCase();
+  const perQMs = Number(modes[mode]);
+  if (Number.isFinite(perQMs) && perQMs >= 0) {
+    return {
+      perQMs: perQMs,
+      padMs: padMs,
+      label: mode === 'rank' ? '上榜模式' : '快速模式',
+      mode: mode,
+    };
+  }
+  // 5) 兜底
+  return { perQMs: 200, padMs: padMs, label: '快速模式(兜底)', mode: 'fast' };
+}
+
 /* ---------------------------------------------------- 经验上报（刷分） */
 
 /** 可记账的 `ruleType`（实测只有 0 和 1 会让 `curWeekScore` 真正增加）。 */
@@ -473,43 +526,55 @@ async function runPractice(jar, opts) {
   });
 
   // 2) 作答（抄答案 + 生成笔迹 —— 服务端靠笔迹判卷）
-  live();
-  const answered = answerAll(exam, o.costTimePerQuestionMs);
+  //
+  // ★★ 2026-10-08 定标：等待量 = 题数 × **单题间隔**，**与声明耗时无关**。
+  //
+  // 服务端校验「提交时刻 − 出题时刻」的**实际间隔**，按题数放大；
+  // 与请求里声明的 `costTime` 完全无关（见 config.js 的说明与
+  // tools/probe-declared-vs-elapsed.js：声明 1ms 也照样过）。
+  //
+  // 两个实测系数（用户提供 / 我的梯度互相印证）：
+  //   · **0.2s/题** → 提交即可通过（`fast`，默认）
+  //   · **0.5s/题** → **上榜**所需，结算时间要卡到这个数（`rank`）
+  //
+  // ⚠️ 我曾误把等待写成「= 声明总耗时（900ms/题）」，100 题干等 90s。
+  //    那不是服务端要求，是误判。现在按模式取系数，可随任务配置。
+  //
+  // ⚠️ 另注：本轮的 400 常见**不是**节奏问题，而是 **script（笔迹）
+  //    坐标不合格** —— 见 tools/isolate-400.js：
+  //       script=null → 200 ｜ script=<我们生成的笔迹> → 400
+  //    所以这里的等待即使给足了，笔迹不合格照样 400。
+  const pace = resolveSubmitPace(o);
+  const gapPerQ = pace.perQMs;
+  const gapBase = pace.padMs;
+  const qNum = (exam.questions || []).length || 1;
+  const minGapMs = gapBase + qNum * gapPerQ;
 
-  // ★★ 2026-10-08：提交前必须**真实等待**声明的作答时长。
-  //
-  // 决定性证据（tools/probe-400-cause.js，同一份 body 连续提交三次）：
-  //
-  //   | 组 | 出题→提交 间隔 | 顶层成绩 | 结果      |
-  //   |----|---------------|----------|-----------|
-  //   | A  | ~2s           | 未填     | 400 error |
-  //   | B  | ~7s           | 填了     | 400 error |
-  //   | C  | ~15s          | 未填     | **200** ✅ |
-  //
-  // A 与 C 的 body **完全相同**（都不动顶层 correctCnt/costTime），
-  // 唯一差别是调用时刻 ⇒ 400 与 body 内容无关，是**时间相关**的校验。
-  //
-  // 服务端比对「本次提交时刻 − 出题时刻」与请求里声明的总耗时：
-  //   10 题 × 900ms = 9s ＞ 实际间隔 2s ⇒ 判为机器秒答 ⇒ 400 error。
-  // 这也解释了 10 局全败：主循环出题后几乎立刻提交。
-  //
-  // 修法：提交前等到「距出题已过 ≈ 声明耗时」。留一点余量（+300ms）
-  // 抵消网络/时钟抖动，否则仍可能被判「快了一丁点」。
-  const declaredMs = Math.max(0, Number(answered.costTime) || 0);
-  // 注意基准要用**出题成功**时刻（matchOkAt），不能用 tMatch：
+  // 基准必须用**出题成功**时刻（matchOkAt），不能用 tMatch：
   // tMatch 是出题**开始**时刻，若中间被 429 限流重试过，会把重试等待
-  // 也算进 elapsed → 高估已过时间 → 等待不足 → 仍可能被判秒答。
+  // 也算进 elapsed → 高估已过时间 → 等待不足。
   const elapsedMs = Date.now() - matchOkAt;
-  const waitMs = declaredMs - elapsedMs + 300;
+  const waitMs = minGapMs - elapsedMs;
   if (waitMs > 0) {
     emit({
       type: 'ex-pace',
-      message: `按声明耗时等待 ${(waitMs / 1000).toFixed(1)}s 再提交（防「机器秒答」校验，已过 ${(elapsedMs / 1000).toFixed(1)}s / 需 ${(declaredMs / 1000).toFixed(1)}s）`,
+      message: `等待 ${(waitMs / 1000).toFixed(1)}s 后提交（${pace.label} ${gapPerQ}ms/题 × ${qNum} 题，需 ≥ ${(minGapMs / 1000).toFixed(1)}s，已过 ${(elapsedMs / 1000).toFixed(1)}s）`,
     });
     await sleep(waitMs, o.signal);
     live();
   }
 
+  // 每题声明耗时：优先用调用方给的，否则按**实际间隔**反推。
+  // 这一步只影响提交体的合理性数据，**不参与等待**（服务端不看它）。
+  const gapMs = Math.max(0, Date.now() - matchOkAt);
+  const declaredHint = Number(o.costTimePerQuestionMs) || gapPerQ;
+  const perQ = Math.min(
+    Math.max(5, declaredHint),
+    Math.max(5, Math.floor(gapMs / qNum)),
+  );
+  const answered = answerAll(exam, perQ);
+
+  live();
   emit({ type: 'ex-submit', message: `提交（全对 ${answered.correctCnt}/${answered.questionCnt}，含笔迹）` });
   const s = await submitExam(jar, exam.idString, answered, { signal: o.signal });
   if (s.status !== 200) {
@@ -549,14 +614,30 @@ async function practiceLoop(jar, opts) {
    * 「每轮间隔」（UI 配置）：实际等待 = max(冷却剩余, 随机[gapMinMs, gapMaxMs])。
    * 冷却是硬下限（配更小也没用，会 429），之上再随机间隔避免固定节奏；
    * cooldownSafetyMs 是从冷却下沿往回退的安全边距。
+   *
+   * ★ 2026-10-08 修正：
+   *   ① **第一轮不等**。开跑前那一次等待毫无意义（前面根本没有请求，
+   *      不存在「距上次出题多久」的问题）。旧代码用它来「避开频控窗口」，
+   *      但那只在**连续轮次**之间才有意义。现在第一轮直接发车。
+   *   ② **出题等待可自定义**：`o.matchWaitMinMs` / `o.matchWaitMaxMs`
+   *      给「每轮间隔」一套独立的取值范围（不填则仍用 gapMin/gapMax）。
+   *      命名为「出题等待」是因为它等的是下一轮**出题**的时机。
    */
   const gapMin = Math.max(0, Number(o.gapMinMs) || 0);
   const gapMax = Math.max(gapMin, Number(o.gapMaxMs) || 0);
+  // 出题等待（可独立配置；缺省沿用 gapMin/gapMax，保持旧行为）
+  const mwMinRaw = o.matchWaitMinMs == null ? null : Number(o.matchWaitMinMs);
+  const mwMaxRaw = o.matchWaitMaxMs == null ? null : Number(o.matchWaitMaxMs);
+  const mwMin = Math.max(0, mwMinRaw == null ? gapMin : mwMinRaw);
+  const mwMax = Math.max(mwMin, mwMaxRaw == null ? gapMax : mwMaxRaw);
   // 安全边距：从冷却下沿往回退一点，避免贴着窗口边缘白撞 429（默认 200ms）。
   const safety = o.cooldownSafetyMs == null ? 200 : Math.max(0, Number(o.cooldownSafetyMs));
   const randGap = () => (gapMax > gapMin
     ? gapMin + Math.floor(Math.random() * (gapMax - gapMin + 1))
     : gapMin);
+  const randMatchWait = () => (mwMax > mwMin
+    ? mwMin + Math.floor(Math.random() * (mwMax - mwMin + 1))
+    : mwMin);
 
   let lastMatchOkAt = 0;
   let done = 0, failed = 0, totalExp = 0;
@@ -565,17 +646,18 @@ async function practiceLoop(jar, opts) {
   for (let i = 1; i <= rounds; i++) {
     if (o.signal && o.signal.aborted) throw abortedError();
 
-    // 每轮间隔：冷却剩余 与 随机间隔 取大者
+    // 每轮间隔：冷却剩余 与 随机间隔 取大者。
+    // ★ 第一轮跳过（lastMatchOkAt=0）—— 开跑前无需等。
     if (lastMatchOkAt) {
       const cooldownLeft = Math.max(0, lastMatchOkAt + MATCH_COOLDOWN_MS - safety - Date.now());
-      const gap = randGap();
+      const gap = randMatchWait();
       const wait = Math.max(cooldownLeft, gap);
       lastWaitMs = wait;
       if (wait > 0) {
         emit({
           type: 'ex-gap',
           round: i,
-          message: `间隔 ${(wait / 1000).toFixed(1)}s 后开始第 ${i} 轮` +
+          message: `出题等待 ${(wait / 1000).toFixed(1)}s 后开始第 ${i} 轮` +
             `（配置 ${(gap / 1000).toFixed(1)}s，冷却剩 ${(cooldownLeft / 1000).toFixed(1)}s）`,
           configuredMs: gap,
           cooldownLeftMs: cooldownLeft,

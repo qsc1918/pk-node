@@ -352,6 +352,14 @@ function makeExerciseConfig(b) {
     gapMinMs: Math.max(0, Number(b.gapMinMs) || 0),
     gapMaxMs: Math.max(0, Number(b.gapMaxMs) || 0),
     costTimePerQuestionMs: b.costTimePerQuestionMs == null ? undefined : Number(b.costTimePerQuestionMs),
+    // 「上榜模式」：fast = 0.2s/题（够过提交）｜rank = 0.5s/题（上榜，结算时间卡 0.5s/题）。
+    // submitGapPerQMs 给具体毫秒时优先级更高（高级参数用）。
+    submitPaceMode: b.submitPaceMode == null ? undefined : String(b.submitPaceMode),
+    submitGapPerQMs: b.submitGapPerQMs == null ? undefined : Number(b.submitGapPerQMs),
+    submitPadMs: b.submitPadMs == null ? undefined : Number(b.submitPadMs),
+    // 「出题等待」（轮次之间）—— 与提交等待分开配置。第一轮恒不等。
+    matchWaitMinMs: b.matchWaitMinMs == null ? undefined : Number(b.matchWaitMinMs),
+    matchWaitMaxMs: b.matchWaitMaxMs == null ? undefined : Number(b.matchWaitMaxMs),
   };
   cfg.rounds = clampRounds(b.rounds, 1);
   return cfg;

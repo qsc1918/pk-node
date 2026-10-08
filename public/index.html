@@ -260,9 +260,30 @@
         <label class="grow">轮数<input id="prac-rounds" type="number" value="1" min="1" max="100000"></label>
       </div>
       <div class="row">
+        <label class="grow">提交节奏
+          <select id="prac-pace">
+            <option value="fast" selected>快速（0.2s/题）—— 够过提交</option>
+            <option value="rank">上榜模式（0.5s/题）—— 结算时间卡到 0.5s/题</option>
+          </select>
+        </label>
+        <label class="grow">单题间隔（ms，留空=按上方节奏）<input id="prac-pacems" type="number" min="0" step="50" placeholder="如 200 / 500"></label>
+      </div>
+      <p class="muted small">
+        节奏按<b>实测系数</b>：出题→提交的间隔由服务端按题数校验（与请求里声明的耗时无关）。
+        <b>0.2s/题</b> 即可通过提交；要<b>上榜</b>需 <b>0.5s/题</b>（结算时间要卡到这个数）。
+        100 题约 20s（快速）／50s（上榜）。
+      </p>
+      <div class="row">
+        <label class="grow">出题等待最小 ms<input id="prac-mwmin" type="number" min="0" step="500" placeholder="留空=按冷却自动（约 1s）"></label>
+        <label class="grow">出题等待最大 ms<input id="prac-mwmax" type="number" min="0" step="500" placeholder="留空=最小值"></label>
         <label class="grow">每轮最小间隔 ms<input id="prac-gapmin" type="number" value="0" min="0" step="1000"></label>
         <label class="grow">每轮最大间隔 ms<input id="prac-gapmax" type="number" value="0" min="0" step="1000"></label>
       </div>
+      <p class="muted small">
+        <b>出题等待</b>＝两轮之间等下一轮出题的时机（受出题冷却约束，约 1s）。
+        <b>第一轮不等</b>，开跑即出题。留空表示按冷却自动配速。
+        <code>每轮间隔</code> 是旧参数，仍在「取大者」里生效。
+      </p>
       <p class="muted small">
         每轮间隔 = <code>max(出题冷却剩余, 随机[最小, 最大])</code>。
         <b>出题冷却约 1 秒</b>（服务端已放宽；引擎自带 1.5s 配速 + 429 自动重试）。

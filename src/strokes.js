@@ -6,8 +6,37 @@
 // 两种模式坐标口径不同（改代码易踩）：ARC 用像素坐标（x≈150-240、y≈450-500）；SEVEN_SEGMENT 用归一化 0..1 乘 CANVAS_SIZE=1000。
 // 回退：ARC 模式下答案不是 `>`/`<` 时自动回落七段码（弧线模板只有比较符字形）。
 
-/** 提交笔迹的归一化画布边长（仅 SEVEN_SEGMENT 用）。 */
-const CANVAS_SIZE = 1000;
+/**
+ * 七段码的画布边长（像素口径，**与 ARC 同一坐标系**）。
+ *
+ * ## ★ 2026-10-08 修正（修练习提交 400 的关键一处）
+ *
+ * 旧值是 `1000`，含义是「归一化 0..1 乘 1000」。但真机的书写坐标是
+ * **像素口径**，量出来只有一小块区域：
+ *
+ *   tools/measure-canvas.js（真机 09-27 样本，10 题共 222 个点）
+ *     真机书写区: x 125.2~303.1   y 454.1~571.8
+ *     我们的 ARC : x 151.7~242.7   y 483.7~560.6   ← 落在区内 ✅
+ *     旧七段码   : x 428.0~586.4   y 203.6~796.4   ← 远超区外 ❌
+ *
+ * 于是同样走 ARC 模式的比较题能过，一旦回落七段码（算术题就是这样）
+ * 坐标就跑到书写区外，服务端判「笔迹不在作答区」→ 提交 400。
+ *
+ *   隔离实验 tools/isolate-400.js 也印证了这点：
+ *     script=null → 200 ｜ script=<我们生成的> → 400
+ *
+ * 现在改成与真机书写区匹配的像素口径。基准点取真机区间的中位：
+ *   x 中心 ≈ 214（区宽 178），y 中心 ≈ 513（区高 118）
+ * 单字格宽按「区宽 / 常见答案位数」取，使多位数字也落在区内。
+ */
+const CANVAS_SIZE = 178;
+
+/** 书写区高度（真机实测：y 454.1~571.8，高约 118）。 */
+const CANVAS_HEIGHT = 118;
+
+/** 书写区左上角基准（真机实测：x≈125、y≈454）。 */
+const CANVAS_ORIGIN_X = 125.2;
+const CANVAS_ORIGIN_Y = 454.1;
 
 /** 字形在格子内的内缩系数（同 quick.js `sx = cellW*0.72` / `sy = cellH*0.78`）。 */
 const INSET_X = 0.72;
@@ -225,13 +254,15 @@ const GLYPHS = {
  * @param {string} answer
  * @returns {Array<Array<{x:number,y:number}>>} 未收录的字符被跳过
  */
-function sevenSegmentPathPoints(answer, canvasSize) {
+function sevenSegmentPathPoints(answer, canvasSize, canvasHeight) {
   const text = String(answer == null ? '' : answer);
   const size = canvasSize || CANVAS_SIZE;
+  const height = canvasHeight || CANVAS_HEIGHT;
   if (!text) return [];
   const chars = Array.from(text);
-  const cellW = size / chars.length;
-  const cellH = size;
+  // 多字符（如 `42`）横向平分书写区宽度；单字符也用它，保证各题笔迹尺度一致。
+  const cellW = size / Math.max(1, chars.length);
+  const cellH = height;
   const sx = cellW * INSET_X;
   const sy = cellH * INSET_Y;
   const out = [];
@@ -257,15 +288,67 @@ function sevenSegmentPathPoints(answer, canvasSize) {
     return pts;
   };
 
+  /**
+   * 把一段折线**按固定步长**重采样成密集点。
+   *
+   * ⚠️ 为什么要重采样：服务端会判「笔迹像不像真人手写」。
+   *   真机的每一笔是手写采样，每笔约 10 个点、整题 21~24 点：
+   *
+   *     tools/measure-canvas.js（真机 09-27 样本 10 题）
+   *       题0: 21 点 ｜ 题1: 24 点 ｜ … 合计 222 点（10 题）
+   *
+   *   而我们的字形只有 2~9 个顶点，且旧实现只对「段」做低密度插值，
+   *   导致整题只有 8~19 点（`9` 仅 8 点）→ 被判非真人书写 → 400。
+   *
+   *   改法：整笔（而不是单段）按**固定步长**均匀重采样，
+   *   使每笔点数稳定落在真机量级（约 10 点/笔）。
+   */
+  const resampleStroke = (points, perStroke) => {
+    if (!points || points.length === 0) return [];
+    if (points.length === 1) return [points[0].slice()];
+    // 累计弧长
+    const segLen = [];
+    let total = 0;
+    for (let i = 1; i < points.length; i++) {
+      const dx = points[i][0] - points[i - 1][0];
+      const dy = points[i][1] - points[i - 1][1];
+      const d = Math.sqrt(dx * dx + dy * dy);
+      segLen.push(d);
+      total += d;
+    }
+    if (total <= 0) return [points[0].slice()];
+    const out = [];
+    const steps = Math.max(2, perStroke);
+    for (let k = 0; k < steps; k++) {
+      const target = (total * k) / (steps - 1);
+      let acc = 0;
+      let idx = 0;
+      while (idx < segLen.length && acc + segLen[idx] < target) {
+        acc += segLen[idx];
+        idx++;
+      }
+      if (idx >= segLen.length) { out.push(points[points.length - 1].slice()); break; }
+      const t = segLen[idx] <= 0 ? 0 : (target - acc) / segLen[idx];
+      out.push([
+        points[idx][0] + (points[idx + 1][0] - points[idx][0]) * t,
+        points[idx][1] + (points[idx + 1][1] - points[idx][1]) * t,
+      ]);
+    }
+    return out;
+  };
+
   chars.forEach((ch, ci) => {
     const glyph = GLYPHS[ch];
     if (!glyph) return;                       // 未收录字符：跳过（与原版一致）
-    const ox = cellW * ci + (cellW - sx) / 2;
-    const oy = (cellH - sy) / 2;
+    // 格子内居中，再整体平移到书写区（真机坐标是页面像素口径，
+    // 不是从 0 开始的归一化坐标 —— 见 CANVAS_ORIGIN_X/Y 的说明）。
+    const ox = CANVAS_ORIGIN_X + cellW * ci + (cellW - sx) / 2;
+    const oy = CANVAS_ORIGIN_Y + (cellH - sy) / 2;
     for (const stroke of glyph) {
-      // stroke 是 [[x,y],[x,y]]（两点一段）；插值后映射到画布
-      const dense = densify(stroke[0], stroke[1]);
-      out.push(dense.map(([nx, ny]) => ({
+      // 先把该笔的顶点序列整体重采样成 ~10 点（对齐真机手写密度），
+      // 再映射到书写区。用整笔重采样而非逐段插值，点数才稳定。
+      const resampled = resampleStroke(stroke, 10);
+      out.push(resampled.map(([nx, ny]) => ({
         x: roundTo(ox + nx * sx, 3),
         y: roundTo(oy + ny * sy, 3),
       })));

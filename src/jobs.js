@@ -602,6 +602,15 @@ async function runExerciseLoop(job, cfg, ctx) {
       rounds: cfg.rounds, limit: cfg.limit, keypointId: cfg.keypointId,
       gapMinMs: cfg.gapMinMs, gapMaxMs: cfg.gapMaxMs,
       costTimePerQuestionMs: cfg.costTimePerQuestionMs,
+      // 「上榜模式」：fast(0.2s/题) ｜ rank(0.5s/题，上榜用)。
+      // 也可直接给 submitGapPerQMs 指定毫秒（优先级更高）。
+      submitPaceMode: cfg.submitPaceMode,
+      submitGapPerQMs: cfg.submitGapPerQMs,
+      submitPadMs: cfg.submitPadMs,
+      // 「出题等待」（轮次之间，等的是下一轮出题时机）——可独立于提交等待配置。
+      // 缺省沿用 gapMinMs/gapMaxMs，保持旧行为；第一轮不等待（无论配多少）。
+      matchWaitMinMs: cfg.matchWaitMinMs,
+      matchWaitMaxMs: cfg.matchWaitMaxMs,
       signal: ctx.signal,
       onEvent: emit,
     });
