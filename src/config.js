@@ -164,18 +164,59 @@ const config = {
    *    干等 90s。那不是服务端要求，是我的误判，已纠正。
    */
   exerciseSubmitPace: {
-    /** 默认模式：`fast`（0.2s/题，够过提交）｜`rank`（0.5s/题，为上榜）。 */
-    defaultMode: process.env.PK_EX_SUBMIT_GAP_MODE || 'fast',
-    /** 各模式的单题间隔（毫秒）。 */
-    modes: {
-      fast: 200,
-      rank: 500,
-    },
     /**
-     * 固定余量：抵消网络往返与客户端/服务端时钟偏差，
-     * 避免「刚好卡在阈值上」被判不足。
+     * 默认模式。用户要求「主打上榜」→ 默认 `rank`。
+     * 可用 `PK_EX_SUBMIT_GAP_MODE=speed|rank` 覆盖。
      */
+    defaultMode: process.env.PK_EX_SUBMIT_GAP_MODE || 'rank',
+
+    /**
+     * 两个模式（实测系数，2026-10-08）。
+     *
+     * `perQMs` = 每题的「出题→提交」间隔；`padMs` = 固定余量
+     * （抵消网络往返与时钟偏差，避免刚好卡在阈值上被判不足）。
+     *
+     * | 模式 | 定位 | 单题 | 余量 | 说明 |
+     * |---|---|---|---|---|
+     * | `speed` | **刷分，主打速度** | 200ms | 300ms | 实测够过提交，最快 |
+     * | `rank`  | **上榜，主打上榜** | 500ms | 500ms | 结算时间要卡到 0.5s/题 |
+     */
+    modes: {
+      speed: { perQMs: 200, padMs: 300, label: '刷分模式（速度优先）' },
+      rank: { perQMs: 500, padMs: 500, label: '上榜模式' },
+    },
+    /** 旧字段兼容：无模式信息时的兜底余量。 */
     fixedPadMs: 500,
+  },
+
+  /**
+   * 练习吞吐相关的提速参数。
+   *
+   * ## 瓶颈在哪（实测）
+   *
+   *   tools/measure-match-cooldown.js：出题冷却约 **58 秒**（服务端硬约束），
+   *   而提交只要约 2 秒 —— 一局里 56 秒空闲。
+   *   ⇒ 提速不能靠「调短提交等待」，要靠下面三项。
+   */
+  exerciseSpeed: {
+    /**
+     * 撞 429 后的重试轮询间隔（毫秒）。
+     *
+     * 旧值写死 10000（10s），而 `MATCH_COOLDOWN_MS` 是 1500（1.5s）——
+     * 两者自相矛盾，导致每轮平均白等约 4~5s。
+     * 改成 3000 后，最坏也只多等 3s。可用 PK_EX_MATCH_RETRY_MS 覆盖。
+     */
+    matchRetryMs: process.env.PK_EX_MATCH_RETRY_MS || 3000,
+
+    /**
+     * 默认每局题数。**这是最有效的提速杠杆**：
+     * 同一个 58s 冷却窗口里，100 题拿 200 经验、200 题拿 400 经验。
+     * 可用 PK_EX_DEFAULT_LIMIT 覆盖。
+     */
+    defaultLimit: process.env.PK_EX_DEFAULT_LIMIT || 200,
+
+    /** 口算每局可选的最大题数（服务端上限，超出会被拒）。 */
+    maxLimit: 200,
   },
 
   /**

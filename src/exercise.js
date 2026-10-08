@@ -346,34 +346,59 @@ function answerAll(exam, costTimePerQuestionMs) {
 function resolveSubmitPace(opts) {
   const o = opts || {};
   const cfgPace = (config.exerciseSubmitPace) || {};
-  const modes = cfgPace.modes || { fast: 200, rank: 500 };
-  const padMs = Math.max(0, Number(o.submitPadMs) || Number(cfgPace.fixedPadMs) || 500);
+  const modes = cfgPace.modes || {};
+  const fallbackPad = Math.max(0, Number(cfgPace.fixedPadMs) || 500);
 
-  // 1) 显式毫秒
+  /**
+   * 取一个模式的参数。
+   * 兼容两种写法：`{ perQMs, padMs, label }`（新）与纯数字（旧）。
+   */
+  const pick = (name) => {
+    const v = modes[name];
+    if (v == null) return null;
+    if (typeof v === 'number') {
+      return { perQMs: Math.max(0, v), padMs: fallbackPad, label: name, mode: name };
+    }
+    return {
+      perQMs: Math.max(0, Number(v.perQMs) || 0),
+      padMs: Math.max(0, Number(v.padMs) == null ? fallbackPad : Number(v.padMs)),
+      label: v.label || name,
+      mode: name,
+    };
+  };
+
+  // 1) 显式毫秒（优先级最高，供实验/高级用户）
   const explicit = Number(o.submitGapPerQMs);
   if (Number.isFinite(explicit) && explicit >= 0) {
-    return { perQMs: explicit, padMs: padMs, label: '自定义', mode: 'custom' };
-  }
-  // 3) 环境变量毫秒
-  const envMs = Number(process.env.PK_EX_SUBMIT_GAP_PER_Q_MS);
-  if (Number.isFinite(envMs) && envMs >= 0) {
-    return { perQMs: envMs, padMs: padMs, label: 'env-毫秒', mode: 'custom' };
-  }
-  // 2)/4) 模式
-  const mode = String(
-    o.submitPaceMode || process.env.PK_EX_SUBMIT_GAP_MODE || cfgPace.defaultMode || 'fast',
-  ).toLowerCase();
-  const perQMs = Number(modes[mode]);
-  if (Number.isFinite(perQMs) && perQMs >= 0) {
     return {
-      perQMs: perQMs,
-      padMs: padMs,
-      label: mode === 'rank' ? '上榜模式' : '快速模式',
-      mode: mode,
+      perQMs: explicit,
+      padMs: Math.max(0, Number(o.submitPadMs) || fallbackPad),
+      label: '自定义（' + explicit + 'ms/题）',
+      mode: 'custom',
     };
   }
-  // 5) 兜底
-  return { perQMs: 200, padMs: padMs, label: '快速模式(兜底)', mode: 'fast' };
+  // 2) 环境变量毫秒
+  const envMs = Number(process.env.PK_EX_SUBMIT_GAP_PER_Q_MS);
+  if (Number.isFinite(envMs) && envMs >= 0) {
+    return {
+      perQMs: envMs,
+      padMs: Math.max(0, Number(o.submitPadMs) || fallbackPad),
+      label: 'env（' + envMs + 'ms/题）',
+      mode: 'custom',
+    };
+  }
+  // 3) 模式名（任务配置 / 环境变量 / 默认）
+  const name = String(
+    o.submitPaceMode || process.env.PK_EX_SUBMIT_GAP_MODE || cfgPace.defaultMode || 'rank',
+  ).toLowerCase();
+  const got = pick(name);
+  if (got) {
+    if (o.submitPadMs != null) got.padMs = Math.max(0, Number(o.submitPadMs) || 0);
+    return got;
+  }
+  // 4) 兜底：按用户「主打上榜」的意图走 rank，取不到再 speed
+  return pick('rank') || pick('speed')
+    || { perQMs: 500, padMs: fallbackPad, label: '上榜模式(兜底)', mode: 'rank' };
 }
 
 /* ---------------------------------------------------- 经验上报（刷分） */
@@ -472,8 +497,17 @@ async function pumpScore(jar, opts) {
  * 默认 1s（与安卓端 DEFAULT_COOLDOWN_MS 对齐），可用 PK_EX_MATCH_COOLDOWN_MS 覆盖。
  */
 const MATCH_COOLDOWN_MS = Math.max(0, Number(process.env.PK_EX_MATCH_COOLDOWN_MS) || 1_500);
-/** 撞 429 时的重试间隔 / 总等待上限。 */
-const MATCH_RETRY_INTERVAL_MS = 10_000;
+/**
+ * 撞 429 时的重试轮询间隔。
+ *
+ * ★ 2026-10-08 提速：旧值写死 10s，而出题冷却实测约 58s、
+ *   `MATCH_COOLDOWN_MS` 只有 1.5s —— 三者不协调，每轮平均白等 4~5s。
+ *   改为可配（默认 3s），把「多等的部分」压到最小。
+ */
+const MATCH_RETRY_INTERVAL_MS = Math.max(
+  500,
+  Number((config.exerciseSpeed && config.exerciseSpeed.matchRetryMs) || process.env.PK_EX_MATCH_RETRY_MS) || 3_000,
+);
 const MATCH_RETRY_MAX_MS = 4 * 60 * 1000;
 
 /**
@@ -760,6 +794,8 @@ module.exports = {
   submitExam,
   // 刷分
   attend, pumpScore, explainLimits, practiceLoop,
+  resolveSubmitPace,
   MATCH_COOLDOWN_MS,
+  MATCH_RETRY_INTERVAL_MS,
   PUMP_RULE_TYPES, PER_ITEM_MAX,
 };

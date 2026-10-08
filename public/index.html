@@ -260,18 +260,19 @@
         <label class="grow">轮数<input id="prac-rounds" type="number" value="1" min="1" max="100000"></label>
       </div>
       <div class="row">
-        <label class="grow">提交节奏
+        <label class="grow">模式
           <select id="prac-pace">
-            <option value="fast" selected>快速（0.2s/题）—— 够过提交</option>
-            <option value="rank">上榜模式（0.5s/题）—— 结算时间卡到 0.5s/题</option>
+            <option value="rank" selected>上榜（0.5s/题）—— 主打，结算时间卡到 0.5s/题</option>
+            <option value="speed">刷分（0.2s/题）—— 速度优先，够过提交</option>
           </select>
         </label>
         <label class="grow">单题间隔（ms，留空=按上方节奏）<input id="prac-pacems" type="number" min="0" step="50" placeholder="如 200 / 500"></label>
       </div>
       <p class="muted small">
         节奏按<b>实测系数</b>：出题→提交的间隔由服务端按题数校验（与请求里声明的耗时无关）。
-        <b>0.2s/题</b> 即可通过提交；要<b>上榜</b>需 <b>0.5s/题</b>（结算时间要卡到这个数）。
-        100 题约 20s（快速）／50s（上榜）。
+        <b>上榜（默认）</b> 用 0.5s/题，结算时间卡到位；<b>刷分</b> 用 0.2s/题，最快过提交。
+        <br>注意：真正的速度瓶颈是<b>服务端出题冷却（实测约 58 秒）</b>，不是提交等待。
+        想更快请把 <b>每轮题数拉到 200</b>（同窗口收益×2），或<b>多账号并行</b>跑多个任务。
       </p>
       <div class="row">
         <label class="grow">出题等待最小 ms<input id="prac-mwmin" type="number" min="0" step="500" placeholder="留空=按冷却自动（约 1s）"></label>
