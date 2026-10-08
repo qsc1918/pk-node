@@ -14,17 +14,22 @@ const keystream = require('./keystream');
 
 /** 主域（leo-gateway / leo-profile / leo-auth / leo-star / leo-math）公共参数：
  *  必须 version=3.140.1 + platform=android37，否则主域端点被 solar-encoder 拦（400/417）。 */
-const MAIN_COMMON_QUERY = [
-  ['platform', PK.exercise.platform],
-  ['version', PK.exercise.version],
-  ['vendor', PK.exercise.vendor],
-  ['av', PK.exercise.av],
-  ['deviceCategory', PK.exercise.deviceCategory],
-  ['webviewVersion', PK.exercise.webviewVersion],
-  ['whRatio', PK.exercise.whRatio],
-  ['isBackground', PK.exercise.isBackground],
+/* --------------------------------------------------------------------------
+ * 公共参数 —— 2026-10-08 真机实测：**全服务同一套**
+ *
+ * 真机 353 个请求里，platform / version / vendor / webviewVersion / whRatio
+ * 在任何服务下都是同一组值（android37 / 3.141.1 / UC / 150 / 2.17）。
+ * 旧代码把主域与 PK 拆成两套表，且值都与真机不符 → 被 solar-encoder 判异构。
+ * 现在合并；保留 MAIN_DOMAIN_PREFIXES 判断只为「补不补 isBackground」。
+ * ------------------------------------------------------------------------ */
+const DOMAIN_PREFIXES = [
+  '/leo-gateway', '/leo-profile', '/leo-auth', '/leo-star', '/leo-math', '/leo-reward',
+  '/leo-account', '/leo-game-pk', '/leo-activity', '/leo-exam', '/leo-homework',
+  '/leo-mis', '/leo-msg', '/leo-data', '/leo-literacy', '/leo-english', '/leo-ai-chat',
+  '/leo-rn-bfe', '/leo-error-book', '/leo-alchemy-account', '/leo-goblin-mall',
+  '/solar-activity', '/solar-vip', '/orion-config-center', '/orion-hubble-config',
+  '/accounts', '/profile', '/verifier',
 ];
-const MAIN_DOMAIN_PREFIXES = ['/leo-gateway', '/leo-profile', '/leo-auth', '/leo-star', '/leo-math', '/leo-reward', '/leo-account'];
 const COMMON_QUERY = [
   ['platform', PK.commonQuery.platform],
   ['version', PK.commonQuery.version],
@@ -33,8 +38,13 @@ const COMMON_QUERY = [
   ['deviceCategory', PK.commonQuery.deviceCategory],
   ['webviewVersion', PK.commonQuery.webviewVersion],
   ['whRatio', PK.commonQuery.whRatio],
-  // 真机 PK 出题 URL 没有 isBackground（抓包逐字），故不补。
 ];
+/** 真机 PK 出题 URL **不带** isBackground（抓包逐字），主域才带。 */
+const MAIN_EXTRA_QUERY = [
+  ['isBackground', PK.exercise.isBackground],
+];
+const MAIN_DOMAIN_PREFIXES = ['/leo-gateway', '/leo-profile', '/leo-auth', '/leo-star', '/leo-math', '/leo-reward', '/leo-account'];
+
 
 /** 风控头（真机抓包逐字）——**PK/H5 系**（`leo-game-pk`）用这套即可。 */
 function riskHeaders() {
@@ -49,13 +59,17 @@ function riskHeaders() {
 /* --------------------- 主域「App 原生」请求头（417 关键） --------------------- */
 
 /**
- * App 原生 UA：`Leo/<版本名> (<BRAND><MODEL>; Android <sdkInt>; Scale/<density>)`。
- * ⚠️ 不是 H5 的 Chrome UA：主域 417 风控会核对它，用 H5 UA 打 accounts/switch 会被拦成 417。
+ * App 原生 UA：`Leo/<版本名> (<BRAND><MODEL>; Android <NN>; Scale/<density>)`。
+ *
+ * ⚠️ 两处易错：
+ *   1. 真机逐字是 `Android 17`（**不是** SDK 号 37）—— 见 config.device.uaSdk。
+ *      query 里的 `platform=android37` 用的是 SDK 号，两者**不是一回事**。
+ *   2. 版本名取 commonQuery.version（真机 3.141.1）。
+ * 真机逐字：`Leo/3.141.1 (Redmi25053RT47C; Android 17; Scale/3.25)`
  */
 function leoUserAgent() {
   const d = config.device;
-  return 'Leo/' + PK.commonQuery.version +
-    ' (' + d.brand + d.model + '; Android ' + d.sdk + '; Scale/' + d.scale + ')';
+  return PK.uaTemplate(PK.commonQuery.version, d.brand, d.model, d.uaSdk, d.scale);
 }
 
 /** 20 位小写十六进制，形态同真机 `leo-client-trace-id`。 */
@@ -117,9 +131,19 @@ function buildUrl(urlPath, params = {}, opts = {}) {
   q.set('_productId', opts.productId || PK.productIdDefault);
   if (opts.appId) q.set('_appId', opts.appId);
 
-  // 1) 公共参数：主域用 MAIN_COMMON_QUERY（android37 / 3.140.1），PK 等用 COMMON_QUERY
-  const isMain = MAIN_DOMAIN_PREFIXES.some((pre) => String(urlPath).indexOf(pre) === 0);
-  for (const [k, v] of (isMain ? MAIN_COMMON_QUERY : COMMON_QUERY)) q.set(k, v);
+  // 1) 公共参数 —— 全服务同一套（2026-10-08 真机实测）
+  //
+  //    真机 353 个请求里，platform/version/vendor/webviewVersion/whRatio
+  //    在任何服务下都是同一组值。旧代码分主域/PK 两套表，两套都错 → 被判异构。
+  //
+  //    唯一差异：主域补 isBackground，PK 不补（抓包逐字如此）。
+  const pathStr = String(urlPath);
+  const isKnown = DOMAIN_PREFIXES.some((pre) => pathStr.indexOf(pre) === 0);
+  const isPk = pathStr.indexOf('/leo-game-pk') === 0;
+  for (const [k, v] of COMMON_QUERY) q.set(k, v);
+  if (isKnown && !isPk) {
+    for (const [k, v] of MAIN_EXTRA_QUERY) q.set(k, v);
+  }
 
   // 3) 业务参数（最后放，可覆盖前面任何同名键 —— 调用方优先）
   for (const [k, v] of Object.entries(params)) {

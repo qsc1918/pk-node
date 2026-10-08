@@ -176,22 +176,35 @@ check('leo.js 导出齐全', missingLeo.length === 0,
   check('T 生成（纯 JS 模拟 arm64）与真机 fixture 逐字节一致', tOk, tDetail);
 }
 
-// 练习协议层（/leo-star /leo-math；version 必须 3.140.1）
+// 练习协议层（/leo-star /leo-math）
 const exLib = require(path.join(root, 'src', 'exercise'));
 const REQUIRED_EX = ['buildExerciseUrl', 'exerciseHeaders', 'overview', 'getExam', 'attend', 'pumpScore', 'readScore', 'runPractice', 'practiceLoop', 'submitExam', 'answerAll'];
 const missingEx = REQUIRED_EX.filter((k) => typeof exLib[k] !== 'function');
 check('exercise.js 导出齐全', missingEx.length === 0,
   missingEx.length === 0 ? REQUIRED_EX.length + ' 项' : '缺少 ' + missingEx.join(', '));
 
-// 练习 URL 必须带 version=3.140.1 + platform=android37（否则 417）
+// 练习 URL 的公共参数必须与 **2026-10-08 真机实测** 完全一致（否则被判异构 → 417）
+//
+// 真机逐字（App 原生日志 353 个请求）：
+//   platform=android37  version=3.141.1  vendor=UC  av=5
+//   deviceCategory=phone  webviewVersion=150  whRatio=2.17  _productId=611
+const REAL_PARAMS = [
+  ['_productId', '611'],
+  ['platform', 'android37'],
+  ['version', '3.141.1'],
+  ['vendor', 'UC'],
+  ['av', '5'],
+  ['deviceCategory', 'phone'],
+  ['webviewVersion', '150'],
+  ['whRatio', '2.17'],
+];
+const REAL_SET = REAL_PARAMS.map(([k, v]) => k + '=' + v);
 {
   const u = exLib.buildExerciseUrl('/leo-star/android/exercise/homepage');
-  const okVer = u.includes('version=3.140.1');
-  const okPlat = u.includes('platform=android37');
-  const okProd = u.includes('_productId=611');
-  check('练习参数 version=3.140.1 / platform=android37 / _productId=611',
-    okVer && okPlat && okProd,
-    (okVer ? '' : 'version 错 ') + (okPlat ? '' : 'platform 错 ') + (okProd ? '' : '_productId 错 '));
+  const bad = REAL_SET.filter((kv) => !u.includes(kv));
+  check('练习参数逐字对齐真机（' + REAL_SET.length + ' 项）',
+    bad.length === 0,
+    bad.length === 0 ? REAL_SET.join(' ') : '与实际不符: ' + bad.join(', '));
 }
 
 const engineLib = require(path.join(root, 'src', 'pk-engine'));

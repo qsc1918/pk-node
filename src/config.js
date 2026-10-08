@@ -159,42 +159,51 @@ config.isExposed = (config.host === '0.0.0.0' || config.host === '::' || config.
  */
 const PK = {
   /**
-   * 主域公共参数（缺 sign 会 417）。
-   * 逐字来自真机 PK 出题请求；version 必须是 **App 实际版本号**（3.143.1），不是服务端放行版。
+   * 公共参数 —— **2026-10-08 真机实测逐字**（App 原生日志 353 个请求）。
+   *
+   * 真机所有服务（leo-star / leo-math / leo-game-pk / leo-profile / solar-activity …）
+   * 用的是**同一套**参数，不存在「主域一套、练习一套」：
+   *
+   *   platform=android37  version=3.141.1  vendor=UC  av=5
+   *   deviceCategory=phone  webviewVersion=150  whRatio=2.17
+   *
+   * 旧代码把参数拆成 MAIN_COMMON_QUERY(3.140.1/android37) 与
+   * COMMON_QUERY(3.143.1/android35/fenbi/110/1.78) 两套，两套**都错**：
+   *   · 3.140.1 落后（服务端已放行 3.141.1）
+   *   · 3.143.1 超前（真机根本没有这个版本）
+   *   · android35 / fenbi / 110 / 1.78 与真机逐字值均不符
+   * 参数对不上会被 solar-encoder 判异构 → 400 / 417。
    */
   commonQuery: {
-    platform: 'android35',
-    version: '3.143.1',
-    vendor: 'fenbi',
+    platform: 'android37',
+    version: '3.141.1',
+    vendor: 'UC',
     av: '5',
     deviceCategory: 'phone',
-    webviewVersion: '110',
-    whRatio: '1.78',
+    webviewVersion: '150',
+    whRatio: '2.17',
   },
-  /**
-   * 产品线 id。真机 PK 出题请求用的是 **611**（不是 631），且**不带 `_appId`**。
-   */
-  productIdDefault: '611',
-  productIdPk: '611',
 
-  /**
-   * 练习（`/leo-star` `/leo-math` `/leo-reward` 主域端点）公共参数。
-   * 主域端点被 `solar-encoder` 拦成 417，**根因是 `version`**：服务端放行 3.140.1 + android37。
-   * PK 端点走另一套校验，不受此限，故各自用各自的表。
-   */
+  /** 旧字段保留（外部可能引用），值已对齐真机。 */
   exercise: {
     platform: 'android37',
-    version: '3.140.1',
+    version: '3.141.1',
     vendor: 'UC',
     av: '5',
     deviceCategory: 'phone',
     webviewVersion: '150',
     whRatio: '2.17',
     isBackground: '0',
-    /** 练习一律 611。 */
     productId: '611',
   },
-  /** 风控头（真机抓包逐字）。 */
+
+  /**
+   * 产品线 id。真机实测：**所有服务一律 611**（356 次请求无一例外）。
+   */
+  productIdDefault: '611',
+  productIdPk: '611',
+
+  /** 风控头（真机逐字）。 */
   headers: {
     'X-XYKS-REQ-NETWORK-ENV': 'mobile',
     'x-shepherd-sessionid': '0',
@@ -202,29 +211,27 @@ const PK = {
 
   /**
    * 提交接口独立频控：默认等 10s、最多 2 次。
-   *
-   * 设备参数（UA）与 `x-shepherd-did` 属于**设备级凭据**，不在本对象里
-   * —— 见 [config.device] / [config.shepherdDid]。
    */
   rateLimitBaseMs: 10_000,
   rateLimitMaxWait: 2,
   /**
-   * 出题接口的冷却：**≈60s/账号**（实测仍在）。
-   *
-   * 本字段只是「引擎是否**自动**替你等」的开关 —— 默认 **0**（不等）。
-   * 网页侧默认每轮间隔填 0/0，冷却由「出题频控重试」在背景里蹲。
-   *
-   * 想让引擎自动贴着下沿配速：`PK_MATCH_COOLDOWN_MS=61600`。
-   *
-   * ⚠️ 练习链路无此冷却（见 `src/exercise.js` 的 `MATCH_COOLDOWN_MS` = 1.5s）。
+   * 出题接口冷却：本轮真机日志未观察到 60s 频控（366 个请求全 200）。
+   * 如需恢复限速：PK_MATCH_COOLDOWN_MS=61600。
    */
   matchCooldownMs: envInt('PK_MATCH_COOLDOWN_MS', 0),
   /** 出题撞 400/403 时的重试间隔。 */
   matchRetryIntervalMs: 10_000,
   /** 出题重试的累计上限（超此才判该轮失败）。 */
   matchRetryMaxMs: 120_000,
-  /** 冷却估计最多往回缩这么多（避免每次都在窗口边缘白撞一次）。 */
+  /** 冷却估计最多往回缩这么多。 */
   matchCooldownSafetyMs: 0,
+
+  /**
+   * 真机 UA 模板：`Leo/<version> (<BRAND><MODEL>; Android <sdk>; Scale/<scale>)`
+   * 真机逐字：`Leo/3.141.1 (Redmi25053RT47C; Android 17; Scale/3.25)`
+   */
+  uaTemplate: (ver, brand, model, sdk, scale) =>
+    'Leo/' + ver + ' (' + brand + model + '; Android ' + sdk + '; Scale/' + scale + ')',
 };
 
 /**

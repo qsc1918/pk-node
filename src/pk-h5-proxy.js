@@ -1935,8 +1935,14 @@ function sleepMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 /** 首屏关键请求优先出站：pk.html 首屏并发 6+ 个 xyks 请求，若一律 FIFO，
  *  `math/pk/home`（决定卡片是否渲染）可能排最后 → 卡片不显示。
- *  故给关键请求开优先通道（仍受最小间隔约束）。 */
+ *  故给关键请求开优先通道（仍受最小间隔约束）。
+ *
+ *  ⚠️ 两套路径都要列：真机 H5 用 `{client}=android`（→ `/leo-game-pk/android/...`），
+ *     而早期 bundle 用 `/api/`。只写一套会让另一套失去优先权。 */
 const PK_PRIORITY_PATHS = [
+  '/leo-game-pk/android/math/pk/home',
+  '/leo-game-pk/android/math/pk/props/home',
+  '/leo-game-pk/android/math/pk/match',
   '/leo-game-pk/api/math/pk/home',
   '/leo-game-pk/api/math/pk/props/home',
   '/leo-game-pk/api/math/pk/match',
