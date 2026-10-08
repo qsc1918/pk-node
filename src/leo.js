@@ -152,30 +152,47 @@ function buildUrl(urlPath, params = {}, opts = {}) {
   }
 
   // 4) sign —— 按 signMode 决定加不加（默认 off：PK 用不上，且它需要 arm64）
-  const sign = maybeSign(urlPath);
+  //
+  // ★ 必须把**本次实际使用的 version** 传进去：服务端按 version 选签名算法，
+  //   版本与资产错配会 417（详见 maybeSign 的注释）。
+  const sign = maybeSign(urlPath, q.get('version'));
   if (sign) q.set('sign', sign);
 
   return config.leoBase + urlPath + '?' + q.toString();
 }
 
 /**
- * 决定是否计算 sign：按端点判断「要不要签名 / 用哪套签名资产」。
- *  - PK v1（`/leo-game-pk/android/math/pk/match`）：不需要签名；
- *  - PK v2 与提交等新端点：需要签名，用 `variant:'pk'` 资产（套练习版会 417）；
- *  - 其余主域端点：沿用练习版资产。
+ * 决定是否计算 sign，并选出**与 version 配对**的签名资产。
+ *
+ * ★ 2026-10-08 修正（修 PK 的 417）：
+ *
+ *   **不要按路径选资产。** 服务端是按 URL 里的 `version` 选签名算法的：
+ *
+ *     version=3.141.1 → 练习资产（bin/native/lre.so）      ← 当前真机版本
+ *     version=3.143.1 → PK 资产（bin/native/lre_pk.so）
+ *
+ *   旧实现写的是 `p.indexOf('/leo-game-pk') === 0 ? 'pk' : 'exercise'`，
+ *   而公共参数在同日被统一成 `version=3.141.1` —— 于是 `/leo-game-pk/**`
+ *   全变成「3.141.1 + pk 资产」的**错配**，一律 417。PK 链路因此整体失效。
+ *
+ *   现在改为由 `version` 推导（映射表 `config.signVariantByVersion`），
+ *   结构上不可能再出现错配。
+ *
+ * 特例：PK v1（`/leo-game-pk/android/math/pk/match`）不需要签名。
+ *
  * @param {string} urlPath 只含路径
+ * @param {string} [version] 本请求将要带的 `version` 值
  * @returns {string|null} 32 位 hex 或 null
  */
-function maybeSign(urlPath) {
+function maybeSign(urlPath, version) {
   const mode = String(config.signMode || 'off').toLowerCase();
   if (mode === 'off') return null;
 
   const p = String(urlPath);
   if (p === '/leo-game-pk/android/math/pk/match') return null;   // v1 不需要签名
 
-  const variant = p.indexOf('/leo-game-pk') === 0 ? 'pk' : 'exercise';
   try {
-    return nativeLib.calcSign(p, { variant });
+    return nativeLib.calcSign(p, { version: version });
   } catch (e) {
     if (mode === 'on') throw e;
     return null;                       // auto：静默降级

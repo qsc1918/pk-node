@@ -116,14 +116,35 @@ const signCachePk = new Map();
 const tCachePk = new Map();
 
 /**
+ * 按 `version` 解析该用的签名资产（**服务端实际规则**）。
+ *
+ * 服务端按 URL 里的 `version` 选签名算法；版本与资产错配一律 417。
+ * 映射表见 `config.js` 的 `signVariantByVersion`。
+ *
+ * @param {string} [version] URL 里将出现的 `version` 值，如 `'3.141.1'`
+ * @returns {'exercise'|'pk'}
+ */
+function variantForVersion(version) {
+  const v = String(version || '');
+  const map = config.signVariantByVersion || {};
+  return map[v] || config.defaultSignVariant || 'exercise';
+}
+/**
  * 算主域签名 `sign`（纯 JS 复刻，平台无关；正确性以 src/sign.js 真机 fixture 为准）。
  * 公式：`chainMd5(path, T)`，path 为 encodedPath（不含 query），ts 恒为 0。
+ *
+ * ★ 2026-10-08：变体优先由 `opts.version` 推导（与真机规则一致）；
+ *   仍保留 `opts.variant` 显式覆盖，供实验脚本用。
+ *
  * @param {string} urlPath 只含路径
- * @param {{variant?: 'exercise'|'pk'}} [opts] 用哪套签名资产，默认 `exercise`；PK 新端点传 `'pk'`
+ * @param {{variant?: 'exercise'|'pk', version?: string}} [opts]
+ *        `version` 给出时将按其推导资产；`variant` 显式指定则优先生效
  * @returns {string} 32 位 hex
  */
 function calcSign(urlPath, opts) {
-  const pk = !!(opts && opts.variant === 'pk');
+  const o = opts || {};
+  const chosen = o.variant || variantForVersion(o.version);
+  const pk = chosen === 'pk';
   const p = String(urlPath);
   const minute = Math.floor(Date.now() / 60000);
   const key = minute + '|' + p;
@@ -189,5 +210,6 @@ module.exports = {
   gzipLikeDevice,
   encodeSubmitBody,
   calcSign,
+  variantForVersion,
   selfTest,
 };

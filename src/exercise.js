@@ -79,11 +79,15 @@ function buildExerciseUrl(path, params) {
 /**
  * 练习端点的签名策略：一律带 sign（不受 `config.signMode` 影响）。
  * 不带 sign → 417（solar-encoder 拦）；sign 由原生库算，算不出返回 null（端点会 417 但 UI 可见响应）。
+ *
+ * ★ 2026-10-08：变体**由 version 推导**（不再写死 `'exercise'`）。
+ *   服务端按 URL 里的 `version` 选签名算法，写死资产在换版本时会静默错配 → 417。
+ *   本函数的 URL 由 `buildPracticeUrl` 组装，公共参数取 `PK.commonQuery.version`，
+ *   故显式传它，语义与真机一致。
  */
 function maybeSign(path) {
   try {
-    // 练习走「练习版」签名资产（variant: 'exercise'，配 version=3.140.1）
-    return nativeLib.calcSign(path, { variant: 'exercise' });
+    return nativeLib.calcSign(path, { version: PK.commonQuery.version });
   } catch (e) {
     // 算不出来 → 不带。此时练习端点会 417，
     // 但至少不抛异常，UI 能看到明确的服务端响应。
@@ -228,14 +232,37 @@ async function getExam(jar, keypointId, limit, opts) {
  * @returns {Promise<{status:number, json:object|null, text:string}>}
  */
 async function submitExam(jar, examId, exam, opts) {
-  const path = '/leo-math/android/exams/' + examId;
+  // ★ 必须带 `/v2/`：2026-10-08 双路径对照实验（同一份 body、仅路径不同）：
+  //     PUT /leo-math/android/exams/{id}      → 401（网关不认这条路）
+  //     PUT /leo-math/android/exams/v2/{id}   → 400（路由存在、鉴权通过；400 是 body 内容问题）
+  //   真机原生日志里的 7 次提交也**全部**是带 `/v2/` 的那条。
+  const path = '/leo-math/android/exams/v2/' + examId;
+
+  // ★ body 必须**编码后发**（与 `attend` 同一纪律）。
+  //
+  //   真机日志逐字证据（auto_oral-2026-10-01.log 18:14:48）：
+  //     [PKT][REQ] PUT /leo-math/android/exams/v2/1555281849442996224?... body=˲��)�k...
+  //   body 是二进制密文，**不是**可读 JSON。
+  //
+  //   原先发明文 JSON → 服务端反序列化失败 → 400 `{"message":"error"}`。
+  //   注：开发早期「练习提交发明文」的结论是错的（当时用错了路径，
+  //   401 掩盖了 body 问题；换成正确的 /v2/ 路径后 400 才暴露出来）。
+  //
+  //   编码链路与 attend 完全一致：JSON → gzip(仿设备) → keystream XOR。
+  let cipher;
+  try {
+    cipher = nativeLib.encodeSubmitBody(Buffer.from(JSON.stringify(exam), 'utf8'));
+  } catch (e) {
+    return { status: null, text: '编码失败：' + e.message, error: true };
+  }
+
   const r = await request({
     url: buildExerciseUrl(path),
     method: 'PUT',
     jar,
-    body: Buffer.from(JSON.stringify(exam), 'utf8'),
+    body: cipher,
     signal: opts && opts.signal,
-    headers: exerciseHeaders({ 'Content-Type': 'application/json' }),
+    headers: exerciseHeaders({ 'Content-Type': 'application/octet-stream' }),
   });
   return { status: r.status, json: safeJson(r.text), text: r.text };
 }
@@ -438,6 +465,8 @@ async function runPractice(jar, opts) {
   }
 
   const exam = g.json;
+  /** 出题**成功**的时刻（提交节奏校验的基准，见下方「防机器秒答」注释）。 */
+  const matchOkAt = Date.now();
   emit({
     type: 'ex-match-ok',
     message: `出题成功 examId=${exam.idString} ${exam.keypoint} 共 ${exam.questionCnt} 题（预计 +${exam.questionCnt * 2} 经验）`,
@@ -446,6 +475,41 @@ async function runPractice(jar, opts) {
   // 2) 作答（抄答案 + 生成笔迹 —— 服务端靠笔迹判卷）
   live();
   const answered = answerAll(exam, o.costTimePerQuestionMs);
+
+  // ★★ 2026-10-08：提交前必须**真实等待**声明的作答时长。
+  //
+  // 决定性证据（tools/probe-400-cause.js，同一份 body 连续提交三次）：
+  //
+  //   | 组 | 出题→提交 间隔 | 顶层成绩 | 结果      |
+  //   |----|---------------|----------|-----------|
+  //   | A  | ~2s           | 未填     | 400 error |
+  //   | B  | ~7s           | 填了     | 400 error |
+  //   | C  | ~15s          | 未填     | **200** ✅ |
+  //
+  // A 与 C 的 body **完全相同**（都不动顶层 correctCnt/costTime），
+  // 唯一差别是调用时刻 ⇒ 400 与 body 内容无关，是**时间相关**的校验。
+  //
+  // 服务端比对「本次提交时刻 − 出题时刻」与请求里声明的总耗时：
+  //   10 题 × 900ms = 9s ＞ 实际间隔 2s ⇒ 判为机器秒答 ⇒ 400 error。
+  // 这也解释了 10 局全败：主循环出题后几乎立刻提交。
+  //
+  // 修法：提交前等到「距出题已过 ≈ 声明耗时」。留一点余量（+300ms）
+  // 抵消网络/时钟抖动，否则仍可能被判「快了一丁点」。
+  const declaredMs = Math.max(0, Number(answered.costTime) || 0);
+  // 注意基准要用**出题成功**时刻（matchOkAt），不能用 tMatch：
+  // tMatch 是出题**开始**时刻，若中间被 429 限流重试过，会把重试等待
+  // 也算进 elapsed → 高估已过时间 → 等待不足 → 仍可能被判秒答。
+  const elapsedMs = Date.now() - matchOkAt;
+  const waitMs = declaredMs - elapsedMs + 300;
+  if (waitMs > 0) {
+    emit({
+      type: 'ex-pace',
+      message: `按声明耗时等待 ${(waitMs / 1000).toFixed(1)}s 再提交（防「机器秒答」校验，已过 ${(elapsedMs / 1000).toFixed(1)}s / 需 ${(declaredMs / 1000).toFixed(1)}s）`,
+    });
+    await sleep(waitMs, o.signal);
+    live();
+  }
+
   emit({ type: 'ex-submit', message: `提交（全对 ${answered.correctCnt}/${answered.questionCnt}，含笔迹）` });
   const s = await submitExam(jar, exam.idString, answered, { signal: o.signal });
   if (s.status !== 200) {

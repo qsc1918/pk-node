@@ -98,12 +98,12 @@ function ts() {
     if (r && r.ok) {
       ok++;
       totalExp += r.exp || 0;
-      console.log('[%s] 第 %2d/%d 局 ✓  examId=%s  判对 %d/%d  +%d 经验  (%ss)',
+      console.log('[%s] 第 %d/%d 局 ✓  examId=%s  判对 %d/%d  +%d 经验  (%ss)',
         ts(), i, ROUNDS, r.examId, r.correctCnt, r.questionCnt, r.exp, sec);
       detail.push({ round: i, ok: true, correct: r.correctCnt, total: r.questionCnt, exp: r.exp, sec: Number(sec) });
     } else {
       fail++;
-      console.log('[%s] 第 %2d/%d 局 ✗  %s  (%ss)',
+      console.log('[%s] 第 %d/%d 局 ✗  %s  (%ss)',
         ts(), i, ROUNDS, String((r && (r.text || r.message)) || '未知失败').slice(0, 140), sec);
       detail.push({ round: i, ok: false, stage: r && r.stage, status: r && r.status,
                     text: String((r && r.text) || '').slice(0, 200), sec: Number(sec) });
@@ -136,11 +136,11 @@ function ts() {
     for (const f of fails) {
       const k = (f.stage || 'unknown') + ' HTTP ' + (f.status || '-');
       byStage[k] = (byStage[k] || 0) + 1;
-      console.log('  第 %d 局: %s  %s', f.round, k, f.text || '');
+      console.log('  第 ' + f.round + ' 局: ' + k + '  ' + (f.text || ''));
     }
     console.log();
     console.log('按阶段汇总:');
-    for (const k of Object.keys(byStage)) console.log('  %-28s %d 次', k, byStage[k]);
+    for (const k of Object.keys(byStage)) console.log('  ' + k.padEnd(28) + ' ' + byStage[k] + ' 次');
   }
 
   require('node:fs').writeFileSync('/tmp/run10-result.json',

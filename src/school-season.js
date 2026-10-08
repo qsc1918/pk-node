@@ -208,12 +208,25 @@ function buildWsUrl(wsPath, params) {
   return WS_HOST + encodedPath + '?' + q.toString();
 }
 
-/** sign（pk 变体；算不出静默降级——但 WS 需要它，建议保持 PK_SIGN_MODE=auto）。 */
-function appendSign(q, encodedPath) {
+/**
+ * sign（算不出静默降级 —— WS 需要它，建议保持 PK_SIGN_MODE=auto）。
+ *
+ * ★ 2026-10-08 修正：变体**由 version 推导**，不再写死 `'pk'`。
+ *
+ *   服务端按 `version` 选签名算法（实测矩阵：3.141.1↔练习资产、3.143.1↔PK 资产，
+ *   交叉组合一律 417）。本文件走 `PK.commonQuery`（当前 3.141.1），
+ *   写死 `'pk'` 就会错配 → 417。
+ *
+ * @param {URLSearchParams} q 查询串
+ * @param {string} encodedPath sign 的输入路径（不含 query）
+ * @param {string} [version] 本请求带的 version；缺省取 `PK.commonQuery.version`
+ */
+function appendSign(q, encodedPath, version) {
   try {
     const mode = String(config.signMode || 'off').toLowerCase();
     if (mode === 'off') return;
-    const sign = nativeLib.calcSign(encodedPath, { variant: 'pk' });
+    const v = version || (q.get && q.get('version')) || PK.commonQuery.version;
+    const sign = nativeLib.calcSign(encodedPath, { version: v });
     if (sign) q.set('sign', sign);
   } catch (e) { /* ignore */ }
 }
