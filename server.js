@@ -20,6 +20,10 @@ const nativeLib = require('./src/native');
 const signLib = require('./src/sign');
 const strokes = require('./src/strokes');
 const exercise = require('./src/exercise');
+// 顶层引入 leo：`DELETE /api/leo/accounts/:id` 需要它来发包退登。
+// （此前只在 42 行的局部作用域里 require 过 —— 那里拿不到，
+//   直接写 `leo.logout()` 会抛 `leo is not defined`。端到端测试暴露的。）
+const leo = require('./src/leo');
 const pkH5 = require('./src/pk-h5-proxy');
 const pkH5Local = require('./src/pk-h5-localserver');
 const schoolSeason = require('./src/school-season');
@@ -845,9 +849,41 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
     const id = Number(leoDel[1]);
     const acc = db.getLeoAccount(id);
     if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '账号不存在' });
-    db.deleteLeoAccount(id);
-    db.audit(user.id, 'leo_delete', 'id=' + id, clientIp(req));
-    return sendJson(res, 200, { ok: true });
+
+    // ★ 2026-10-08 修正（用户指出）：退出账号必须**先发包退登**，不能直接删本地。
+    //
+    //   旧行为只做 db.deleteLeoAccount(id) —— 纯本地删库，一个包都不发。
+    //   后果：① 服务端会话没清（小猿那边登录态还活着）
+    //         ② 该账号占用的 ks_* 设备链还被锁着
+    //         ③ 若服务端限制同账号并发登录，重新登录可能被拒
+    //
+    //   正确顺序（与「逆向系老挂」cn.apixiaoyuan.app 的 AuthRepository.logout 一致）：
+    //     先用该账号的 cookie 发包退登 → 再清本地
+    //   **顺序不能反** —— 先清本地就拿不到 cookie 去调服务端了。
+    //
+    //   两条链路都试、各自失败不阻塞（App 端用 runCatching 包住）：
+    //     POST /accounts/android/logout      （账号域）
+    //     POST /leo-profile/android/logout   （主域）
+    //
+    //   查询参数 `?keepLocal=1`：只退登、保留本地记录（换号/调试用）。
+    let logout = null;
+    try {
+      const jar = jobs.jarOf(acc);
+      logout = await leo.logout(jar, {});
+    } catch (e) {
+      logout = { attempts: [], ok: false, error: e && e.message ? e.message : String(e) };
+    }
+
+    const keepLocal = u.searchParams.get('keepLocal') === '1';
+    if (!keepLocal) db.deleteLeoAccount(id);
+    db.audit(user.id, keepLocal ? 'leo_logout_only' : 'leo_delete',
+      'id=' + id + ' logout=' + JSON.stringify(logout), clientIp(req));
+
+    return sendJson(res, 200, {
+      ok: true,
+      keepLocal: keepLocal,
+      loggedOut: logout,
+    });
   }
 
   /* -------------------------- PK H5 诊断（浏览器回传） -------------------------- */

@@ -199,6 +199,80 @@ function maybeSign(urlPath, version) {
   }
 }
 
+/* ------------------------------ 登出 ------------------------------ */
+/**
+ * 小猿登出 —— **先发包退登，再清本地**（顺序不能反）。
+ *
+ * ## 为什么必须发包
+ *
+ * 只删本地记录的话：
+ *   · 服务端会话仍然有效（小猿那边登录态还活着）
+ *   · 该账号占用的 `ks_*` 设备链还被锁着
+ *   · 若服务端限制同账号并发登录，重新登录可能被拒
+ *
+ * ## 权威做法（来自「逆向系老挂」cn.apixiaoyuan.app）
+ *
+ * `core/auth/AuthRepository.kt`：
+ *
+ *     suspend fun logout() {
+ *         runCatching { ServiceLocator.ytkApi.logout() }        // 账号域
+ *         runCatching { ServiceLocator.profile.leoLogout() }    // 主域
+ *         SessionStore.clear()
+ *     }
+ *
+ * 两条链路**都试、各自失败不阻塞**（App 端用 runCatching 包住）。
+ *
+ * ## 两条链路（均无参数 POST）
+ *
+ * | 链路 | 方法 | 路径 | 基域 |
+ * |---|---|---|---|
+ * | 账号域 ytk | POST | `/accounts/android/logout` | ytk |
+ * | 主域 leo   | POST | `/leo-profile/android/logout` | leo |
+ *
+ * @param {object} jar  该账号的 cookie jar（**必须在清本地之前调用**）
+ * @param {{signal?:object}} [opts]
+ * @returns {Promise<{attempts:Array<{host:string,path:string,status:number|null,error:string|null}>, ok:boolean}>}
+ */
+async function logout(jar, opts) {
+  const o = opts || {};
+  const attempts = [];
+  const targets = [
+    { host: 'ytk', path: '/accounts/android/logout' },
+    { host: 'leo', path: '/leo-profile/android/logout' },
+  ];
+
+  for (const t of targets) {
+    let status = null;
+    let error = null;
+    try {
+      // ★ 主域端点（leo-*）被 solar-encoder 保护：必须补公共参数 + sign，
+      //   否则恒 417（实测：直接 POST /leo-profile/android/logout → 417）。
+      //   账号域（ytk）无此要求，原样 POST 即可（实测 200）。
+      const isYtk = t.host === 'ytk';
+      const url = isYtk
+        ? (config.ytkBase || config.ytk) + t.path
+        : buildUrl(t.path, {}, {});          // buildUrl 内部补 COMMON_QUERY + sign
+      const r = await request({
+        url: url,
+        method: 'POST',
+        jar: jar,
+        signal: o.signal,
+        headers: isYtk
+          ? riskHeaders()
+          : Object.assign({}, mainDomainHeaders(), riskHeaders()),
+      });
+      status = r.status;
+    } catch (e) {
+      error = e && e.message ? e.message : String(e);
+    }
+    attempts.push({ host: t.host, path: t.path, status: status, error: error });
+  }
+
+  // 两条都算「成功或已失效」即视为 ok（404/401 也说明服务端已无该会话）
+  const ok = attempts.every((a) => a.error === null || a.status === 404 || a.status === 401);
+  return { attempts: attempts, ok: ok };
+}
+
 /* ------------------------------ PK 接口 ------------------------------ */
 
 /** PK 端点统一带的固定参数。真机实测：只有 `_productId=611`，**没有 `_appId`**。 */
@@ -531,5 +605,6 @@ module.exports = {
   ytkSmsVerify,
   ytkSmsLogin,
   ytkPasswordLogin,
+  logout,
   CookieJar,
 };

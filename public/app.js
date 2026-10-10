@@ -431,10 +431,26 @@ function renderLeoList(accounts) {
       } catch (err) { toast(err.message, 'err'); }
     });
     el.querySelector('[data-act="del"]').addEventListener('click', async () => {
-      if (!confirm('确定删除该小猿账号？其登录态将从本地库移除。')) return;
+      // ★ 2026-10-08：删账号会**先向服务端发包退登**，再清本地记录。
+      //
+      //   只删本地是错的 —— 服务端会话仍然有效、ks_* 设备链还被锁着。
+      //   顺序与「逆向系老挂」的 AuthRepository.logout 一致：
+      //     先 POST /accounts/android/logout + POST /leo-profile/android/logout，
+      //     再清本地（顺序不能反：先清本地就拿不到 cookie 去调服务端了）。
+      //
+      //   退登会**作废该账号的服务端登录态**，之后需重新登录 —— 所以确认文案要说清。
+      if (!confirm('确定退出该小猿账号？\\n\\n'
+        + '会先向小猿服务端发包退登（清会话），再移除本地记录。\\n'
+        + '退登后该账号需重新登录才能使用。')) return;
       try {
-        await api('/api/leo/accounts/' + a.id, { method: 'DELETE' });
-        toast('已删除', 'ok');
+        const r = await api('/api/leo/accounts/' + a.id, { method: 'DELETE' });
+        const att = (r && r.loggedOut && r.loggedOut.attempts) || [];
+        const okN = att.filter((x) => x.status === 200).length;
+        if (att.length) {
+          toast('已退登并移除（服务端 ' + okN + '/' + att.length + ' 条链路返回 200）', 'ok');
+        } else {
+          toast('已移除本地记录（退登未执行或失败）', 'warn');
+        }
         await loadLeoAccounts();
       } catch (err) { toast(err.message, 'err'); }
     });
