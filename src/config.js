@@ -168,7 +168,7 @@ const config = {
      * 默认模式。用户要求「主打上榜」→ 默认 `rank`。
      * 可用 `PK_EX_SUBMIT_GAP_MODE=speed|rank` 覆盖。
      */
-    defaultMode: process.env.PK_EX_SUBMIT_GAP_MODE || 'rank',
+    defaultMode: process.env.PK_EX_SUBMIT_GAP_MODE || 'rush',
 
     /**
      * 两个模式（实测系数，2026-10-08）。
@@ -182,8 +182,29 @@ const config = {
      * | `rank`  | **上榜，主打上榜** | 500ms | 500ms | 结算时间要卡到 0.5s/题 |
      */
     modes: {
-      speed: { perQMs: 200, padMs: 300, label: '刷分模式（速度优先）' },
-      rank: { perQMs: 500, padMs: 500, label: '上榜模式' },
+      /**
+       * **冲榜模式** —— 所有间隔压到实测最小。
+       *
+       * ## 实测依据（tools/calibrate-submit-min.js，10 题梯度）
+       *
+       *   300ms(30ms/题)  → 400
+       *   1754ms(175ms/题)→ 400
+       *   2473ms(247ms/题)→ ✅ 200
+       *   2602ms(260ms/题)→ ✅ 200
+       *
+       * ⇒ 单题下限约 **200~260ms**。
+       *
+       * `perQMs`（每题 costTime）仍保持 500ms —— 已确认服务端**不校验**每题之和
+       * （tools/probe-top-vs-perq.js），保留它可维持「上榜速度」资格；
+       * 真正决定等待的是 `basePerQMs`（顶层），压到 200ms/题。
+       */
+      rush: { perQMs: 500, basePerQMs: 250, padMs: 300, label: '冲榜模式（间隔最小）' },
+
+      /** 刷分：速度优先，但不追最小。 */
+      speed: { perQMs: 200, basePerQMs: 200, padMs: 300, label: '刷分模式（速度优先）' },
+
+      /** 上榜：结算时间卡到 0.5s/题。 */
+      rank: { perQMs: 500, basePerQMs: 200, padMs: 500, label: '上榜模式' },
     },
     /** 旧字段兼容：无模式信息时的兜底余量。 */
     fixedPadMs: 500,
@@ -217,6 +238,15 @@ const config = {
 
     /** 口算每局可选的最大题数（服务端上限，超出会被拒）。 */
     maxLimit: 200,
+
+    /**
+     * 出题 429 后的轮询间隔（毫秒）——**冲榜模式压到最小**。
+     *
+     * 为什么能这么小：不需要「提前等够冷却」，而是**贴着窗口轮询抢**，
+     * 一放行立刻发车。实测（tools/recheck-cooldown.js）冷却是每账号独立的
+     * 硬约束，抢反而比等更快、更准。
+     */
+    rushRetryMs: process.env.PK_EX_RUSH_RETRY_MS || 400,
   },
 
   /**

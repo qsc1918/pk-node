@@ -380,6 +380,8 @@ function resolveSubmitPace(opts) {
     }
     return {
       perQMs: Math.max(0, Number(v.perQMs) || 0),
+      // 顶层系数：决定**等待时长**（服务端只校验顶层 costTime ≤ 实际间隔）
+      basePerQMs: v.basePerQMs == null ? null : Math.max(0, Number(v.basePerQMs)),
       padMs: Math.max(0, Number(v.padMs) == null ? fallbackPad : Number(v.padMs)),
       label: v.label || name,
       mode: name,
@@ -562,11 +564,24 @@ async function runPractice(jar, opts) {
       emit({ type: 'ex-fail', message: `出题持续频控（已试 ${tries} 次 / ${Math.round(waited / 1000)}s）` });
       return { ok: false, stage: 'match', status: g.status, text: g.text };
     }
+    // ★ 冲榜模式：贴着窗口轮询抢（400ms 一跳），而不是提前等够。
+    //   依据 tools/recheck-cooldown.js：冷却是每账号独立的硬约束，
+    //   抢比等更快也更准（少等一个周期就是纯赚）。
+    const retryMs = (function () {
+      try {
+        const p = resolveSubmitPace(o);
+        if (p && p.mode === 'rush') {
+          const r = Number((config.exerciseSpeed || {}).rushRetryMs);
+          if (Number.isFinite(r) && r > 0) return r;
+        }
+      } catch (e) { /* ignore */ }
+      return MATCH_RETRY_INTERVAL_MS;
+    })();
     emit({
       type: 'ex-rate-limit',
-      message: `出题被限流（HTTP 429），${MATCH_RETRY_INTERVAL_MS / 1000}s 后重试（已等 ${Math.round(waited / 1000)}s）`,
+      message: `出题被限流（HTTP 429），${(retryMs / 1000).toFixed(1)}s 后重试（已等 ${Math.round(waited / 1000)}s）`,
     });
-    await sleep(MATCH_RETRY_INTERVAL_MS, o.signal);
+    await sleep(retryMs, o.signal);
     live();
   }
 
@@ -637,7 +652,11 @@ async function runPractice(jar, opts) {
    *
    *   （我此前记的「服务端不看声明值」是**误读** —— 那组恰巧实际间隔也够。）
    */
-  const basePerQ = Math.max(0, Number(process.env.PK_EX_SUBMIT_BASE_PER_Q_MS) || 200);
+  // 顶层系数优先级：模式自带 > 环境变量 > 默认 200
+  // （冲榜模式自带 200ms/题；rank/speed 也各自给了 basePerQMs）
+  const basePerQ = Math.max(0,
+    (pace.basePerQMs == null ? Number(process.env.PK_EX_SUBMIT_BASE_PER_Q_MS) : pace.basePerQMs)
+    || 200);
   const minGapMs = gapBase + qNum * basePerQ;
 
   // 基准必须用**出题成功**时刻（matchOkAt），不能用 tMatch：

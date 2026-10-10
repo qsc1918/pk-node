@@ -43,7 +43,7 @@ function hr(t) { line(''); line('='.repeat(88)); line(t); line('='.repeat(88)); 
 
   hr('账号 ' + acc.id + '  知识点 ' + KP + '  题数 ' + NQ);
 
-  for (const mode of ['rank', 'speed']) {
+  for (const mode of ['rush', 'rank', 'speed']) {
     line('');
     line('--- 模式 ' + mode + ' ---');
     const t0 = Date.now();

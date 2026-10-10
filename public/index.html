@@ -252,7 +252,7 @@
         经验 = <b>答对题数 × 2</b>（10 题 20 / 100 题 200）。<br>
         <b>练习链路的出题冷却实测约 1 秒/账号</b>（2026-10-01 复测：连续出题 4 次全 200）——
         <b>注意「刷局（PK）」完全是另一回事：那边有 ≈60 秒的冷却</b>，别把这里的数字套过去；
-        引擎<b>贴着冷却自动配速</b>，撞频控（429）会自动重试。建议 <code>limit=100</code>（一轮 200 经验，约 1.5 秒）。
+        引擎<b>贴着冷却自动配速</b>，撞频控（429）会自动重试。建议 <code>limit=200</code>（一轮 400 经验）。<b>注</b>：单账号「1.5 秒/轮」在 2026-10-01 时成立，此后服务端收紧了出题冷却（实测「零间隔连发」第 1 次 200、之后全 429），现已无法回到该速度 —— 想提高吞吐请<b>多账号并行</b>（冷却是每账号独立的）。
       </p>
       <div class="row">
         <label class="grow">知识点 ID<input id="prac-kp" type="number" value="16"></label>
@@ -262,8 +262,9 @@
       <div class="row">
         <label class="grow">模式
           <select id="prac-pace">
-            <option value="rank" selected>上榜（0.5s/题）—— 主打，结算时间卡到 0.5s/题</option>
-            <option value="speed">刷分（0.2s/题）—— 速度优先，够过提交</option>
+            <option value="rush" selected>冲榜（间隔最小）—— 所有间隔压到实测下限</option>
+            <option value="rank">上榜（0.5s/题）—— 结算时间卡到 0.5s/题</option>
+            <option value="speed">刷分（0.2s/题）—— 速度优先</option>
           </select>
         </label>
         <label class="grow">单题间隔（ms，留空=按上方节奏）<input id="prac-pacems" type="number" min="0" step="50" placeholder="如 200 / 500"></label>
