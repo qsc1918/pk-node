@@ -67,6 +67,21 @@ const NEVER = [
   'node_modules',
 ];
 
+/** 永不打包的**文件模式**（按路径后缀判断，防 Python 编译产物混入）。 */
+const NEVER_EXT = [
+  '.pyc',            // __pycache__/*.pyc：本机 Python 版本相关的垃圾
+  '.sqlite', '.sqlite-shm', '.sqlite-wal',
+  '.log',
+];
+
+/** 永不打包的**目录名**（出现在任意层级都要挡）。 */
+const NEVER_DIR = [
+  '__pycache__',
+  'node_modules',
+  '.git',
+  '.wrangler',
+];
+
 function walk(rel, out) {
   const abs = path.join(ROOT, rel);
   const st = fs.statSync(abs);
@@ -87,8 +102,18 @@ function collect() {
   // 二次过滤
   return files.filter((f) => {
     const top = f.split(path.sep)[0];
+    const parts = f.split(path.sep);
     const never = NEVER.some((n) => f === n || f.startsWith(n + path.sep) || top === n);
     if (never) { console.warn('  ⚠ 已排除：' + f); return false; }
+    // 目录名黑名单（任意层级）
+    if (parts.some((p) => NEVER_DIR.includes(p))) {
+      console.warn('  ⚠ 已排除（目录黑名单）：' + f); return false;
+    }
+    // 后缀黑名单
+    const lower = f.toLowerCase();
+    if (NEVER_EXT.some((e) => lower.endsWith(e))) {
+      console.warn('  ⚠ 已排除（后缀黑名单）：' + f); return false;
+    }
     return true;
   });
 }
@@ -171,11 +196,14 @@ const leaks = allInPkg.filter((f) =>
   /(^|\/)(data|node_modules)(\/|$)/.test(f)
   || f.includes('.sqlite')
   || /(^|\/)cloudflared$/.test(f)          // 只挡二进制本体，不挡 get-cloudflared.sh
+  // Python 编译产物（本机 Python 版本相关，无意义且污染包）
+  || /(^|\/)__pycache__(\/|$)/.test(f)
+  || f.endsWith('.pyc')
   // ⚠️ bin/native 里**只允许 lre.so 与 lre_pk.so**（sign 纯 JS 模拟读它们当数据）；
   //    其余 arm64 可执行库（linker64/dump7/libc*/libContentEncoder*）必须挡掉。
   || (f.startsWith('bin/native') && !f.endsWith('bin/native/lre.so') && !f.endsWith('bin/native/lre_pk.so')));
 if (leaks.length) { console.error('  ✘ 包内出现不应有的文件：' + leaks.join(', ')); process.exit(1); }
-console.log('  [OK] 无 data/ 、无 sqlite、无 cloudflared、bin/native 只含 lre.so / lre_pk.so');
+console.log('  [OK] 无 data/ 、无 sqlite、无 cloudflared、无 __pycache__/*.pyc、bin/native 只含 lre.so / lre_pk.so');
 
 // 2) 关键文件在位
 for (const must of ['server.js', 'start.bat', 'start.sh', 'bin/start.js', 'bin/keystream.bin',

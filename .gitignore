@@ -32,3 +32,7 @@ deploy/pages/.wrangler/
 
 # 站点配置文件（部署产物，由 wrangler 上传）
 deploy/pages/site.json
+
+# Python 编译产物（tools/ 下的脚本会生成）
+__pycache__/
+*.pyc
