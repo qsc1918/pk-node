@@ -553,7 +553,27 @@ async function runPractice(jar, opts) {
   for (;;) {
     g = await getExam(jar, kp, limit, { signal: o.signal });
     tries++;
-    if (g.status === 200 && g.json && g.json.idString) break;
+    // ★★ 2026-10-08 修正：`idString === "0"` 是**空卷**（账号级软限），
+    //   不是成功。旧判断 `g.json.idString` 会把字符串 "0" 当成真值 →
+    //   空卷被误判为出题成功 → 后面整卷作答 + 提交全部白做。
+    //
+    //   实测（tools/diagnose-empty-exam.js，11 账号 × 2 知识点）：
+    //     能出真卷: id=5, 18, 32, 35, 36
+    //     永远空卷: id=2, 7, 17, 27, 28（等 20s 也没用，与知识点无关）
+    //   ⇒ 空卷是**账号级**软限，只能换账号，重试无益。
+    const emptyExam = (j) => !j || j.idString == null || String(j.idString) === '0';
+    if (g.status === 200 && g.json && !emptyExam(g.json)) break;
+    if (g.status === 200 && emptyExam(g.json)) {
+      // 200 但是空卷：不是频控，重试也没用 —— 直接如实上报，让上层换账号。
+      emit({
+        type: 'ex-fail',
+        message: `出题返回空卷（idString=0）—— 该账号已被服务端软限（额度用尽或受限），换账号重试`,
+      });
+      return {
+        ok: false, stage: 'match', status: 200, empty: true, text: g.text,
+        reason: 'empty-exam',
+      };
+    }
     const rateLimited = g.status === 429 || /频繁|too_many/.test(String(g.text));
     if (!rateLimited) {
       emit({ type: 'ex-fail', message: `出题失败 HTTP ${g.status} ${String(g.text).slice(0, 90)}` });
