@@ -282,8 +282,24 @@ async function getExamResult(jar, examId, opts) {
  * 笔迹复用 [strokes]：比较题（`>`/`<`/`=`）走弧线模板，其它回落七段码。
  * @param {object} exam 出题响应
  * @param {number} [costTimePerQuestionMs] 每题耗时（下限 5ms，真机纪律）
+ * @param {number} [topCostTimeMs] 顶层 `costTime`；不给则 = 每题 × 题数
+ *
+ * ## ★ 为什么要能分开给（2026-10-08）
+ *
+ * 实测（tools/probe-top-vs-perq.js，题数 50）：
+ *
+ *   | 组 | 实际间隔 | 每题 Σ | 顶层 | 结果 |
+ *   |----|---------|--------|------|------|
+ *   | A  | 12.0s   | 25.0s  | 25.0s | ❌ 400 |
+ *   | B  | 13.5s   | 25.0s  | **11.0s** | ✅ **200** |
+ *   | C  | 15.0s   | 10.0s  | 11.0s | ✅ 200 |
+ *
+ * ⇒ 服务端只校验**顶层** `costTime ≤ 实际间隔`，不看每题之和。
+ *
+ * 于是「上榜速度」（每题 0.5s/题）与「等待时长」（按顶层算）可以解耦：
+ *   每题声明 500ms（上榜），顶层声明 200×题数（只等 40s 而非 100s）。
  */
-function answerAll(exam, costTimePerQuestionMs) {
+function answerAll(exam, costTimePerQuestionMs, topCostTimeMs) {
   const per = Math.max(5, Number(costTimePerQuestionMs) || 900);
   const questions = (exam.questions || []).map((q, idx) => {
     const answer = q.answer == null ? '' : String(q.answer);
@@ -316,10 +332,13 @@ function answerAll(exam, costTimePerQuestionMs) {
       costTime: per,
     };
   });
+  const top = Number(topCostTimeMs);
   return Object.assign({}, exam, {
     questions: questions,
     correctCnt: questions.length,
-    costTime: per * questions.length,
+    // 顶层 costTime：可独立于每题之和（见本函数 JSDoc 的说明）。
+    // 不给则沿用旧语义（= 每题 × 题数）。
+    costTime: Number.isFinite(top) && top >= 0 ? top : per * questions.length,
   });
 }
 
@@ -582,7 +601,44 @@ async function runPractice(jar, opts) {
   const gapPerQ = pace.perQMs;
   const gapBase = pace.padMs;
   const qNum = (exam.questions || []).length || 1;
-  const minGapMs = gapBase + qNum * gapPerQ;
+  /**
+   * ★★ 2026-10-08 关键解耦：**等待只按「顶层 costTime」算，不按每题之和**。
+   *
+   * ## 决定性实验（tools/probe-top-vs-perq.js，题数 50）
+   *
+   *   | 组 | 实际间隔 | 每题 Σ | 顶层 costTime | 结果 |
+   *   |----|---------|--------|--------------|------|
+   *   | A  | 12.0s   | 25.0s  | 25.0s        | ❌ 400 |
+   *   | B  | 13.5s   | 25.0s  | **11.0s**    | ✅ **200** |
+   *   | C  | 15.0s   | 10.0s  | 11.0s        | ✅ 200 |
+   *
+   *   ⇒ 服务端只校验 **顶层 costTime ≤ 实际间隔**，
+   *     **不校验**「每题 costTime 之和」。
+   *
+   * ## 于是可以两全
+   *
+   *   用户给的两个实测系数：
+   *     · 0.2s/题 → 够过提交
+   *     · 0.5s/题 → 上榜（结算时间卡到这里）
+   *
+   *   上榜要求的是**每题声明的速度**；而等待只受**顶层**约束。
+   *   所以：
+   *     · 每题声明 `pace.perQMs`（rank=500ms → 上榜速度）
+   *     · 顶层声明 `submitBasePerQMs`（=200ms → 只等这么多）
+   *
+   *   ⇒ 200 题的等待从 **100.5s 降到 40.5s**，上榜资格不变。
+   *
+   * ## 另一条已确认的约束（tools/probe-rank-vs-wait.js）
+   *
+   *   实际间隔必须 ≥ 顶层 costTime，否则 400：
+   *     A 间隔 10.2s / 顶层 10.0s → 200
+   *     B 间隔 11.3s / 顶层 25.0s → ❌ 400
+   *     C 间隔 27.0s / 顶层 25.0s → 200
+   *
+   *   （我此前记的「服务端不看声明值」是**误读** —— 那组恰巧实际间隔也够。）
+   */
+  const basePerQ = Math.max(0, Number(process.env.PK_EX_SUBMIT_BASE_PER_Q_MS) || 200);
+  const minGapMs = gapBase + qNum * basePerQ;
 
   // 基准必须用**出题成功**时刻（matchOkAt），不能用 tMatch：
   // tMatch 是出题**开始**时刻，若中间被 429 限流重试过，会把重试等待
@@ -598,15 +654,19 @@ async function runPractice(jar, opts) {
     live();
   }
 
-  // 每题声明耗时：优先用调用方给的，否则按**实际间隔**反推。
-  // 这一步只影响提交体的合理性数据，**不参与等待**（服务端不看它）。
-  const gapMs = Math.max(0, Date.now() - matchOkAt);
-  const declaredHint = Number(o.costTimePerQuestionMs) || gapPerQ;
-  const perQ = Math.min(
-    Math.max(5, declaredHint),
-    Math.max(5, Math.floor(gapMs / qNum)),
-  );
-  const answered = answerAll(exam, perQ);
+  // 每题声明耗时：优先用调用方给的，否则用**模式值**（rank=500ms → 上榜速度）。
+  // ★ 顶层 costTime 单独给 `basePerQ × 题数`（默认 200ms/题）。
+  //   依据：服务端只校验顶层 ≤ 实际间隔，不看每题之和
+  //   （tools/probe-top-vs-perq.js）。这样「上榜速度」与「等待时长」解耦：
+  //     每题 500ms（上榜）＋ 顶层 200ms×题数（只等 40s，而非 100s）。
+  //
+  // ⚠️ 每题值**不能**再被「实际间隔」压小：
+  //   旧代码写过 `Math.min(declaredHint, gapMs/qNum)`，那会把 500ms 压成
+  //   实际能给出的值（如 200ms），上榜速度就丢了。按上面的结论，
+  //   服务端不看每题之和，所以直接用模式值即可。
+  const perQ = Math.max(5, Number(o.costTimePerQuestionMs) || gapPerQ);
+  const topCost = Math.max(5, Number(o.topCostTimeMs) || basePerQ * qNum);
+  const answered = answerAll(exam, perQ, topCost);
 
   live();
   emit({ type: 'ex-submit', message: `提交（全对 ${answered.correctCnt}/${answered.questionCnt}，含笔迹）` });
