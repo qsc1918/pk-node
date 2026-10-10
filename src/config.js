@@ -198,13 +198,13 @@ const config = {
        * （tools/probe-top-vs-perq.js），保留它可维持「上榜速度」资格；
        * 真正决定等待的是 `basePerQMs`（顶层），压到 200ms/题。
        */
-      rush: { perQMs: 500, basePerQMs: 250, padMs: 300, label: '冲榜模式（间隔最小）' },
+      rush: { perQMs: 500, basePerQMs: 200, padMs: 600, label: '冲榜模式（间隔最小）' },
 
       /** 刷分：速度优先，但不追最小。 */
-      speed: { perQMs: 200, basePerQMs: 200, padMs: 300, label: '刷分模式（速度优先）' },
+      speed: { perQMs: 200, basePerQMs: 200, padMs: 600, label: '刷分模式（速度优先）' },
 
       /** 上榜：结算时间卡到 0.5s/题。 */
-      rank: { perQMs: 500, basePerQMs: 200, padMs: 500, label: '上榜模式' },
+      rank: { perQMs: 500, basePerQMs: 200, padMs: 600, label: '上榜模式' },
     },
     /** 旧字段兼容：无模式信息时的兜底余量。 */
     fixedPadMs: 500,

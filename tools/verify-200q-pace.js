@@ -48,7 +48,8 @@ function hr(t) { line(''); line('='.repeat(84)); line(t); line('='.repeat(84)); 
   line('  对照：用户看到的 180.3s = 200 × 900ms + 300ms（旧算法，已废弃）');
 
   hr('② 真实跑一轮（' + NQ + ' 题，默认模式）');
-  line('  注意：出题冷却约 58s，可能要等；这里只观察「等待文案」与结果。');
+  line('  注意：出题间隔实测约 1.1s/账号（tools/measure-match-interval.js）；');
+  line('        若账号被软限（出题返回 idString=0）会拿不到卷，换账号即可。');
   const t0 = Date.now();
   const seen = [];
   const r = await exercise.runPractice(jar, {
