@@ -37,6 +37,7 @@ const OUTDIR = path.join(DIST, NAME);
 const INCLUDE = [
   'package.json',
   'README.md',
+  'CHANGELOG.md',
   'DISCLAIMER.md',
   'LICENSE',
   'start.bat',
@@ -65,6 +66,15 @@ const NEVER = [
   '.git',
   'dist',
   'node_modules',
+  // ★ 2026-10-11：**个人文档不进发布包**。
+  //
+  //   `docs/` 在 INCLUDE 里（项目文档要随包发），但这份是**账号申诉信**——
+  //   里面含 GitHub 用户名、封禁经过、申诉正文等**私人内容**，
+  //   与 pk-node 这个软件毫无关系。发布包是公开分发的，
+  //   把私人文件打进去属于无意泄漏。
+  //
+  //   按**精确路径**排除（不是整个 docs/），项目文档照常打包。
+  'docs/appeal-report-sxd91.md',
 ];
 
 /** 永不打包的**文件模式**（按路径后缀判断，防 Python 编译产物混入）。 */
@@ -196,9 +206,13 @@ const leaks = allInPkg.filter((f) =>
   /(^|\/)(data|node_modules)(\/|$)/.test(f)
   || f.includes('.sqlite')
   || /(^|\/)cloudflared$/.test(f)          // 只挡二进制本体，不挡 get-cloudflared.sh
-  // Python 编译产物（本机 Python 版本相关，无意义且污染包）
+// Python 编译产物（本机 Python 版本相关，无意义且污染包）
   || /(^|\/)__pycache__(\/|$)/.test(f)
   || f.endsWith('.pyc')
+  // ★ 个人文档（账号申诉信）—— 与软件无关，不进公开发布包。
+  //   NEVER 里已挡一道，这里再挡一道：万一将来有人把 NEVER 那行删了，
+  //   内容校验仍然会拦下来（双保险）。
+  || f.includes('appeal-report')
   // ⚠️ bin/native 里**只允许 lre.so 与 lre_pk.so**（sign 纯 JS 模拟读它们当数据）；
   //    其余 arm64 可执行库（linker64/dump7/libc*/libContentEncoder*）必须挡掉。
   || (f.startsWith('bin/native') && !f.endsWith('bin/native/lre.so') && !f.endsWith('bin/native/lre_pk.so')));

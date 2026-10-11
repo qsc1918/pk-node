@@ -158,22 +158,17 @@ check('leo.js 导出齐全', missingLeo.length === 0,
 // Windows 上算不出来 → 练习端点必然 417（x-block-by: solar-encoder）。
 // 现在改由 src/lre-emu.js 在 JS 里执行同一段机器码，判据是「真机抓包 fixture 逐字节一致」。
 {
-  const lreEmu = require(path.join(root, 'src', 'lre-emu'));
-  const FIXTURE_T = '331546629839215717298392312983921519499463992983919162712654497319929839215'
-    + '33554432459678392983923159678391704973199175967839994639929839215192983920117298391697'
-    + '17174210221952172983911717421022195217298391691677721625298392012983920016229532317298'
-    + '39200335544322983919171677721649731991625024865992983912295323298392154973199298392159'
-    + '94639933154672486599596783927126541617733154661759678397596783999463993315467';
-  let tOk = false;
-  let tDetail = '';
-  try {
-    const T = lreEmu.calcT(29839199 * 60);     // fixture 对应的分钟（见 README）
-    tOk = T === FIXTURE_T;
-    tDetail = tOk ? '410 字符，与真机抓包逐字节一致' : ('长度 ' + T.length + '，期望 410');
-  } catch (e) {
-    tDetail = '异常：' + e.message;
-  }
-  check('T 生成（纯 JS 模拟 arm64）与真机 fixture 逐字节一致', tOk, tDetail);
+  // sign / T 链路：判据是「真机抓包 fixture 逐字节一致」。
+  //
+  // ⚠️ 样本版本必须与 bin/native/lre.so 对应（现为 3.141.1）。
+  //    小猿 3.141.1 换过签名库，旧样本必然对不上 —— 换版本时要一起更新。
+  const signLib = require(path.join(root, 'src', 'sign'));
+  const r = signLib.verifyWithFixture();
+  check('T/sign 与真机 fixture 逐字节一致（3.141.1 样本 ' + r.total + ' 组）',
+    r.ok,
+    r.ok ? (r.pass + '/' + r.total + ' 命中')
+         : ('命中 ' + r.pass + '/' + r.total + '，首条不符：' +
+            JSON.stringify(r.fails[0] || null).slice(0, 140)));
 }
 
 // 练习协议层（/leo-star /leo-math）
