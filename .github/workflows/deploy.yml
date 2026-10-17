@@ -1,0 +1,33 @@
+name: deploy
+# 把 pk-node 部署成长期运行的托管服务：https://sxd91.kdns.fr/server/pk-node
+#
+# 用 localhub/host-node 而不是 run: node server.js 的原因：
+#   Actions 步骤收尾时 runner 会 process.kill(-pid) 杀整个进程组，
+#   直接在 run: 里起的服务会在"部署成功"那一刻被杀掉。
+#   host-node 用 detached 起进程（独立成组），并用 hosting.json 持久化状态。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server.js'
+      - 'src/**'
+      - 'bin/**'
+      - 'public/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 部署为托管服务
+        uses: localhub/host-node@v1
+        with:
+          # pk-node 的启动器会优先读平台注入的 PORT（本托管会给 PORT 与 HOST）
+          command: node bin/start.js
+          health-path: /
+          env: |
+            NODE_ENV=production
+            PK_HOST=127.0.0.1
