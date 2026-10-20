@@ -10,6 +10,36 @@
 
 ---
 
+## 1.13.0
+
+> 2026-10-20
+
+**修「PK 提交恒 400」。** 服务端在 10 月中旬换了提交体口径：必须带**嵌套的 `examVO`
+副本**和**非空的 `userInfos`**，旧的「顶层平铺」结构一律
+`400 {"status":400,"message":"error"}`。
+
+### 修复
+
+- **提交体改为线上 H5 `result.html` 的形状**（`src/pk-engine.js`）：
+  外层卷 + 一份完整内层 `examVO` + `userInfos: [{ userInfo }]`。
+  实测判据：缺 `examVO` 嵌套 → 400；`userInfos` 为空 → 400；
+  元素不包 `userInfo` 一层 → 400。现在逐项对齐后 200 并正常结算。
+- **`costTime` 缺省改用真实耗时**（出题成功 → 提交）。服务端有下限：
+  10 题声明 100/200/500 全 400、1000 才过；旧代码按「题数 × 5ms」兜底
+  （10 题 = 50ms）是第二个必 400 的原因。
+- 同步修正 `cn.apixiaoyuan.app`（安卓端）的 `PkBattleModels` /
+  `PkBattleRepository` / `PkBattleEngine`，以及 Worker 部署包
+  （`deploy/wsrc`，额外补了最短答题时间）。
+- 自检（`bin/selftest.js`）的提交体断言改为校验新结构（嵌套 `examVO`、
+  `userInfos` 非空且包一层），防止再退回去。
+
+> 为什么难查：这个 400 **与 body 内容无关** —— 空 body、错 `pkIdStr`、
+> 明文/纯 gzip/随机字节，响应都是同一个 `{"status":400,"message":"error"}`，
+> 单看响应完全看不出缺什么。真因是从线上 H5 的 `Result-legacy.*.js`
+> 里读到 `It()` 组装 `A` 对象的代码，再逐项做对照实验定出来的。
+
+---
+
 ## 1.12.0
 
 > 2026-10-11

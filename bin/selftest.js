@@ -59,13 +59,15 @@ const sg = signLib.verifyWithFixture();
 check('chainMd5 4 轮公式', sg.ok, sg.ok ? sg.got : 'expect ' + sg.expect + ' got ' + sg.got);
 
 console.log('');
-console.log('3) 提交体结构（对照真机 ground truth）');
+console.log('3) 提交体结构（对照线上 H5 result.html 的 A 对象）');
 const match = {
   pkIdStr: 'TEST',
+  otherUser: { userId: 1, userName: '对手', avatarUrl: 'x' },
   examVO: {
     pointId: 1951,
     pointName: '5以内比大小',
     ruleType: -7,
+    triggerPeakMatch: 0,
     questions: [{ id: 1, examId: 1, answer: '>', answers: ['>', '<'], ruleType: 'COMPARE' }],
   },
 };
@@ -76,10 +78,14 @@ try {
   check('buildSubmitBody', false, e.message);
 }
 if (body) {
-  check('顶层字段 = pkIdStr/pointId/pointName/ruleType/questionCnt/correctCnt/costTime/questions',
-    Object.keys(body).join(',') === 'pkIdStr,pointId,pointName,ruleType,questionCnt,correctCnt,costTime,questions');
-  check('无 examVO / userInfos / updatedTime 嵌套',
-    !('examVO' in body) && !('userInfos' in body) && !('updatedTime' in body));
+  check('顶层 = examVO 字段 + questions/updatedTime/triggerPeakMatch + examVO + userInfos',
+    Object.keys(body).join(',') ===
+    'pkIdStr,pointId,pointName,ruleType,questionCnt,correctCnt,costTime,questions,updatedTime,triggerPeakMatch,examVO,userInfos');
+  check('examVO 嵌套副本存在且与顶层同源',
+    !!body.examVO && body.examVO.pkIdStr === body.pkIdStr && body.examVO.questions === body.questions);
+  check('userInfos 非空且元素是 { userInfo }',
+    Array.isArray(body.userInfos) && body.userInfos.length === 1 &&
+    !!body.userInfos[0].userInfo && body.userInfos[0].userInfo.userName === '对手');
   const q = body.questions[0];
   check('script 与 pathPoints 同源', q.script === JSON.stringify(q.curTrueAnswer.pathPoints));
   check('curTrueAnswer 四字段',

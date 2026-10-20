@@ -298,19 +298,44 @@ s3 = s2 + d2 + T                    d3 = md5(s3)
 sign = md5(s3 + d3 + salt)          salt = "wdi4n2t8edr"
 ```
 
-### 3. 提交 body 结构（真机 ground truth，**不要加字段**）
+### 3. 提交 body 结构（★ 2026-10-20 换代：外层 + 嵌套 examVO + userInfos）
 
-顶层展开 examVO 字段，**没有** `examVO` 嵌套、**没有** `userInfos`、**没有** `updatedTime`
-（加上去会 400）：
+> **旧结构（顶层平铺、无 `examVO` / `userInfos`）自 2026-10 中旬起一律 400
+> `{"status":400,"message":"error"}`，且与 body 内容无关（连空 body 都是同一个 400）。**
+
+线上 H5 `result.html`（`Result-legacy.*.js`）的真实构造：
+
+```js
+y = { ...examVO, questions, correctCnt, costTime, updatedTime: Date.now() }
+A = { ...y, examVO: y, userInfos: opponents.map(o => o.userInfo) }
+```
+
+即提交体 = **外层卷 + 一份完整的内层 `examVO` 副本 + `userInfos`**：
 
 ```json
 {"pkIdStr":"…","pointId":1951,"pointName":"5以内比大小","ruleType":-7,
- "questionCnt":20,"correctCnt":20,"costTime":8000,
+ "questionCnt":10,"correctCnt":10,"costTime":9239,"updatedTime":1792477…,
+ "triggerPeakMatch":0,
  "questions":[{"id":…,"examId":…,"content":…,"answer":…,"userAnswer":…,"answers":[…],
    "status":1,"script":"…","wrongScript":null,"ruleType":"COMPARE","errorState":0,
-   "curTrueAnswer":{"recognizeResult":"…","pathPoints":[…],"answer":1,"showReductionFraction":0}}]}
+   "curTrueAnswer":{"recognizeResult":"…","pathPoints":[…],"answer":1,"showReductionFraction":0}}],
+ "examVO":{"pkIdStr":"…","pointId":1951,…,"questions":[…同上…],"updatedTime":…,"triggerPeakMatch":0},
+ "userInfos":[{"userInfo":{"source":"leo","userId":10308,"userName":"雨儿","avatarUrl":"…"}}]}
 ```
 
+实测判据（同一局、只改一个变量）：
+
+| 变体 | 结果 |
+|---|---|
+| 旧结构（顶层平铺） | 400 |
+| + 嵌套 `examVO`，`userInfos=[]` | 400 |
+| 有嵌套 `examVO` + `userInfos=[对手]` | **200 并结算** |
+| 去掉嵌套 `examVO`（其余保留） | 400 |
+| 去掉 `updatedTime`（其余保留） | 200（非必需，H5 会带，保留） |
+
+- `userInfos` 元素必须是 `{ userInfo: {...} }`（**包一层**）；裸 userInfo 也 400。
+- `costTime` 有**下限**：10 题声明 100/200/500 全 400，1000 才过 ——
+  真机 H5 填的是真实耗时，所以引擎默认用「出题成功 → 提交」的实测毫秒数。
 - `script` = `JSON.stringify(pathPoints)`，两处**同源**。
 - 笔迹是**画布像素坐标**（x≈150–240，y≈450–500），比较题用密集弧线模板（`<` 左弧 / `>` 右弧）。
 

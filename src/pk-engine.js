@@ -1,9 +1,34 @@
 'use strict';
 // PK 刷局引擎：出题 → 组装提交 body → 加密提交 → 频控退避。
 //
-// 提交 body 结构（真机 ground truth，缺 sign 会 417）：
-//   { pkIdStr, pointId, pointName, ruleType, questionCnt, correctCnt, costTime, questions }
-// 顶层直接展开 examVO 字段，**没有** examVO 嵌套 / userInfos / updatedTime（加上去会 400）。
+// ## 提交 body 结构（★ 2026-10-20 修正：这是「提交 400」的真因）
+//
+// 服务端在 2026-10 中旬改了口径：**必须**是「外层 + 嵌套 examVO 副本 + userInfos」，
+// 缺任一项一律 `400 {"status":400,"message":"error"}`（且与 body 内容无关，
+// 传空 body 也是同一个 400，所以从响应上完全看不出缺什么）。
+//
+// 权威来源：线上 H5 `result.html` 的 `Result-legacy.*.js` ——
+//
+// ```js
+//   y = { ...examVO, questions, correctCnt, costTime, updatedTime: Date.now() }
+//   A = { ...y, examVO: y, userInfos: opponents.map(o => o.userInfo) }
+//   api.put('/leo-game-pk/{client}/math/pk/submit', dataEncrypt(A), { params })
+// ```
+//
+// 实测矩阵（同一局、只改一个变量）：
+//
+//   | 变体 | 结果 |
+//   |---|---|
+//   | 旧结构（顶层平铺，无 examVO/userInfos） | 400 |
+//   | + 嵌套 examVO，userInfos=[]            | 400 |
+//   | 有嵌套 examVO + userInfos=[对手]        | **200 并结算** |
+//   | 去掉嵌套 examVO（其余保留）             | 400 |
+//   | 去掉 updatedTime（其余保留）            | 200（非必需，H5 会带，保留） |
+//
+// ⚠️ `userInfos` 的元素必须是 `{ userInfo: {...} }`（**包一层**）：
+//    直接放 `{userId,userName,...}` 会 400（服务端 DTO 是 `List<OpponentVO>`）。
+//    这一条与 H5 源码的 `.map(o => o.userInfo)` 写法不一致，但实测以服务端为准。
+//
 // 每题 = 原始 question 深拷贝 + 补字段；`script` = JSON.stringify(pathPoints)（两处同源）。
 //
 // 笔迹（stroke）：服务端回放笔迹做一致性检查，比较类题用普通字形会被判可疑；
@@ -15,6 +40,18 @@ const strokes = require('./strokes');
 
 /** 每题 costTime 下限（毫秒）。0ms 明显不自然。 */
 const MIN_COST_TIME_MS = 5;
+
+/**
+ * `costTime` 的**服务端下限**（★ 2026-10-20 实测）。
+ *
+ * 提交体的 `costTime` 不能随便填小：10 题声明 100/200/500 一律 400，
+ * 声明 1000 才 200（同一局、同一时刻、只改这一个字段）。
+ *
+ * 真机 H5 填的是 `结束时间 - 开始时间`（真实耗时），所以**生产路径直接用实测耗时**
+ * （见 [runOneRound]）；下面两个常量只给「没传 costTimeMs」的工具/自检兜底。
+ */
+const DEFAULT_COST_TIME_PER_Q_MS = 100;
+const DEFAULT_COST_TIME_FLOOR_MS = 1000;
 
 /**
  * 兼容旧调用：生成一题的笔迹点集。
@@ -31,11 +68,25 @@ function makePath(answer, seed, strokeMode) {
 /**
  * 组装提交 body（全对秒结算）。
  *
- * @param {object} match       出题响应 JSON（含 pkIdStr / examVO）
+ * 返回结构 = H5 `result.html` 的真实提交体（见文件头注释）：
+ *
+ * ```js
+ * {
+ *   ...examVO 字段,            // pkIdStr/pointId/pointName/ruleType/questionCnt/correctCnt/costTime
+ *   questions,                 // 作答后的题目
+ *   updatedTime,               // 提交时刻（ms）
+ *   triggerPeakMatch,          // 透传出题响应的值（缺省 0）
+ *   examVO: { ...同一份 },      // ★ 嵌套副本，服务端要求
+ *   userInfos: [{ userInfo }], // ★ 对手（包一层），服务端要求非空
+ * }
+ * ```
+ *
+ * @param {object} match       出题响应 JSON（含 pkIdStr / examVO / otherUser）
  * @param {object} [opts]
  * @param {number} [opts.costTimeMs] 整卷耗时；缺省按题数 × 下限
  * @param {number} [opts.seedBase]   笔迹随机种子基数
  * @param {string} [opts.strokeMode] 画笔算法：`ARC`（默认）/ `SEVEN_SEGMENT`
+ * @param {number} [opts.updatedTimeMs] 覆盖 `updatedTime`（实验用）
  * @returns {object} 待加密的明文 body
  */
 function buildSubmitBody(match, opts = {}) {
@@ -77,10 +128,12 @@ function buildSubmitBody(match, opts = {}) {
 
   const questionCnt = outQuestions.length;
   const cost = opts.costTimeMs == null
-    ? Math.max(questionCnt * MIN_COST_TIME_MS, MIN_COST_TIME_MS)
+    ? Math.max(questionCnt * DEFAULT_COST_TIME_PER_Q_MS, DEFAULT_COST_TIME_FLOOR_MS)
     : Math.max(Number(opts.costTimeMs), MIN_COST_TIME_MS);
+  const updatedTime = opts.updatedTimeMs == null ? Date.now() : Number(opts.updatedTimeMs);
 
-  return {
+  // 内层卷：旧版顶层结构 + updatedTime / triggerPeakMatch（H5 是直接展开 examVO）
+  const inner = {
     pkIdStr: pkIdStr,
     pointId: examVO.pointId == null ? 0 : examVO.pointId,
     pointName: examVO.pointName == null ? null : examVO.pointName,
@@ -89,7 +142,47 @@ function buildSubmitBody(match, opts = {}) {
     correctCnt: questionCnt,     // 全对
     costTime: cost,
     questions: outQuestions,
+    updatedTime: updatedTime,
+    triggerPeakMatch: examVO.triggerPeakMatch == null ? 0 : examVO.triggerPeakMatch,
   };
+
+  return Object.assign({}, inner, {
+    examVO: inner,
+    userInfos: opponentUserInfos(match),
+  });
+}
+
+/**
+ * 从出题响应里取对手列表，转成提交体要求的 `[{ userInfo }]`。
+ *
+ * 兼容三种来源（按优先级）：
+ *   1. `examVO.opponents` / 顶层 `opponents`（多玩法，元素已是 `{ userInfo }` 或裸 userInfo）
+ *   2. `otherUser`（1v1 的对手，服务端在顶层给）
+ *
+ * ⚠️ **必须非空**：实测 `userInfos: []` → 400。取不到对手时照原样返回空数组
+ * （由服务端报错，日志里能看到 body，便于排查），不要在这里抛异常打断整轮。
+ *
+ * @param {object} match 出题响应
+ * @returns {Array<{userInfo: object}>}
+ */
+function opponentUserInfos(match) {
+  const raw = [];
+  const examVO = match && match.examVO;
+  if (examVO && Array.isArray(examVO.opponents)) raw.push.apply(raw, examVO.opponents);
+  if (match && Array.isArray(match.opponents)) raw.push.apply(raw, match.opponents);
+  if (match && match.otherUser) raw.push({ userInfo: match.otherUser });
+
+  const out = [];
+  const seen = new Set();
+  for (const it of raw) {
+    if (!it || typeof it !== 'object') continue;
+    const ui = it.userInfo && typeof it.userInfo === 'object' ? it.userInfo : it;
+    const key = String(ui.userId == null ? '' : ui.userId) + '|' + String(ui.userName == null ? '' : ui.userName);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ userInfo: ui });
+  }
+  return out;
 }
 
 /** 从题目里挑「正确答案」：优先 `answer`，退回 `answers[0]`。 */
@@ -117,7 +210,8 @@ function backoffMs(attempt) {
  * @param {object} jar          已登录的 [leo.CookieJar]
  * @param {object} cfg          刷局配置
  * @param {number} cfg.pointId  知识点 ID
- * @param {number} [cfg.costTimeMs]
+ * @param {number} [cfg.costTimeMs] 提交体里声明的整卷耗时。**留空 = 用真实耗时**
+ *        （出题成功 → 提交时刻，即真机 H5 的口径）。填小于服务端下限会被 400。
  * @param {number} [cfg.rateLimitBaseMs] 覆盖默认退避基数
  * @param {number} [cfg.rateLimitMaxWait] 覆盖默认最大等待次数
  * @param {number} [cfg.gapMinMs] [cfg.gapMaxMs] 出题前随机间隔（降低频控概率）
@@ -187,6 +281,8 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
   const matchIntervalMs = num(cfg.matchRetryIntervalMs, 10_000);
   emit({ type: 'match', message: `出题 pointId=${cfg.pointId}` });
   let m = null;
+  /** 出题成功时刻（= 真机 H5 的 `startTime`），用于算提交体的 `costTime`。 */
+  let matchOkAt = 0;
   {
     const tMatch = Date.now();
     let tries = 0;
@@ -217,7 +313,8 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
     }
     emit({ type: 'match-ok', message: `出题成功：pkIdStr=${m.json.pkIdStr}，共 ${((m.json.examVO && m.json.examVO.questions) || []).length} 题（第 ${tries} 次尝试）` });
     // 记下这次成功时刻（**按账号**共享）→ 下一轮据此贴冷却下沿发车
-    if (ctx) ctx.lastMatchOkAt = Date.now();
+    matchOkAt = Date.now();
+    if (ctx) ctx.lastMatchOkAt = matchOkAt;
   }
   const pkIdStr = m.json.pkIdStr;
   const qCount = (m.json.examVO && m.json.examVO.questions) ? m.json.examVO.questions.length : 0;
@@ -248,8 +345,14 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
   for (;;) {
     let bodyObj;
     try {
+      // ★ `costTime` 缺省用**真实耗时**（出题成功 → 现在）。
+      //
+      // 真机 H5 交的就是「结束时间 - 开始时间」；服务端会校验这个值不能太小
+      // （实测 10 题：100/200/500 全 400，1000 才 200）。
+      // 旧代码缺省填 `题数 × 5ms`（10 题 = 50ms）→ 2026-10 中旬起必 400。
+      const elapsedMs = matchOkAt > 0 ? Date.now() - matchOkAt : null;
       bodyObj = buildSubmitBody(m.json, {
-        costTimeMs: cfg.costTimeMs,
+        costTimeMs: cfg.costTimeMs == null ? elapsedMs : cfg.costTimeMs,
         seedBase: (Date.now() % 1e9) + attempt,
         strokeMode: cfg.strokeMode,
       });
@@ -435,6 +538,7 @@ module.exports = {
   MIN_COST_TIME_MS,
   makePath,
   buildSubmitBody,
+  opponentUserInfos,
   pickAnswer,
   isRateLimited,
   backoffMs,

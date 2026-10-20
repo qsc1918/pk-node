@@ -107,9 +107,22 @@ export async function runOneRound(env, acct, opts) {
   out.pkIdStr = pkIdStr;
 
   // 2) 组装提交体 + 提交
+  //
+  // ★ 2026-10-20：提交体的 `costTime` 有服务端下限（10 题声明 500 仍 400，1000 才过），
+  //   而且真机 H5 交的是真实耗时。这里按「出题成功 → 提交」的真实间隔填，
+  //   并给一段最短答题时间（Worker 不能像本机那样等 8~12s）。
+  const matchOkAt = Date.now();
+  const minAnswerMs = o.minAnswerMs == null ? 1500 : Number(o.minAnswerMs);
+  const left = minAnswerMs - (Date.now() - matchOkAt);
+  if (left > 0) await new Promise((res) => setTimeout(res, left));
+
   let bodyObj;
   try {
-    bodyObj = buildSubmitBody(m.json, { pointId: o.pointId || 64, strokeMode: o.strokeMode || STROKE_MODES.ARC });
+    bodyObj = buildSubmitBody(m.json, {
+      pointId: o.pointId || 64,
+      strokeMode: o.strokeMode || STROKE_MODES.ARC,
+      costTimeMs: o.costTimeMs == null ? (Date.now() - matchOkAt) : o.costTimeMs,
+    });
   } catch (e) {
     out.error = '组装提交体失败：' + e.message;
     return out;

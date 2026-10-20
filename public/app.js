@@ -1602,7 +1602,7 @@ function collectPkBody() {
     matchRetryMaxMs: Number(($('grind-mmax') || {}).value || 120000),
     strokeMode: strokeEl ? strokeEl.value : 'ARC',
   };
-  // costTime 留空 = 自动（服务端按题数 × 5ms 给下限）
+  // costTime 留空 = 自动（用「出题成功 → 提交」的真实耗时；服务端有下限，填小会 400）
   const cost = $('grind-cost').value.trim();
   if (cost !== '') body.costTimeMs = Number(cost);
   return body;
