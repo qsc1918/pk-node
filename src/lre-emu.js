@@ -32,7 +32,9 @@ const path = require('node:path');
  */
 const EX_INSNS = require('./lre-insns');
 const PK_INSNS_PATH = './lre-insns-pk';
+const V3144_INSNS_PATH = './lre-insns-3144';
 let PK_INSNS = null;
+let V3144_INSNS = null;
 let D = EX_INSNS;
 
 const PAGE_SHIFT = 12;
@@ -45,6 +47,8 @@ const MASK128 = (1n << 128n) - 1n;
 
 const EX_SO_PATH = path.join(__dirname, '..', 'bin', 'native', 'lre.so');
 const PK_SO_PATH = path.join(__dirname, '..', 'bin', 'native', 'lre_pk.so');
+/** 3.144.3（APK `leo-3.144.3-arm64.apk` 里的 libRequestEncoder.so）。 */
+const V3144_SO_PATH = path.join(__dirname, '..', 'bin', 'native', 'lre_3144.so');
 let SO_PATH = EX_SO_PATH;
 
 /** 「函数已返回」的哨兵 pc（不落在任何映射区间）。 */
@@ -1102,7 +1106,7 @@ function soBufferFor(p) {
  * 算出给定时刻的 T 串（78 个 unsigned 的十进制拼接）。
  *
  * @param {number} epochSec Unix 秒（模拟 `time()`；同一分钟内结果相同）
- * @param {'exercise'|'pk'} [variant] 用哪套签名资产，默认 `exercise`（见文件头表格）
+ * @param {'exercise'|'pk'|'v3144'} [variant] 用哪套签名资产，默认 `exercise`（见文件头表格）
  * @returns {string} T
  */
 function calcT(epochSec, variant) {
@@ -1111,6 +1115,12 @@ function calcT(epochSec, variant) {
     if (!PK_INSNS) PK_INSNS = require(PK_INSNS_PATH);
     D = PK_INSNS;
     SO_PATH = PK_SO_PATH;
+  } else if (variant === 'v3144') {
+    // ★ 2026-10-20：3.144.3 的新签名资产（APK 里的 libRequestEncoder.so）。
+    //   指令表由 tools/gen-lre-insns.py 从该 so 重新导出（区间与旧版一致）。
+    if (!V3144_INSNS) V3144_INSNS = require(V3144_INSNS_PATH);
+    D = V3144_INSNS;
+    SO_PATH = V3144_SO_PATH;
   } else {
     D = EX_INSNS;
     SO_PATH = EX_SO_PATH;

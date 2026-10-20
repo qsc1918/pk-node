@@ -102,18 +102,18 @@ function encodeSubmitBody(jsonBytes) {
 }
 
 // sign 缓存：同 path + 同分钟结果相同。key = `${minute}|${path}`
-const signCache = new Map();
+// 每个签名资产一份（不同资产算出的 T/sign 不同，缓存绝不能共用）。
+const signCaches = { exercise: new Map(), pk: new Map(), v3144: new Map() };
 const SIGN_CACHE_MAX = 512;
 // T 缓存：只按分钟变化，与 path 无关 —— 同一分钟内所有 path 复用同一份 T。
-const tCache = new Map();
+const tCaches = { exercise: new Map(), pk: new Map(), v3144: new Map() };
 const T_CACHE_MAX = 8;
 
-/**
- * PK 版签名资产**单独的缓存**：两套资产算出的 T/sign 不同（服务端按 App 版本校验），
- * 缓存绝不能共用，否则会拿练习版 T 去签 PK 请求（或反过来），直接 417。
- */
-const signCachePk = new Map();
-const tCachePk = new Map();
+/** 取（必要时建）某个签名资产的缓存。未知资产回落 exercise。 */
+function cacheOf(kind, variant) {
+  const table = kind === 'sign' ? signCaches : tCaches;
+  return table[variant] || table.exercise;
+}
 
 /**
  * 按 `version` 解析该用的签名资产（**服务端实际规则**）。
@@ -122,7 +122,7 @@ const tCachePk = new Map();
  * 映射表见 `config.js` 的 `signVariantByVersion`。
  *
  * @param {string} [version] URL 里将出现的 `version` 值，如 `'3.141.1'`
- * @returns {'exercise'|'pk'}
+ * @returns {'exercise'|'pk'|'v3144'}
  */
 function variantForVersion(version) {
   const v = String(version || '');
@@ -135,27 +135,27 @@ function variantForVersion(version) {
  *
  * ★ 2026-10-08：变体优先由 `opts.version` 推导（与真机规则一致）；
  *   仍保留 `opts.variant` 显式覆盖，供实验脚本用。
+ * ★ 2026-10-20：新增 `v3144` 资产（3.144.3 的 libRequestEncoder.so）。
  *
  * @param {string} urlPath 只含路径
- * @param {{variant?: 'exercise'|'pk', version?: string}} [opts]
+ * @param {{variant?: string, version?: string}} [opts]
  *        `version` 给出时将按其推导资产；`variant` 显式指定则优先生效
  * @returns {string} 32 位 hex
  */
 function calcSign(urlPath, opts) {
   const o = opts || {};
-  const chosen = o.variant || variantForVersion(o.version);
-  const pk = chosen === 'pk';
+  const variant = o.variant || variantForVersion(o.version);
   const p = String(urlPath);
   const minute = Math.floor(Date.now() / 60000);
   const key = minute + '|' + p;
-  const sCache = pk ? signCachePk : signCache;
+  const sCache = cacheOf('sign', variant);
   const hit = sCache.get(key);
   if (hit) return hit;
 
-  const tc = pk ? tCachePk : tCache;
+  const tc = cacheOf('t', variant);
   let T = tc.get(minute);
   if (!T) {
-    T = calcT(minute * 60, pk ? 'pk' : 'exercise');
+    T = calcT(minute * 60, variant);
     if (tc.size >= T_CACHE_MAX) tc.clear();
     tc.set(minute, T);
   }

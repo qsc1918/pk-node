@@ -141,6 +141,14 @@ function buildUrl(urlPath, params = {}, opts = {}) {
   const isKnown = DOMAIN_PREFIXES.some((pre) => pathStr.indexOf(pre) === 0);
   const isPk = pathStr.indexOf('/leo-game-pk') === 0;
   for (const [k, v] of COMMON_QUERY) q.set(k, v);
+
+  // ★ 2026-10-20：**版本可按请求覆盖**（PK 单独走最新 App 版本）。
+  //
+  // PK 链路要跟着 App 升级走（旧版本会被服务端区别对待），但主域/练习那条链
+  // 仍停在 3.141.1（sign 资产与它配对，换版本要一起换）。所以这里给一个
+  // 「只影响本次请求」的 version 覆盖，`sign` 也随之按新版本选资产。
+  if (opts.version) q.set('version', String(opts.version));
+
   if (isKnown && !isPk) {
     for (const [k, v] of MAIN_EXTRA_QUERY) q.set(k, v);
   }
@@ -275,9 +283,14 @@ async function logout(jar, opts) {
 
 /* ------------------------------ PK 接口 ------------------------------ */
 
-/** PK 端点统一带的固定参数。真机实测：只有 `_productId=611`，**没有 `_appId`**。 */
+/** PK 端点统一带的固定参数。真机实测：只有 `_productId=611`，**没有 `_appId`**。
+ *
+ * ★ 2026-10-20：PK 请求统一带**最新 App 版本**（[PK.pkVersion]，默认 3.144.3），
+ *   签名的 T 也随之取 `v3144` 资产（`bin/native/lre_3144.so`）。
+ *   旧版本（3.141.1）实测仍能出题，但服务端对旧版本更严（更容易被判频控/限制）。
+ */
 function pkOpts(extra = {}) {
-  return Object.assign({ productId: PK.productIdPk }, extra);
+  return Object.assign({ productId: PK.productIdPk, version: PK.pkVersion }, extra);
 }
 
 /**
@@ -329,17 +342,30 @@ async function pkMatch(jar, pointId, opts) {
  * 出题 v2：`POST /leo-game-pk/android/math/pk/match/v2?pointId=N`（加密响应）。
  * 请求 body 必须是**空**，传 {} 会被服务端判 400。
  * 解密链路：密文 --keystream XOR--> gzip 字节 --gunzip--> 明文 JSON。
+ *
+ * ## ★ 2026-10-20：`triggerPeakMatch` 决定**题数**
+ *
+ * | 值 | 结果 | 说明 |
+ * |---|---|---|
+ * | `0` | **10 题** | 普通 1v1 |
+ * | `1` | **30 题** | 王者争霸赛（App 从首页卡片进去就是这条） |
+ *
+ * 实测同一账号同一知识点：`0` → questionCnt=10，`1` → questionCnt=30。
+ * 默认取 [PK.pkTriggerPeakMatch]（=1），与真机一致。
+ *
  * @returns {Promise<{status:number, json:object|null, text:string, headers:object}>}
  */
 async function pkMatchV2(jar, pointId, opts) {
   const path = '/leo-game-pk/android/math/pk/match/v2';
+  const o = opts || {};
+  const peak = o.triggerPeakMatch == null ? PK.pkTriggerPeakMatch : String(o.triggerPeakMatch);
   // 业务参数在最前、公共参数在后、sign 夹中间（顺序不影响 sign，sign 只对 encodedPath 计算）。
-  const url = buildUrl(path, { pointId: String(pointId), triggerPeakMatch: '0' }, pkOpts());
+  const url = buildUrl(path, { pointId: String(pointId), triggerPeakMatch: peak }, pkOpts());
   const r = await request({
     url,
     method: 'POST',
     jar,
-    signal: opts && opts.signal,
+    signal: o.signal,
     rawBody: true,                       // 加密字节，别当 gzip 解码
     headers: pkH5Headers('exercise.html'),
   });

@@ -136,6 +136,11 @@ const config = {
     '3.140.1': 'exercise',
     '3.141.1': 'exercise',
     '3.143.1': 'pk',
+    // ★ 2026-10-20：3.144.3（APK `leo-3.144.3-arm64.apk`）。
+    //   内容编码器（libContentEncoder.so）与 3.143.1 **完全相同**（sha256 一致）
+    //   ⇒ 密钥流不用重新提取；只有签名库 libRequestEncoder.so 换了。
+    //   资产：bin/native/lre_3144.so + src/lre-insns-3144.js。
+    '3.144.3': 'v3144',
   },
   /** 版本未知时的默认签名资产。 */
   defaultSignVariant: 'exercise',
@@ -343,10 +348,22 @@ const PK = {
   },
 
   /**
-   * 产品线 id。真机实测：**所有服务一律 611**（356 次请求无一例外）。
+   * PK 链路专用的 App 版本（★ 2026-10-20）。
+   *
+   * 为什么要单独一个：PK 要跟着 App 升级走（旧版本被服务端区别对待，
+   * 越旧越容易吃 400/限制），而主域/练习那条链的 sign 资产与 3.141.1 绑定，
+   * 换版本要连资产一起换，不宜一把梭。
+   *
+   * 3.144.3 的签名资产来自 `leo-3.144.3-arm64.apk` 里的 `libRequestEncoder.so`
+   * （`bin/native/lre_3144.so` + `src/lre-insns-3144.js`）。
+   * 内容编码器 `libContentEncoder.so` 与 3.143.1 **逐字节相同** ⇒ 密钥流不用重提。
+   *
+   * 可用 `PK_VERSION=3.141.1` 回退（回退后走 exercise 资产）。
    */
+  pkVersion: process.env.PK_VERSION || '3.144.3',
+  pkTriggerPeakMatch: process.env.PK_TRIGGER_PEAK || '0',
   productIdDefault: '611',
-  productIdPk: '611',
+  productIdPk: '631',
 
   /** 风控头（真机逐字）。 */
   headers: {
@@ -354,22 +371,47 @@ const PK = {
     'x-shepherd-sessionid': '0',
   },
 
-  /**
-   * 提交接口独立频控：默认等 10s、最多 2 次。
-   */
-  rateLimitBaseMs: 10_000,
+  rateLimitBaseMs: 20_000,
   rateLimitMaxWait: 2,
+
   /**
-   * 出题接口冷却：本轮真机日志未观察到 60s 频控（366 个请求全 200）。
-   * 如需恢复限速：PK_MATCH_COOLDOWN_MS=61600。
+   * ★ 2026-10-20：**每轮换一条设备链** —— 出题冷却的真正解法。
+   *
+   * 实测：`400 请求过于频繁` 是按**设备链（`ks_deviceid`）**限的，不是按账号。
+   * 同一账号、间隔 3 秒的对照实验：
+   *
+   * | 动作 | 结果 |
+   * |---|---|
+   * | 链 A 出题 | 200 |
+   * | 立刻再用链 A | **400 请求过于频繁** |
+   * | 立刻换链 B（只换 `ks_*`） | **200** |
+   *
+   * 即：**一条链 60 秒内只能出一次题，换链立刻就能出**。App「看起来没限制」
+   * 就是因为它用自己那一条真实链、一局本来就要打一分多钟，从不在窗口内二次出题。
+   *
+   * 所以每轮从池里挑一条「最久没用过、且已过 65s」的链即可连刷，不用等。
+   * 实现见 `src/pk-chain.js`。关掉（退回老行为）：`PK_ROTATE_CHAIN=0`
    */
+  rotateChain: process.env.PK_ROTATE_CHAIN !== '0',
+
+  /** 换链后立刻重试的间隔（换链成功基本一次就通，不需要久等）。 */
+  chainRetryIntervalMs: envInt('PK_CHAIN_RETRY_MS', 1_200),
+
   matchCooldownMs: envInt('PK_MATCH_COOLDOWN_MS', 0),
-  /** 出题撞 400/403 时的重试间隔。 */
   matchRetryIntervalMs: 10_000,
   /** 出题重试的累计上限（超此才判该轮失败）。 */
   matchRetryMaxMs: 120_000,
   /** 冷却估计最多往回缩这么多。 */
   matchCooldownSafetyMs: 0,
+
+  /**
+   * 「账号被平台限制」的响应措辞（★ 2026-10-20）。
+   *
+   * 被限 24 小时的账号，出题返回 `400 {"message":"No message available"}`
+   * —— 与频控的 `请求过于频繁` 是两回事：**重试没有任何意义**，
+   * 按频控重试只会白白拖 2 分钟，还可能加重处罚。
+   */
+  accountLimitedText: 'No message available',
 
   /**
    * 真机 UA 模板：`Leo/<version> (<BRAND><MODEL>; Android <sdk>; Scale/<scale>)`

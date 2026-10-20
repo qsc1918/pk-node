@@ -175,6 +175,33 @@ check('leo.js 导出齐全', missingLeo.length === 0,
     r.ok ? (r.pass + '/' + r.total + ' 命中')
          : ('命中 ' + r.pass + '/' + r.total + '，首条不符：' +
             JSON.stringify(r.fails[0] || null).slice(0, 140)));
+
+  // ★ 2026-10-20：三套签名资产都要能算 T（PK 已切到 3.144.3）。
+  // 判据：T 全是数字且位数与真机同量级（实测 408~410），且**同一时刻不同资产
+  // 的 T 必须不同**（否则说明切资产没生效，PK 会拿错 T 去签 → 417）。
+  const lre = require(path.join(root, 'src', 'lre-emu'));
+  const minute = Math.floor(Date.now() / 60000) * 60;
+  const Ts = {};
+  let okT = true, why = '';
+  for (const v of ['exercise', 'pk', 'v3144']) {
+    let T = '';
+    try { T = lre.calcT(minute, v); } catch (e) { okT = false; why = v + ': ' + e.message; break; }
+    Ts[v] = T;
+    if (!/^[0-9]+$/.test(T) || T.length < 380 || T.length > 460) {
+      okT = false; why = v + ' 的 T 异常（长度 ' + T.length + '）'; break;
+    }
+  }
+  if (okT && Ts.exercise === Ts.pk || Ts.pk === Ts.v3144) {
+    okT = false; why = '不同资产算出同一个 T —— 切资产没生效';
+  }
+  check('三套签名资产都能算 T 且互不相同（3.141.1 / 3.143.1 / 3.144.3）',
+    okT, okT ? 'exercise/pk/v3144 分别 ' + Ts.exercise.length + '/' + Ts.pk.length + '/' +
+      Ts.v3144.length + ' 位' : why);
+
+  // 3.144.3 的资产文件必须在（否则 PK 会静默回落到 exercise 资产 → 417）
+  const so3144 = path.join(config.nativeDir, 'lre_3144.so');
+  check('bin/native/lre_3144.so 存在（3.144.3 签名资产）', fs.existsSync(so3144),
+    fs.existsSync(so3144) ? fs.statSync(so3144).size + ' B' : '缺失');
 }
 
 // 练习协议层（/leo-star /leo-math）
@@ -209,10 +236,44 @@ const REAL_SET = REAL_PARAMS.map(([k, v]) => k + '=' + v);
 }
 
 const engineLib = require(path.join(root, 'src', 'pk-engine'));
-const REQUIRED_ENGINE = ['makePath', 'buildSubmitBody', 'pickAnswer', 'isRateLimited', 'backoffMs', 'runOneRound'];
+const REQUIRED_ENGINE = ['makePath', 'buildSubmitBody', 'pickAnswer', 'isRateLimited', 'isAccountLimited', 'backoffMs', 'runOneRound'];
 const missingEngine = REQUIRED_ENGINE.filter((k) => typeof engineLib[k] === 'undefined');
 check('pk-engine.js 导出齐全', missingEngine.length === 0,
   missingEngine.length === 0 ? REQUIRED_ENGINE.length + ' 项' : '缺少 ' + missingEngine.join(', '));
+
+// 设备链轮换（★ 2026-10-20：出题冷却按 ks_deviceid 限，换链即可连刷）
+{
+  const chainLib = require(path.join(root, 'src', 'pk-chain'));
+  const dbLib = require(path.join(root, 'src', 'db'));
+  try { dbLib.init(); } catch (e) { /* 已初始化过 */ }
+  chainLib.reset();
+  const pool = dbLib.listDeviceChains(true) || [];
+  check('链池非空（出题冷却靠它绕开）', pool.length > 0, pool.length + ' 条');
+
+  const a = chainLib.pickFresh();
+  check('能挑到空闲链', !!a, a ? '#' + a.id + ' ' + (a.deviceId || '') : '挑不到');
+
+  // 打上时间戳后，65s 内不应再被选中
+  if (a) {
+    chainLib.markUsed(a.id, Date.now());
+    const b = chainLib.pickFresh();
+    check('用过的链 65s 内不再被选', !!b && b.id !== a.id,
+      b ? '#' + b.id : '挑不到第二条');
+    chainLib.reset();
+  }
+
+  // rotate() 必须真的把 ks_* 换掉（注意 domain 要带上，jar 是按 name+domain 覆盖的）
+  const leoLib2 = require(path.join(root, 'src', 'leo'));
+  const fakeJar = new leoLib2.CookieJar([
+    { name: 'ks_deviceid', value: 'OLD-DEVICE', domain: '.yuanfudao.com', path: '/' },
+  ]);
+  const r1 = chainLib.rotate(fakeJar, {});
+  const nowDev = (fakeJar.items.find((c) => c.name === 'ks_deviceid' && c.domain === '.yuanfudao.com') || {}).value;
+  check('rotate() 把 jar 的 ks_* 换成了池里的链',
+    !!r1 && !!nowDev && nowDev !== 'OLD-DEVICE',
+    r1 ? '#' + r1.id + ' device=' + (r1.deviceId || nowDev) : '没有可用链');
+  chainLib.reset();
+}
 
 const jobsLib = require(path.join(root, 'src', 'jobs'));
 const REQUIRED_JOBS = ['startJob', 'stopJob', 'subscribe', 'publish', 'bufferedEvents', 'isBusy'];

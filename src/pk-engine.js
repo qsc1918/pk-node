@@ -37,6 +37,7 @@
 const { PK } = require('./config');
 const leo = require('./leo');
 const strokes = require('./strokes');
+const chain = require('./pk-chain');
 
 /** 每题 costTime 下限（毫秒）。0ms 明显不自然。 */
 const MIN_COST_TIME_MS = 5;
@@ -199,6 +200,22 @@ function isRateLimited(status, text) {
   return t.includes('频繁') || t.includes('rate') || t.includes('blocked');
 }
 
+/**
+ * 判断是不是「账号被平台限制」（不是频控，重试没有意义）。
+ *
+ * ★ 2026-10-20 实测：被限的账号出题返回
+ * `400 {"status":400,"message":"No message available"}` —— 与频控的
+ * `400 {"status":400,"message":"请求过于频繁"}` 是两回事，用户实测是 **24 小时**量级。
+ *
+ * 按频控去重试只会白等 2 分钟，还可能把处罚拖长，所以遇到这个直接判失败。
+ */
+function isAccountLimited(status, text) {
+  if (status !== 400 && status !== 403) return false;
+  const t = String(text || '');
+  return t.includes(PK.accountLimitedText) ||
+    t.includes('not available') || t.includes('已封禁');
+}
+
 /** 频控等待时长：base × 2^n，n 从 0 开始。 */
 function backoffMs(attempt) {
   return PK.rateLimitBaseMs * Math.pow(2, Math.max(0, attempt));
@@ -280,6 +297,24 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
   const matchMaxWaitMs = num(cfg.matchRetryMaxMs, 2 * 60 * 1000);
   const matchIntervalMs = num(cfg.matchRetryIntervalMs, 10_000);
   emit({ type: 'match', message: `出题 pointId=${cfg.pointId}` });
+
+  // ★ 2026-10-20：**每轮换一条设备链**（出题冷却按 `ks_deviceid` 算，不按账号）。
+  //
+  // 见 src/pk-chain.js 的实测表：同链 60s 内二次出题必 400，换链立刻 200。
+  // 这里在出题前换，**整轮（出题 → 提交）用同一条链**，提交期间不再动 jar。
+  const rotateEnabled = cfg.rotateChain == null ? PK.rotateChain !== false : cfg.rotateChain !== false;
+  const triedChains = new Set();     // 本局已经撞过 400 的链，换链时排除
+  let chainId = null;
+  if (rotateEnabled) {
+    const picked = chain.rotate(jar, { exclude: triedChains });
+    if (picked) {
+      chainId = picked.id;
+      emit({ type: 'chain', message: `设备链 → #${picked.id}（${picked.deviceId || '?'}）` });
+    } else {
+      emit({ type: 'chain', message: '设备链池暂无空闲链，沿用当前链（可能需要等冷却）' });
+    }
+  }
+
   let m = null;
   /** 出题成功时刻（= 真机 H5 的 `startTime`），用于算提交体的 `costTime`。 */
   let matchOkAt = 0;
@@ -292,6 +327,15 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
       tries++;
       if (m.status === 200 && m.json) break;
 
+      // ★ 账号被平台限制（No message available，用户实测 24h 量级）：
+      //   这不是频控，重试没有意义，直接判失败让上层停掉这个账号。
+      if (isAccountLimited(m.status, m.text)) {
+        return fail(m.status,
+          '该账号被平台限制（HTTP 400 No message available）—— 通常 24 小时后恢复，' +
+          '本轮不再重试（重试只会白等，还可能把处罚拖长）',
+          m.text, t0);
+      }
+
       // 非频控错误：没必要重试
       if (!isRateLimited(m.status, m.text)) {
         return fail(m.status, `出题失败 HTTP ${m.status}`, m.text, t0);
@@ -302,15 +346,40 @@ async function runOneRound(jar, cfg, onEvent, ctx) {
           `出题持续频控（已重试 ${tries} 次 / ${Math.round(waited / 1000)}s 仍未放行）`,
           m.text, t0);
       }
+
+      // ★ 撞冷却 → **换一条链立刻重试**（这才是正确解法，不是干等 60s）。
+      let rotated = null;
+      if (rotateEnabled) {
+        if (chainId != null) triedChains.add(chainId);
+        rotated = chain.rotate(jar, { exclude: triedChains });
+        if (rotated) chainId = rotated.id;
+      }
+      if (rotated) {
+        const gap = num(cfg.chainRetryIntervalMs, PK.chainRetryIntervalMs);
+        emit({
+          type: 'rate-limit',
+          message: `出题被频控（HTTP ${m.status}）→ 换设备链 #${rotated.id}` +
+            `（${rotated.deviceId || '?'}）后重试（已重试 ${tries} 次 / ${Math.round(waited / 1000)}s）`,
+        });
+        await sleepWithTicks(gap, (leftMs) => {
+          emit({ type: 'tick', message: `换链重试倒计时 ${Math.ceil(leftMs / 1000)}s`, leftMs: leftMs });
+        }, signal);
+        ensureLive();
+        continue;
+      }
+
+      // 池里没有别的链可用 → 退回「等一会儿再试」
       emit({
         type: 'rate-limit',
-        message: `出题被频控（HTTP ${m.status}），${Math.round(matchIntervalMs / 1000)}s 后自动重试（已等 ${Math.round(waited / 1000)}s）`,
+        message: `出题被频控（HTTP ${m.status}）且无可换设备链，${Math.round(matchIntervalMs / 1000)}s 后重试（已等 ${Math.round(waited / 1000)}s）`,
       });
       await sleepWithTicks(matchIntervalMs, (leftMs) => {
         emit({ type: 'tick', message: `出题重试倒计时 ${Math.ceil(leftMs / 1000)}s`, leftMs: leftMs });
       }, signal);
       ensureLive();
     }
+    // 这条链刚被用于出题 → 记时间戳，65s 内不再选它
+    if (chainId != null) chain.markUsed(chainId, Date.now());
     emit({ type: 'match-ok', message: `出题成功：pkIdStr=${m.json.pkIdStr}，共 ${((m.json.examVO && m.json.examVO.questions) || []).length} 题（第 ${tries} 次尝试）` });
     // 记下这次成功时刻（**按账号**共享）→ 下一轮据此贴冷却下沿发车
     matchOkAt = Date.now();
@@ -541,6 +610,7 @@ module.exports = {
   opponentUserInfos,
   pickAnswer,
   isRateLimited,
+  isAccountLimited,
   backoffMs,
   runOneRound,
 };
