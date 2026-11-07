@@ -11,6 +11,7 @@ const leoAccounts = require('./services/leo-accounts');
 const engine = require('./pk-engine');
 const exercise = require('./exercise');
 const schoolSeason = require('./school-season');
+const runWindow = require('./run-window');
 const { config } = require('./config');
 
 /** 默认最大并行任务数：0 = 不限制（可用 `PK_MAX_CONCURRENT=<正整数>` 设上限）。 */
@@ -178,6 +179,28 @@ function pickByUsage(chains, usage) {
 }
 
 /**
+ * 算出「限时任务」这一次运行的绝对截止时刻（毫秒时间戳）。
+ *
+ * 三种来源，优先级从高到低：
+ *   1. `remaining_ms` —— 暂停时落库的剩余时长 → 从现在起算（暂停不白送时间）；
+ *   2. `deadline_at`  —— 进程被杀 / 服务重启后恢复 → **沿用原来的绝对截止时刻**
+ *      （否则「刷 24 小时」重启一次就重新数 24 小时，永远跑不完）；
+ *   3. 全新任务 → 现在 + durationMs。
+ *
+ * @param {object} job 任务行
+ * @param {object|null} win runWindow.normalize() 的结果
+ * @returns {number|null}
+ */
+function deadlineOf(job, win) {
+  if (!win || win.mode !== 'duration') return null;
+  const remain = job && job.remaining_ms != null ? Number(job.remaining_ms) : null;
+  if (Number.isFinite(remain) && remain > 0) return Date.now() + remain;
+  const prev = job && job.deadline_at != null ? Number(job.deadline_at) : null;
+  if (Number.isFinite(prev) && prev > 0) return prev;
+  return Date.now() + win.durationMs;
+}
+
+/**
  * 启动一个刷局任务（异步执行，立即返回 jobId）。
  *
  * @param {object} o
@@ -211,6 +234,13 @@ function startJob(o) {
   const jar = jarOf(account);
   const cfg = JSON.parse(job.config_json);
 
+  // ★ 2026-10-26：运行窗口（限时 / 每天定时）。
+  //   窗口模式下 `rounds_total` 只是一个「不限」的占位值（MAX_ROUNDS），
+  //   真正的停止条件由 deadline / 每日窗口决定。
+  const win = runWindow.normalize(cfg.window);
+  const deadline = deadlineOf(job, win);
+  if (win) db.setJobDeadline(job.id, deadline, null);
+
   // 「立即结束」靠这个 controller：既中断在途 HTTP，也中断等待中的 sleep
   const controller = new AbortController();
   // 出题冷却**按账号**共享：把「该账号上次成功出题的时刻」放进一个按
@@ -224,12 +254,23 @@ function startJob(o) {
     config: cfg,
     controller: controller,
     signal: controller.signal,
+    window: win,
+    deadline: deadline,
     get lastMatchOkAt() { return lastMatchOkAt.get(job.leo_account_id) || 0; },
     set lastMatchOkAt(v) { lastMatchOkAt.set(job.leo_account_id, v); },
   };
   running.set(job.id, ctx);
   db.setJobStatus(job.id, 'running', { startedAt: Date.now() });
   publish(job.id, { type: 'status', message: '任务开始', at: Date.now() });
+  if (win) {
+    publish(job.id, {
+      type: 'status',
+      message: win.mode === 'duration'
+        ? `停止条件：${runWindow.describe(win)}（到点后当前这一局跑完即停，不打断在途提交）`
+        : `停止条件：${runWindow.describe(win)}（窗口外自动挂起等待，第二天到点自动接着刷）`,
+      at: Date.now(),
+    });
+  }
 
   // 后台跑（不 await，让 HTTP 请求立刻返回）
   runLoop(job, cfg, ctx).catch((e) => {
@@ -272,11 +313,20 @@ function stopJob(jobId, immediate, opts) {
 
   if (!ctx) {
     const job = db.getJob(id);
-    if (job && (job.status === 'queued' || job.status === 'running' || job.status === 'paused')) {
+    if (job && (job.status === 'queued' || job.status === 'running' ||
+                job.status === 'waiting' || job.status === 'paused')) {
       db.setJobStatus(id, pause ? 'paused' : 'stopped', { finishedAt: Date.now() });
       return { ok: true, message: '任务未在运行，已标记为' + (pause ? '暂停' : '停止') };
     }
     return { ok: false, message: '任务未在运行' };
+  }
+
+  // ★ 2026-10-26：限时任务被暂停 / 停止时，把「还剩多久」落库。
+  //   继续时按剩余时长重新算 deadline —— 否则暂停 10 分钟再继续，
+  //   等于白送 10 分钟（甚至直接判定「已到点」）。
+  if (ctx.deadline != null) {
+    const remain = Math.max(0, ctx.deadline - Date.now());
+    db.setJobDeadline(id, null, remain);
   }
 
   ctx.stopped = true;
@@ -309,15 +359,21 @@ function resumeJob(jobId) {
   const job = db.getJob(id);
   if (!job) return { ok: false, message: '任务不存在' };
   if (running.has(id)) return { ok: false, message: '该任务正在运行中' };
-  if (job.status !== 'paused' && job.status !== 'stopped' && job.status !== 'queued') {
+  // 'waiting' = 定时任务在窗口外挂着（进程还在），也算「没结束」，可以继续/接着等
+  if (job.status !== 'paused' && job.status !== 'stopped' &&
+      job.status !== 'queued' && job.status !== 'waiting') {
     return { ok: false, message: '只有「已暂停 / 已停止」的任务可以继续' };
   }
-  if ((job.rounds_done || 0) >= job.rounds_total) {
+
+  let cfg = {};
+  try { cfg = JSON.parse(job.config_json) || {}; } catch (e) { cfg = {}; }
+  const kind = cfg.kind || 'pk';
+  const win = runWindow.normalize(cfg.window);
+
+  // 窗口模式下 rounds_total 是占位值，别用「局数跑满」把任务判死
+  if (!win && (job.rounds_done || 0) >= job.rounds_total) {
     return { ok: false, message: '任务已跑完全部轮次，没有可继续的' };
   }
-
-  let kind = 'pk';
-  try { kind = (JSON.parse(job.config_json) || {}).kind || 'pk'; } catch (e) { /* 保持 pk */ }
 
   // 清掉上次结束的痕迹，回到「排队中」再由 start*Job 置为 running
   db.setJobStatus(id, 'queued', { finishedAt: null, error: null });
@@ -329,9 +385,55 @@ function resumeJob(jobId) {
     ok: true,
     jobId: id,
     resumedFrom: (job.rounds_done || 0) + 1,
-    roundsTotal: job.rounds_total,
-    message: `已继续：从第 ${(job.rounds_done || 0) + 1}/${job.rounds_total} 轮接着跑`,
+    roundsTotal: win ? null : job.rounds_total,
+    message: win
+      ? `已继续：${runWindow.describe(win)}（已完成 ${job.rounds_done || 0} 局，接着跑）`
+      : `已继续：从第 ${(job.rounds_done || 0) + 1}/${job.rounds_total} 轮接着跑`,
   };
+}
+
+/**
+ * 服务重启后自动接上「限时 / 每天定时」任务。
+ *
+ * 为什么需要：普通任务重启后按「中断」处理（标 failed，用户自己再点开始），
+ * 但定时任务的全部价值就在于「不用管」—— 重启一次就永久失效等于没做。
+ * 这些任务建的时候打了 `auto_resume=1`，启动时重新拉起来：
+ *   · 限时任务 → 沿用原来的绝对截止时刻（到点了就立刻收尾）；
+ *   · 每天定时 → 现在在窗口内就直接刷，不在窗口内就挂 waiting 等下一个窗口。
+ *
+ * @returns {{resumed:number, failed:number}}
+ */
+function autoResumeWindowJobs() {
+  let resumed = 0;
+  let failed = 0;
+  let rows = [];
+  try {
+    rows = db.listAutoResumeJobs();
+  } catch (e) {
+    console.warn('[jobs] 读取待恢复任务失败：' + e.message);
+    return { resumed: 0, failed: 0 };
+  }
+  for (const job of rows) {
+    if (running.has(job.id)) continue;
+    try {
+      // 现场是「进程被杀时留下的 running」—— 不是真在跑（running 表里没有它）。
+      // 先归到 queued，再走统一的 resumeJob（它会重新算 deadline / 窗口）。
+      db.setJobStatus(job.id, 'queued', { finishedAt: null, error: null });
+      const r = resumeJob(job.id);
+      if (r.ok) {
+        resumed++;
+        console.log(`[jobs] 已自动恢复任务 #${job.id}（${job.leo_name || ('leo ' + job.leo_account_id)}）`);
+      } else {
+        failed++;
+        db.setJobStatus(job.id, 'paused', { error: '自动恢复失败：' + (r.message || '未知') });
+        console.warn(`[jobs] 自动恢复任务 #${job.id} 失败：${r.message}`);
+      }
+    } catch (e) {
+      failed++;
+      console.warn(`[jobs] 自动恢复任务 #${job.id} 异常：${e.message}`);
+    }
+  }
+  return { resumed: resumed, failed: failed };
 }
 
 /**
@@ -410,8 +512,17 @@ function stopJobsByUser(userId, opts) {
   return n;
 }
 
-/** 主循环：一轮一轮跑，每轮落库并广播。 */
-async function runLoop(job, cfg, ctx) {  const jobId = job.id;
+/**
+ * 主循环：一轮一轮跑，每轮落库并广播。
+ *
+ * ★ 2026-10-26：加入「运行窗口」—— 除了「按局数」，还支持
+ *   · 限时（duration）：到点后**当前这一局跑完**再收尾，绝不打断在途提交；
+ *   · 每天定时（daily）：窗口外挂起（status='waiting'），窗口一到自动接着刷。
+ *
+ * 判断点放在**每轮边界**，所以「19:59:58 才开的那一局」会完整跑完再停。
+ */
+async function runLoop(job, cfg, ctx) {
+  const jobId = job.id;
   let done = job.rounds_done || 0;
   let failed = job.rounds_failed || 0;
 
@@ -439,25 +550,80 @@ async function runLoop(job, cfg, ctx) {  const jobId = job.id;
     });
   }
 
-  for (let i = done + 1; i <= job.rounds_total; i++) {
+  const win = ctx.window || null;
+  const deadline = ctx.deadline || null;
+
+  // 每轮边界重读总轮数（「叠加轮数」立即生效）
+  const readTotal = () => {
+    const fresh = db.getJob(jobId);
+    return (fresh && Number(fresh.rounds_total)) || job.rounds_total;
+  };
+  let total = readTotal();
+
+  /** 局数文案：窗口模式下不显示「/100000」这种占位数字，只报已跑多少局。 */
+  const roundLabel = (n) => (win ? `第 ${n} 轮（已跑 ${done} 局）` : `第 ${n}/${total} 轮`);
+
+  /** 收尾：落库 + 广播，调用方 return。 */
+  const finish = (status, message, opts) => {
+    const o = opts || {};
+    db.setJobStatus(jobId, status, Object.assign({
+      finishedAt: o.finished === false ? null : Date.now(),
+      roundsDone: done,
+      roundsFailed: failed,
+    }, o.error ? { error: o.error } : {}));
+    publish(jobId, {
+      type: 'status',
+      message: message,
+      finished: o.finished !== false,
+      at: Date.now(),
+    });
+  };
+
+  for (let i = done + 1; ; i++) {
+    // ---- 1) 手动停止 / 暂停 ----
     if (ctx.stopped) {
       // 暂停（paused）与停止（stopped）都在这里收尾，区别只在落库状态：
       // paused 保留已跑轮数，之后可以「继续」；stopped 视为彻底结束。
-      db.setJobStatus(jobId, ctx.paused ? 'paused' : 'stopped', {
-        finishedAt: Date.now(), roundsDone: done, roundsFailed: failed,
-      });
-      publish(jobId, {
-        type: 'status',
-        message: ctx.paused
-          ? `已暂停（完成 ${done}/${job.rounds_total}，可点「继续」接着跑）`
-          : `已停止（完成 ${done}/${job.rounds_total}）`,
-        finished: !ctx.paused,
-        at: Date.now(),
-      });
+      finish(ctx.paused ? 'paused' : 'stopped',
+        ctx.paused
+          ? `已暂停（完成 ${done} 局，可点「继续」接着跑）`
+          : `已停止（完成 ${done} 局）`,
+        { finished: !ctx.paused });
       return;
     }
 
-    publish(jobId, { type: 'round', round: i, message: `第 ${i}/${job.rounds_total} 轮开始`, at: Date.now() });
+    // ---- 2) 限时到点 → 收尾（开新局之前先判一次，避免超时了还去开一局） ----
+    if (deadline != null && Date.now() >= deadline) {
+      finish('done', `时间到，已停止：共跑 ${done} 局（失败 ${failed}），${runWindow.describe(win)}`);
+      return;
+    }
+
+    // ---- 3) 总轮数（窗口模式下是占位值，正常不会触发） ----
+    total = readTotal();
+    if (i > total) break;
+
+    // ---- 4) 每日窗口：窗口外挂起，等到下一个窗口再开刷 ----
+    if (win && win.mode === 'daily' && !runWindow.isOpen(win, Date.now())) {
+      db.setJobStatus(jobId, 'waiting', { roundsDone: done, roundsFailed: failed });
+      const opened = await runWindow.waitForOpen(win, {
+        signal: ctx.signal,
+        isStopped: () => ctx.stopped,
+        onEvent: (ev) => publish(jobId, ev),
+      });
+      if (!opened) {
+        // 等待期间被停止 / 暂停 / 中断 → 按停止语义收尾（不是失败）
+        finish(ctx.paused ? 'paused' : 'stopped',
+          ctx.paused
+            ? `已暂停（完成 ${done} 局，可点「继续」接着跑）`
+            : `已停止（完成 ${done} 局）`,
+          { finished: !ctx.paused });
+        return;
+      }
+      db.setJobStatus(jobId, 'running', { roundsDone: done, roundsFailed: failed });
+      publish(jobId, { type: 'status', message: '⏰ 定时窗口已开启，继续刷', at: Date.now() });
+    }
+
+    publish(jobId, { type: 'round', round: i, message: `${roundLabel(i)}开始`, at: Date.now() });
 
     let res;
     try {
@@ -467,17 +633,11 @@ async function runLoop(job, cfg, ctx) {  const jobId = job.id;
     } catch (e) {
       // 被手动「立即结束 / 暂停」→ 直接收尾，不当失败
       if (e && e.aborted === true) {
-        db.setJobStatus(jobId, ctx.paused ? 'paused' : 'stopped', {
-          finishedAt: Date.now(), roundsDone: done, roundsFailed: failed,
-        });
-        publish(jobId, {
-          type: 'status',
-          message: ctx.paused
-            ? `已暂停（完成 ${done}/${job.rounds_total}，可点「继续」接着跑）`
-            : `已立即结束（完成 ${done}/${job.rounds_total}）`,
-          finished: !ctx.paused,
-          at: Date.now(),
-        });
+        finish(ctx.paused ? 'paused' : 'stopped',
+          ctx.paused
+            ? `已暂停（完成 ${done} 局，可点「继续」接着跑）`
+            : `已立即结束（完成 ${done} 局）`,
+          { finished: !ctx.paused });
         return;
       }
       res = { ok: false, httpCode: null, message: '异常：' + e.message, detail: '' };
@@ -494,6 +654,14 @@ async function runLoop(job, cfg, ctx) {  const jobId = job.id;
       detail: res.detail,
       at: Date.now(),
     });
+
+    // ---- 5) ★「这一局搞完之后就直接停」：到点检查放在每轮**结束之后** ----
+    //   刻意放在这里而不是轮次开头，是为了让已经开跑的那一局完整收尾
+    //   （半局中断会白跑一次出题，还可能把提交打进频控窗口）。
+    if (deadline != null && Date.now() >= deadline) {
+      finish('done', `时间到，已停止：共跑 ${done} 局（失败 ${failed}），${runWindow.describe(win)}`);
+      return;
+    }
 
     // 连续失败太多就停（避免把频控喂爆）
     if (failed >= 8 && done === 0) {
@@ -540,6 +708,12 @@ function startExerciseJob(o) {
   if (!account) return { ok: false, message: '小猿账号不存在（可能已被删除）' };
 
   const cfg = JSON.parse(job.config_json);
+
+  // ★ 2026-10-26：运行窗口（限时 / 每天定时）—— 与刷局同一套语义
+  const win = runWindow.normalize(cfg.window);
+  const deadline = deadlineOf(job, win);
+  if (win) db.setJobDeadline(job.id, deadline, null);
+
   const controller = new AbortController();
   const ctx = {
     stopped: false,
@@ -548,14 +722,26 @@ function startExerciseJob(o) {
     config: cfg,
     controller: controller,
     signal: controller.signal,
+    window: win,
+    deadline: deadline,
   };
   running.set(job.id, ctx);
   db.setJobStatus(job.id, 'running', { startedAt: Date.now() });
   publish(job.id, {
     type: 'status', exercise: true, jobId: job.id,
-    message: `练习任务开始：${job.rounds_total} 轮 × ${cfg.limit} 题（知识点 ${cfg.keypointId}）`,
+    message: `练习任务开始：${win ? runWindow.describe(win) : (job.rounds_total + ' 轮')}` +
+      ` × ${cfg.limit} 题（知识点 ${cfg.keypointId}）`,
     at: Date.now(),
   });
+  if (win) {
+    publish(job.id, {
+      type: 'status', exercise: true, jobId: job.id,
+      message: win.mode === 'duration'
+        ? `停止条件：${runWindow.describe(win)}（到点后当前这一轮跑完即停）`
+        : `停止条件：${runWindow.describe(win)}（窗口外自动挂起等待，第二天到点自动接着刷）`,
+      at: Date.now(),
+    });
+  }
 
   runExerciseLoop(job, cfg, ctx).catch((e) => {
     // startExerciseJob 里 runExerciseLoop 已自行 try/catch，这里是最后兜底。
@@ -581,6 +767,9 @@ async function runExerciseLoop(job, cfg, ctx) {
   let done = job.rounds_done || 0;
   let failed = job.rounds_failed || 0;
 
+  const win = ctx.window || null;
+  const deadline = ctx.deadline || null;
+
   const emit = (ev) => {
     if (!ev || typeof ev !== 'object') return;
     const e = Object.assign({}, ev, { exercise: true, jobId: jobId });
@@ -597,9 +786,47 @@ async function runExerciseLoop(job, cfg, ctx) {
     }
   };
 
+  // 本次还要跑多少轮：
+  //  - 窗口模式（限时 / 每天定时）→ 用占位总数当「不限」，由时间条件收尾；
+  //  - 普通模式 → 总轮数 - 已跑（这样「继续」不会把已跑的轮次再跑一遍）。
+  const total = Number(job.rounds_total) || Number(cfg.rounds) || 1;
+  const startNo = done + failed;
+  const roundsLeft = Math.max(0, total - startNo);
+
+  let timeUp = false;    // 限时到点
+
+  /**
+   * 每轮开始前的统一闸门：停止 / 到点 / 窗口外等待。
+   * @returns {Promise<boolean>} false = 该收尾了（不再开新一轮）
+   */
+  const beforeRound = async () => {
+    if (ctx.stopped) return false;
+
+    // 限时到点：开新轮之前先判一次
+    if (deadline != null && Date.now() >= deadline) { timeUp = true; return false; }
+
+    // 每日窗口：窗口外挂起等待
+    if (win && win.mode === 'daily' && !runWindow.isOpen(win, Date.now())) {
+      db.setJobStatus(jobId, 'waiting', { roundsDone: done, roundsFailed: failed });
+      const opened = await runWindow.waitForOpen(win, {
+        signal: ctx.signal,
+        isStopped: () => ctx.stopped,
+        onEvent: emit,
+      });
+      if (!opened) return false;
+      db.setJobStatus(jobId, 'running', { roundsDone: done, roundsFailed: failed });
+      emit({ type: 'status', message: '⏰ 定时窗口已开启，继续刷练习', at: Date.now() });
+    }
+    return true;
+  };
+
   try {
     const r = await exercise.practiceLoop(ctx.jar, {
-      rounds: cfg.rounds, limit: cfg.limit, keypointId: cfg.keypointId,
+      rounds: roundsLeft,
+      // 轮次编号接着已跑的算，避免「继续」后从第 1 轮重新数（明细里会重号）
+      roundOffset: startNo,
+      beforeRound: beforeRound,
+      limit: cfg.limit, keypointId: cfg.keypointId,
       gapMinMs: cfg.gapMinMs, gapMaxMs: cfg.gapMaxMs,
       costTimePerQuestionMs: cfg.costTimePerQuestionMs,
       // 「上榜模式」：fast(0.2s/题) ｜ rank(0.5s/题，上榜用)。
@@ -614,7 +841,11 @@ async function runExerciseLoop(job, cfg, ctx) {
       signal: ctx.signal,
       onEvent: emit,
     });
-    done = r.done; failed = r.failed;
+
+    // ⚠️ 这里**不要**用 `done = r.done` 覆盖：
+    //   r.done 只是本次调用的计数，而 done 已经带着「上次跑到哪」的底数
+    //   （每轮 ex-round-ok/fail 事件里累加过了）。覆盖会让「继续」后的进度倒退。
+
     // 期间被暂停 → 落 paused（保留进度），别标成「已完成」
     if (ctx.stopped) {
       db.setJobStatus(jobId, ctx.paused ? 'paused' : 'stopped', {
@@ -627,6 +858,19 @@ async function runExerciseLoop(job, cfg, ctx) {
       });
       return;
     }
+
+    // ★ 限时到点：当前这一轮已经跑完了（beforeRound 保证了不会开新轮）
+    if (timeUp) {
+      db.setJobStatus(jobId, 'done', { finishedAt: Date.now(), roundsDone: done, roundsFailed: failed });
+      publish(jobId, {
+        type: 'status', exercise: true, jobId: jobId, finished: true,
+        message: `时间到，已停止：共刷 ${done} 轮（失败 ${failed}），累计经验 +${r.totalExp || 0}` +
+          `，${runWindow.describe(win)}`,
+        at: Date.now(),
+      });
+      return;
+    }
+
     db.setJobStatus(jobId, 'done', { finishedAt: Date.now(), roundsDone: done, roundsFailed: failed });
     // 收尾核对一次周分数（只读接口，不计入任何频控）——「经验到底到账没」的唯一可信口径
     let scoreMsg = '';
@@ -636,7 +880,7 @@ async function runExerciseLoop(job, cfg, ctx) {
     } catch (e) { /* 核对失败不影响任务结论 */ }
     publish(jobId, {
       type: 'status', exercise: true, jobId: jobId, finished: true,
-      message: `练习任务完成：成功 ${done} / ${r.rounds}，失败 ${failed}，累计经验 +${r.totalExp}${scoreMsg}`,
+      message: `练习任务完成：成功 ${done} 轮，失败 ${failed}，累计经验 +${r.totalExp || 0}${scoreMsg}`,
       at: Date.now(),
     });
   } catch (e) {
@@ -1017,6 +1261,7 @@ module.exports = {
   startRaceJob,
   stopJob,
   resumeJob,
+  autoResumeWindowJobs,
   extendJobRounds,
   stopJobsByUser,
   subscribe,

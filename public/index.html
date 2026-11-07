@@ -76,8 +76,31 @@
         <div id="point-list" class="chips"></div>
 
         <div class="row">
+          <label class="grow">停止条件
+            <select id="grind-runmode">
+              <option value="rounds" selected>按局数（刷够就停）</option>
+              <option value="duration">按时长（刷够时间就停）</option>
+              <option value="daily">每天定时（时间段内一直刷）</option>
+            </select>
+          </label>
+        </div>
+        <div class="row" id="grind-row-rounds">
           <label class="grow">刷多少局<input id="grind-rounds" type="number" value="10" min="1" max="100000"></label>
         </div>
+        <div class="row hidden" id="grind-row-duration">
+          <label class="grow">刷多久<input id="grind-duration" type="number" value="1" min="1"></label>
+          <label class="grow">单位
+            <select id="grind-duration-unit">
+              <option value="hour" selected>小时</option>
+              <option value="min">分钟</option>
+            </select>
+          </label>
+        </div>
+        <div class="row hidden" id="grind-row-daily">
+          <label class="grow">每天开始<input id="grind-daily-start" type="time" value="08:00"></label>
+          <label class="grow">每天结束<input id="grind-daily-end" type="time" value="20:00"></label>
+        </div>
+        <p class="muted small hidden" id="grind-window-hint"></p>
         <details class="adv">
           <summary>高级参数（costTime / 画笔算法 / 频控 / 间隔）</summary>
 
@@ -260,8 +283,33 @@
       <div class="row">
         <label class="grow">知识点 ID<input id="prac-kp" type="number" value="16"></label>
         <label class="grow">每轮题数 limit<input id="prac-limit" type="number" value="100" min="1" max="200"></label>
+      </div>
+      <div class="row">
+        <label class="grow">停止条件
+          <select id="prac-runmode">
+            <option value="rounds" selected>按轮数（刷够就停）</option>
+            <option value="duration">按时长（刷够时间就停）</option>
+            <option value="daily">每天定时（时间段内一直刷）</option>
+          </select>
+        </label>
+      </div>
+      <div class="row" id="prac-row-rounds">
         <label class="grow">轮数<input id="prac-rounds" type="number" value="1" min="1" max="100000"></label>
       </div>
+      <div class="row hidden" id="prac-row-duration">
+        <label class="grow">刷多久<input id="prac-duration" type="number" value="1" min="1"></label>
+        <label class="grow">单位
+          <select id="prac-duration-unit">
+            <option value="hour" selected>小时</option>
+            <option value="min">分钟</option>
+          </select>
+        </label>
+      </div>
+      <div class="row hidden" id="prac-row-daily">
+        <label class="grow">每天开始<input id="prac-daily-start" type="time" value="08:00"></label>
+        <label class="grow">每天结束<input id="prac-daily-end" type="time" value="20:00"></label>
+      </div>
+      <p class="muted small hidden" id="prac-window-hint"></p>
       <div class="row">
         <label class="grow">模式
           <select id="prac-pace">

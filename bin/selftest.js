@@ -292,6 +292,54 @@ check('设备链解析 extractDeviceChain',
 check('jobs.js 导出齐全', missingJobs.length === 0,
   missingJobs.length === 0 ? REQUIRED_JOBS.length + ' 项' : '缺少 ' + missingJobs.join(', '));
 
+/* ---------------- 运行窗口（限时 / 每天定时） ---------------- */
+console.log('');
+console.log('11) 运行窗口（限时 / 每天定时）');
+const rw = require(path.join(root, 'src', 'run-window'));
+
+check('parseHM 兼容 08:00 / 8:00 / 0800',
+  rw.parseHM('08:00') === 480 && rw.parseHM('8:00') === 480 &&
+  rw.parseHM('0800') === 480 && rw.parseHM('23:59') === 1439,
+  [rw.parseHM('08:00'), rw.parseHM('8:00'), rw.parseHM('0800')].join(' / '));
+check('parseHM 拒绝非法值', rw.parseHM('24:00') === null && rw.parseHM('abc') === null);
+
+const wDur = rw.normalize({ mode: 'duration', durationMs: 3600000 });
+check('限时归一化', !!wDur && wDur.mode === 'duration' && wDur.durationMs === 3600000,
+  wDur ? rw.describe(wDur) : 'null');
+check('限时下限保护（<1 分钟被抬到 1 分钟）',
+  rw.normalize({ mode: 'duration', durationMs: 1000 }).durationMs === rw.MIN_DURATION_MS);
+check('限时优先用「剩余时长」算 deadline',
+  Math.abs(rw.durationDeadline(wDur, 1000000, 60000) - (1000000 + 60000)) < 5);
+
+const wDay = rw.normalize({ mode: 'daily', start: '08:00', end: '20:00' });
+check('每日窗口归一化（缺省每天）',
+  !!wDay && wDay.startMin === 480 && wDay.endMin === 1200 && wDay.days.length === 7,
+  wDay ? rw.describe(wDay) : 'null');
+// 2026-10-26 是周一
+const mon = (h, m) => new Date(2026, 9, 26, h, m, 0, 0).getTime();
+check('窗口内 09:00 → 开', rw.isOpen(wDay, mon(9, 0)) === true);
+check('窗口外 07:59 → 关', rw.isOpen(wDay, mon(7, 59)) === false);
+check('窗口外 20:00 → 关（右开区间）', rw.isOpen(wDay, mon(20, 0)) === false);
+check('nextOpenAt：21:00 → 次日 08:00',
+  rw.nextOpenAt(wDay, mon(21, 0)) === new Date(2026, 9, 27, 8, 0, 0, 0).getTime());
+
+// 跨午夜 22:00 → 02:00
+const wNight = rw.normalize({ mode: 'daily', start: '22:00', end: '02:00' });
+check('跨午夜窗口：23:30 开 / 01:00 开 / 12:00 关',
+  rw.isOpen(wNight, mon(23, 30)) === true &&
+  rw.isOpen(wNight, new Date(2026, 9, 27, 1, 0).getTime()) === true &&
+  rw.isOpen(wNight, mon(12, 0)) === false,
+  rw.describe(wNight));
+check('跨午夜窗口：22:00 之前不算开',
+  rw.isOpen(wNight, mon(21, 59)) === false);
+check('跨午夜窗口归属前一天（只选周一 → 周二凌晨仍算）', (() => {
+  const onlyMon = rw.normalize({ mode: 'daily', start: '22:00', end: '02:00', days: [1] });
+  return rw.isOpen(onlyMon, new Date(2026, 9, 27, 1, 0).getTime()) === true;   // 周二 01:00
+})());
+check('开始=结束 视为非法（否则等于不刷）',
+  rw.normalize({ mode: 'daily', start: '08:00', end: '08:00' }) === null);
+check('autoResumeWindowJobs 已导出', typeof jobsLib.autoResumeWindowJobs === 'function');
+
 console.log('');
 console.log(failed === 0 ? '全部通过 ✔' : ('有 ' + failed + ' 项失败 ✘'));
 process.exit(failed === 0 ? 0 : 1);

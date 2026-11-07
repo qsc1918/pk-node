@@ -27,6 +27,7 @@ const leo = require('./src/leo');
 const pkH5 = require('./src/pk-h5-proxy');
 const pkH5Local = require('./src/pk-h5-localserver');
 const schoolSeason = require('./src/school-season');
+const runWindow = require('./src/run-window');
 
 const PUBLIC_DIR = path.join(config.root, 'public');
 
@@ -317,6 +318,57 @@ function clampRounds(v, def) {
   return Math.min(n, MAX_ROUNDS);
 }
 
+/* ---------------------- 运行窗口（限时 / 每天定时） ---------------------- */
+
+/**
+ * 解析「停止条件」—— 刷局与刷练习共用。
+ *
+ * 三种（请求体 `runMode`）：
+ *   rounds   （默认）按局数跑，行为与改造前完全一致
+ *   duration 按时长跑：`durationValue` + `durationUnit`(hour|min)
+ *   daily    每天定时：`dailyStart` / `dailyEnd`（HH:MM，可跨午夜）+ 可选 `dailyDays`
+ *
+ * 返回 `{ window }` 或 `{ error }`；`window` 为 null 表示「按局数」。
+ *
+ * ⚠️ 窗口模式下 `cfg.rounds` 会被设成 MAX_ROUNDS（= 不限局数），
+ *    真正的停止条件由 `window` 决定 —— 主循环每轮边界检查一次。
+ *
+ * @param {object} b 请求体
+ * @returns {{window?:object|null, error?:string}}
+ */
+function makeRunWindow(b) {
+  const mode = String(b.runMode || b.stopMode || 'rounds');
+
+  if (mode === 'duration') {
+    const unit = String(b.durationUnit || 'hour');
+    const raw = b.durationValue != null && b.durationValue !== '' ? Number(b.durationValue) : NaN;
+    if (!Number.isFinite(raw) || raw <= 0) {
+      return { error: '「刷多久」必须是正数（例如 1 小时 / 90 分钟）' };
+    }
+    const per = (unit === 'min' || unit === 'minute' || unit === 'm') ? 60000 : 3600000;
+    const ms = Math.floor(raw * per);
+    if (ms < runWindow.MIN_DURATION_MS) return { error: '限时至少要 1 分钟' };
+    if (ms > runWindow.MAX_DURATION_MS) return { error: '限时最长 30 天' };
+    return { window: { mode: 'duration', durationMs: ms } };
+  }
+
+  if (mode === 'daily') {
+    const s = runWindow.parseHM(b.dailyStart);
+    const e = runWindow.parseHM(b.dailyEnd);
+    if (s == null) return { error: '「每天开始」时间格式不对，应为 HH:MM（如 08:00）' };
+    if (e == null) return { error: '「每天结束」时间格式不对，应为 HH:MM（如 20:00）' };
+    if (s === e) return { error: '每天的开始和结束时间不能相同（这样等于不刷）' };
+    let days = Array.isArray(b.dailyDays)
+      ? b.dailyDays.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6)
+      : [];
+    // 不传 / 传满一周 → 每天都跑
+    if (days.length === 0 || days.length === 7) days = [0, 1, 2, 3, 4, 5, 6];
+    return { window: { mode: 'daily', startMin: s, endMin: e, days: days } };
+  }
+
+  return { window: null };
+}
+
 /* ---------------------- 任务参数构造（单个 / 批量共用） ---------------------- */
 // 「单开」与「批量」共用同一份解析，避免两边漂移；出错返回 { error } 由调用方定状态码。
 
@@ -342,8 +394,17 @@ function makePkConfig(b) {
   if (cfg.costTimeMs != null && (!Number.isFinite(cfg.costTimeMs) || cfg.costTimeMs < 0)) {
     return { error: 'costTime 必须是非负数字（留空=自动）' };
   }
-  // 只挡非法值，上限给足够大的安全值（见 clampRounds）
-  cfg.rounds = clampRounds(b.rounds, 10);
+  // ★ 2026-10-26：停止条件 —— 按局数（默认）/ 限时 / 每天定时
+  const w = makeRunWindow(b);
+  if (w.error) return { error: w.error };
+  if (w.window) {
+    cfg.window = w.window;
+    // 窗口模式下局数不再是停止条件，用占位上限当「不限」
+    cfg.rounds = MAX_ROUNDS;
+  } else {
+    // 只挡非法值，上限给足够大的安全值（见 clampRounds）
+    cfg.rounds = clampRounds(b.rounds, 10);
+  }
   return cfg;
 }
 
@@ -365,7 +426,15 @@ function makeExerciseConfig(b) {
     matchWaitMinMs: b.matchWaitMinMs == null ? undefined : Number(b.matchWaitMinMs),
     matchWaitMaxMs: b.matchWaitMaxMs == null ? undefined : Number(b.matchWaitMaxMs),
   };
-  cfg.rounds = clampRounds(b.rounds, 1);
+  // ★ 2026-10-26：停止条件 —— 按轮数（默认）/ 限时 / 每天定时
+  const w = makeRunWindow(b);
+  if (w.error) return { error: w.error };
+  if (w.window) {
+    cfg.window = w.window;
+    cfg.rounds = MAX_ROUNDS;
+  } else {
+    cfg.rounds = clampRounds(b.rounds, 1);
+  }
   return cfg;
 }
 
@@ -1178,13 +1247,14 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
       if (kind === 'exercise') {
         const cfg = makeExerciseConfig(b);
         if (cfg.error) { results.push({ leoAccountId: leoId, name: acc.name, ok: false, message: cfg.error }); continue; }
-        jobId = db.createJob(user.id, leoId, null, cfg, cfg.rounds);
+        // 限时 / 每天定时的任务：重启后自动接上（定时任务不能因为重启一次就失效）
+        jobId = db.createJob(user.id, leoId, null, cfg, cfg.rounds, { autoResume: !!cfg.window });
         start = jobs.startExerciseJob({ jobId: jobId });
         if (!start.ok) db.setJobStatus(jobId, 'failed', { finishedAt: Date.now(), error: start.message });
       } else {
         const cfg = makePkConfig(b);
         if (cfg.error) { results.push({ leoAccountId: leoId, name: acc.name, ok: false, message: cfg.error }); continue; }
-        jobId = db.createJob(user.id, leoId, cfg.subUserId, cfg, cfg.rounds);
+        jobId = db.createJob(user.id, leoId, cfg.subUserId, cfg, cfg.rounds, { autoResume: !!cfg.window });
         start = jobs.startJob({ jobId: jobId });
         if (!start.ok) db.setJobStatus(jobId, 'failed', { finishedAt: Date.now(), error: start.message });
       }
@@ -1213,8 +1283,9 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
     const cfg = makePkConfig(b);
     if (cfg.error) return sendJson(res, 400, { ok: false, message: cfg.error });
     const rounds = cfg.rounds;
-    const jobId = db.createJob(user.id, leoId, cfg.subUserId, cfg, rounds);
-    db.audit(user.id, 'job_create', `job=${jobId} rounds=${rounds} pointId=${cfg.pointId}`, clientIp(req));
+    const jobId = db.createJob(user.id, leoId, cfg.subUserId, cfg, rounds, { autoResume: !!cfg.window });
+    db.audit(user.id, 'job_create',
+      `job=${jobId} rounds=${cfg.window ? runWindow.describe(runWindow.normalize(cfg.window)) : rounds} pointId=${cfg.pointId}`, clientIp(req));
 
     const start = jobs.startJob({ jobId: jobId });
     return sendJson(res, start.ok ? 200 : 400, { ok: start.ok, jobId: jobId, message: start.message });
@@ -1391,9 +1462,11 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
     // 刷练习走正经后台任务：写一条 jobs 记录（kind='exercise'）再交给 startExerciseJob，
     // 于是任务页可见、逐轮落库、可停止、与刷局共用 SSE。
     const cfg = makeExerciseConfig(b);
-    const jobId = db.createJob(user.id, acc.id, null, cfg, cfg.rounds);
+    if (cfg.error) return sendJson(res, 400, { ok: false, message: cfg.error });
+    const jobId = db.createJob(user.id, acc.id, null, cfg, cfg.rounds, { autoResume: !!cfg.window });
     const start = jobs.startExerciseJob({ jobId: jobId });
-    db.audit(user.id, 'exercise_run', `job=${jobId} leo=${acc.id} rounds=${cfg.rounds} limit=${cfg.limit} kp=${cfg.keypointId}`, clientIp(req));
+    db.audit(user.id, 'exercise_run',
+      `job=${jobId} leo=${acc.id} rounds=${cfg.window ? runWindow.describe(runWindow.normalize(cfg.window)) : cfg.rounds} limit=${cfg.limit} kp=${cfg.keypointId}`, clientIp(req));
     if (!start.ok) {
       db.setJobStatus(jobId, 'failed', { finishedAt: Date.now(), error: start.message });
       return sendJson(res, 400, { ok: false, jobId: jobId, message: start.message });
@@ -1401,9 +1474,11 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
     return sendJson(res, 200, {
       ok: true,
       jobId: jobId,
-      rounds: cfg.rounds,
+      rounds: cfg.window ? null : cfg.rounds,
       limit: cfg.limit,
-      message: `已开始：${cfg.rounds} 轮 × ${cfg.limit} 题（任务 #${jobId}，可在「任务」页查看进度）`,
+      message: cfg.window
+        ? `已开始：${runWindow.describe(runWindow.normalize(cfg.window))} × 每轮 ${cfg.limit} 题（任务 #${jobId}，可在「任务」页查看进度）`
+        : `已开始：${cfg.rounds} 轮 × ${cfg.limit} 题（任务 #${jobId}，可在「任务」页查看进度）`,
     });
   }
 
@@ -1741,6 +1816,12 @@ function publicJob(j) {
     roundsTotal: j.rounds_total,
     roundsDone: j.rounds_done,
     roundsFailed: j.rounds_failed,
+    // ★ 2026-10-26：运行窗口（限时 / 每天定时）。
+    //   `unlimited=true` 表示「局数不是停止条件」，UI 不该显示「/100000」。
+    window: (cfg && cfg.window) || null,
+    unlimited: !!(cfg && cfg.window),
+    deadlineAt: j.deadline_at == null ? null : j.deadline_at,
+    remainingMs: j.remaining_ms == null ? null : j.remaining_ms,
     createdAt: j.created_at,
     startedAt: j.started_at,
     finishedAt: j.finished_at,
@@ -1812,6 +1893,19 @@ function main() {
   // 服务重启 = 任务中断：清掉残留的 running/queued 僵尸任务，否则任务页永远显示「运行中」。
   const interrupted = db.markInterruptedJobs();
   if (interrupted > 0) console.log('[pk-node] 已把 ' + interrupted + ' 个中断任务标记为失败（服务重启）');
+
+  // ★ 2026-10-26：限时 / 每天定时的任务**不算中断** —— 重启后自动接上。
+  //   否则「每天早上 8 点自动刷到 20 点」会因为重启一次就永久失效，
+  //   而这类任务的全部价值就是「建好之后不用管」。
+  try {
+    const auto = jobs.autoResumeWindowJobs();
+    if (auto.resumed > 0 || auto.failed > 0) {
+      console.log('[pk-node] 已自动恢复 ' + auto.resumed + ' 个定时/限时任务' +
+        (auto.failed > 0 ? '（' + auto.failed + ' 个恢复失败）' : ''));
+    }
+  } catch (e) {
+    console.warn('[pk-node] 自动恢复定时任务失败（不影响启动）：' + e.message);
+  }
 
   const nt = nativeLib.selfTest();
   const sg = signLib.verifyWithFixture();

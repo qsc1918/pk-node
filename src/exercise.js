@@ -776,8 +776,29 @@ async function practiceLoop(jar, opts) {
   let done = 0, failed = 0, totalExp = 0;
   let lastWaitMs = 0;
 
+  // ★ 2026-10-26：支持「运行窗口」（限时 / 每天定时）。
+  //   beforeRound 由调度层（jobs.js）注入，负责三件事：
+  //     ① 用户点了停止 → 返回 false，立刻收尾；
+  //     ② 限时到点     → 返回 false（**当前这一轮已经跑完了**，不会打断在途提交）；
+  //     ③ 每天定时窗口外 → 在里面 await 到下一个窗口再返回 true。
+  const beforeRound = typeof o.beforeRound === 'function' ? o.beforeRound : null;
+  // 轮次编号偏移：任务「继续」时接着已跑的编号数，避免明细里从 1 重新数（会重号）
+  const base = Math.max(0, Math.floor(Number(o.roundOffset) || 0));
+  // 总轮次编号（含已跑过的）——「限时 / 定时」任务用 100000 当占位，日志里显示「不限」
+  const totalNo = base + rounds;
+  const unlimited = totalNo >= 100000;
+  const roundText = (n) => (unlimited ? `第 ${n} 轮` : `第 ${n}/${totalNo} 轮`);
+
   for (let i = 1; i <= rounds; i++) {
     if (o.signal && o.signal.aborted) throw abortedError();
+
+    if (beforeRound) {
+      const go = await beforeRound();
+      if (go === false) break;
+      // 等待期间可能被停止（beforeRound 内部 await 过），再确认一次
+      if (o.signal && o.signal.aborted) throw abortedError();
+    }
+    const roundNo = base + i;
 
     // 每轮间隔：冷却剩余 与 随机间隔 取大者。
     // ★ 第一轮跳过（lastMatchOkAt=0）—— 开跑前无需等。
@@ -789,8 +810,8 @@ async function practiceLoop(jar, opts) {
       if (wait > 0) {
         emit({
           type: 'ex-gap',
-          round: i,
-          message: `出题等待 ${(wait / 1000).toFixed(1)}s 后开始第 ${i} 轮` +
+          round: roundNo,
+          message: `出题等待 ${(wait / 1000).toFixed(1)}s 后开始${roundText(roundNo)}` +
             `（配置 ${(gap / 1000).toFixed(1)}s，冷却剩 ${(cooldownLeft / 1000).toFixed(1)}s）`,
           configuredMs: gap,
           cooldownLeftMs: cooldownLeft,
@@ -801,7 +822,7 @@ async function practiceLoop(jar, opts) {
       }
     }
 
-    emit({ type: 'ex-round', round: i, message: `第 ${i}/${rounds} 轮开始` });
+    emit({ type: 'ex-round', round: roundNo, message: `${roundText(roundNo)}开始` });
     const t0 = Date.now();
     let r;
     try {
@@ -818,8 +839,8 @@ async function practiceLoop(jar, opts) {
     if (!r || !r.ok) {
       failed++;
       emit({
-        type: 'ex-round-fail', round: i, status: (r && r.status) || null,
-        message: `第 ${i} 轮失败：${(r && r.text || '').slice(0, 90)}`,
+        type: 'ex-round-fail', round: roundNo, status: (r && r.status) || null,
+        message: `第 ${roundNo} 轮失败：${(r && r.text || '').slice(0, 90)}`,
       });
       // 出题失败多半是还在冷却 → 补等一轮再继续
       await sleep(MATCH_RETRY_INTERVAL_MS, o.signal);
@@ -830,16 +851,16 @@ async function practiceLoop(jar, opts) {
     lastMatchOkAt = Date.now();
     emit({
       type: 'ex-round-ok',
-      round: i,
+      round: roundNo,
       correctCnt: r.correctCnt,
       questionCnt: r.questionCnt,
       exp: r.exp,
       examId: r.examId,
-      message: `第 ${i} 轮成功：判对 ${r.correctCnt}/${r.questionCnt}，+${r.exp} 经验（耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s，累计 +${totalExp}）`,
+      message: `第 ${roundNo} 轮成功：判对 ${r.correctCnt}/${r.questionCnt}，+${r.exp} 经验（耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s，累计 +${totalExp}）`,
     });
   }
 
-  emit({ type: 'ex-done', message: `全部结束：成功 ${done}/${rounds}，累计经验 +${totalExp}` });
+  emit({ type: 'ex-done', message: `本轮结束：成功 ${done} 轮，累计经验 +${totalExp}` });
   return {
     ok: failed === 0, rounds: rounds, done: done, failed: failed, totalExp: totalExp,
     gapMinMs: gapMin, gapMaxMs: gapMax, lastWaitMs: lastWaitMs,

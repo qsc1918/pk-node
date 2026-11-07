@@ -122,15 +122,19 @@ CREATE TABLE IF NOT EXISTS jobs (
   user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   leo_account_id INTEGER NOT NULL REFERENCES leo_accounts(id) ON DELETE CASCADE,
   sub_user_id    INTEGER,
-  status         TEXT    NOT NULL,          -- queued|running|done|failed|stopped
-  config_json    TEXT    NOT NULL,          -- 刷局参数快照
+  status         TEXT    NOT NULL,          -- queued|running|waiting|done|failed|stopped|paused
+  config_json    TEXT    NOT NULL,          -- 刷局参数快照（含 window：限时 / 每日定时）
   rounds_total   INTEGER NOT NULL,
   rounds_done    INTEGER NOT NULL DEFAULT 0,
   rounds_failed  INTEGER NOT NULL DEFAULT 0,
   created_at     INTEGER NOT NULL,
   started_at     INTEGER,
   finished_at    INTEGER,
-  error          TEXT
+  error          TEXT,
+  -- ★ 2026-10-26：运行窗口（限时 / 每天定时）
+  deadline_at    INTEGER,                   -- 限时模式的绝对截止时刻（毫秒）；null = 不限时
+  remaining_ms   INTEGER,                   -- 暂停时的剩余时长（继续时按它重新算 deadline）
+  auto_resume    INTEGER NOT NULL DEFAULT 0 -- 1 = 服务重启后自动接上（定时任务用）
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id, created_at DESC);
 
@@ -186,6 +190,11 @@ function init() {
   // 老库补列：设备链归属组织 + 内置标记（内置池新增；老库这两列不存在）
   ensureColumn('device_chains', 'org', "ALTER TABLE device_chains ADD COLUMN org TEXT");
   ensureColumn('device_chains', 'builtin', 'ALTER TABLE device_chains ADD COLUMN builtin INTEGER NOT NULL DEFAULT 0');
+  // 老库补列：运行窗口（2026-10-26 新增：限时 / 每天定时）
+  ensureColumn('jobs', 'deadline_at', 'ALTER TABLE jobs ADD COLUMN deadline_at INTEGER');
+  ensureColumn('jobs', 'remaining_ms', 'ALTER TABLE jobs ADD COLUMN remaining_ms INTEGER');
+  ensureColumn('jobs', 'auto_resume',
+    'ALTER TABLE jobs ADD COLUMN auto_resume INTEGER NOT NULL DEFAULT 0');
   // 补列之后才能建依赖它的索引（放前面会让老库上 SCHEMA 直接失败）
   try {
     db.exec('CREATE INDEX IF NOT EXISTS idx_leo_accounts_chain ON leo_accounts(device_chain_id)');
@@ -655,15 +664,29 @@ function getSubAccount(id) {
 
 /* ----------------------------- 任务 ----------------------------- */
 
-function createJob(userId, leoAccountId, subUserId, cfg, roundsTotal) {
+/**
+ * 建一条任务。
+ *
+ * @param {number} userId
+ * @param {number} leoAccountId
+ * @param {number|null} subUserId
+ * @param {object} cfg
+ * @param {number} roundsTotal
+ * @param {{autoResume?:boolean}} [opts]
+ *   autoResume=true → 服务重启后自动接上（限时 / 每天定时的任务需要它，
+ *   否则「每天早上 8 点自动刷」会因为重启一次就永久失效）。
+ * @returns {number} jobId
+ */
+function createJob(userId, leoAccountId, subUserId, cfg, roundsTotal, opts) {
   const now = Date.now();
+  const autoResume = opts && opts.autoResume ? 1 : 0;
   // ⚠️ 参数顺序必须与列顺序严格一致：
-  // (user_id, leo_account_id, sub_user_id, status, config_json, rounds_total, created_at)
+  // (user_id, leo_account_id, sub_user_id, status, config_json, rounds_total, created_at, auto_resume)
   // 顺序错会把 config 写进 status、rounds_total 写成字符串，导致循环条件恒 false。
   const info = get()
     .prepare(
-      `INSERT INTO jobs (user_id, leo_account_id, sub_user_id, status, config_json, rounds_total, created_at)
-       VALUES (?,?,?,?,?,?,?)`,
+      `INSERT INTO jobs (user_id, leo_account_id, sub_user_id, status, config_json, rounds_total, created_at, auto_resume)
+       VALUES (?,?,?,?,?,?,?,?)`,
     )
     .run(
       Number(userId),
@@ -673,8 +696,26 @@ function createJob(userId, leoAccountId, subUserId, cfg, roundsTotal) {
       JSON.stringify(cfg),
       Number(roundsTotal),
       now,
+      autoResume,
     );
   return Number(info.lastInsertRowid);
+}
+
+/**
+ * 记录 / 清空任务的运行截止时刻。
+ *
+ * @param {number} id
+ * @param {number|null} deadlineAt 绝对截止时刻；null = 清掉（不限时）
+ * @param {number|null} [remainingMs] 剩余时长（暂停时存，继续时用；null = 清掉）
+ */
+function setJobDeadline(id, deadlineAt, remainingMs) {
+  get()
+    .prepare('UPDATE jobs SET deadline_at = ?, remaining_ms = ? WHERE id = ?')
+    .run(
+      deadlineAt == null ? null : Number(deadlineAt),
+      remainingMs == null ? null : Number(remainingMs),
+      Number(id),
+    );
 }
 
 /**
@@ -746,15 +787,17 @@ function listAllJobs(limit = 100) {
 }
 
 /**
- * 某用户「还没跑完」的任务（running / queued / paused）。
+ * 某用户「还没跑完」的任务（running / waiting / queued / paused）。
  *
  * 用途：管理员禁用 / 删除用户时，要把这些任务一并停下来 —— 否则用户界面上
  * 显示「已禁用」，后台却还在替他刷局。
+ *
+ * `waiting` 是 2026-10-26 新增的「活着但在等定时窗口」状态，也算未结束。
  */
 function listActiveJobsByUser(userId) {
   return get()
     .prepare(
-      `SELECT * FROM jobs WHERE user_id = ? AND status IN ('running','queued','paused')
+      `SELECT * FROM jobs WHERE user_id = ? AND status IN ('running','waiting','queued','paused')
        ORDER BY id DESC`,
     )
     .all(Number(userId));
@@ -767,8 +810,12 @@ function listJobRounds(jobId, limit = 200) {
 }
 
 /**
- * 把进程被杀时残留的 running/queued 任务标成 failed（语义：服务重启 = 任务中断）。
+ * 把进程被杀时残留的 running/queued/waiting 任务标成 failed（语义：服务重启 = 任务中断）。
  * 现在刷练习也是后台任务，重启后会留下僵尸 running 任务，启动时清理一次。
+ *
+ * ★ 2026-10-26：`auto_resume = 1` 的任务（限时 / 每天定时）**跳过** —— 它们由
+ *   `jobs.autoResumeWindowJobs()` 在启动后自动接上，不能标成失败。
+ *
  * @returns {number} 被标记的任务数
  */
 function markInterruptedJobs() {
@@ -776,10 +823,24 @@ function markInterruptedJobs() {
   const info = get()
     .prepare(
       `UPDATE jobs SET status = 'failed', finished_at = ?, error = ?
-        WHERE status IN ('running','queued')`,
+        WHERE status IN ('running','queued','waiting') AND auto_resume = 0`,
     )
     .run(now, '服务重启，任务已中断');
   return Number(info.changes) || 0;
+}
+
+/**
+ * 服务重启后需要自动接上的任务（限时 / 每天定时）。
+ * 这些任务在重启时保持 running/waiting/queued 原状，由调度器重新拉起来。
+ */
+function listAutoResumeJobs() {
+  return get()
+    .prepare(
+      `SELECT * FROM jobs
+        WHERE auto_resume = 1 AND status IN ('running','waiting','queued')
+        ORDER BY id ASC`,
+    )
+    .all();
 }
 
 /* ------------------------- 键值 / 审计 ------------------------- */
@@ -858,6 +919,8 @@ module.exports = {
   createJob,
   setJobStatus,
   setJobRoundsTotal,
+  setJobDeadline,
+  listAutoResumeJobs,
   addJobRound,
   getJob,
   listJobs,

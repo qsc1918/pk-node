@@ -695,6 +695,18 @@ $('btn-load-points').addEventListener('click', async () => {
   }
 });
 
+/** 启动成功的提示文案：窗口模式报时间，普通模式报局数。 */
+function runModeLabel(body) {
+  if (body && body.runMode === 'duration') {
+    const unit = body.durationUnit === 'min' ? ' 分钟' : ' 小时';
+    return '限时 ' + body.durationValue + unit;
+  }
+  if (body && body.runMode === 'daily') {
+    return '每天 ' + body.dailyStart + '–' + body.dailyEnd + ' 一直刷';
+  }
+  return (body ? body.rounds : '?') + ' 局';
+}
+
 $('btn-start').addEventListener('click', async () => {
   const leoAccountId = Number($('grind-leo').value);
   if (!leoAccountId) return toast('先导入小猿账号', 'err');
@@ -715,7 +727,7 @@ $('btn-start').addEventListener('click', async () => {
     $('btn-stop').disabled = false;
     $('job-badge').textContent = '#' + r.jobId;
     $('job-badge').className = 'badge run';
-    toast('已开始，' + body.rounds + ' 局 · ' + (body.strokeMode === 'ARC' ? '弧线' : '七段码')
+    toast('已开始，' + runModeLabel(body) + ' · ' + (body.strokeMode === 'ARC' ? '弧线' : '七段码')
       + (body.costTimeMs != null ? ' · costTime ' + body.costTimeMs + 'ms' : ' · costTime 自动'), 'ok');
   } catch (err) {
     toast(err.message, 'err');
@@ -848,7 +860,8 @@ function startPollFallback(jobId) {
           rd.ok ? 'l-ok' : 'l-fail');
         if (rd.detail) logLine(log, '         ' + String(rd.detail).slice(0, 300), 'l-dim');
       }
-      if (!(r.job && r.job.status === 'running') && state.pollTimer) {
+      // waiting（等定时窗口）也算「还在跑」，不能当成结束去收尾
+      if (!(r.job && isActiveJob(r.job)) && state.pollTimer) {
         // 任务已结束：收尾
         finishJobUi(r.job ? r.job.status : '');
         stopJobStream();
@@ -967,8 +980,10 @@ async function loadJobs() {
       el.querySelector('.title').textContent =
         '#' + j.id + ' [' + kindText(j) + '] ' + statusText(j.status);
       el.querySelector('.meta').textContent =
-        '成功 ' + j.roundsDone + '/' + j.roundsTotal + ' · 失败 ' + j.roundsFailed +
-        (j.leoName ? ' · ' + j.leoName : '') + ' · ' + fmtTime(j.createdAt);
+        '成功 ' + j.roundsDone + (j.unlimited ? ' 局（不限局数）' : '/' + j.roundsTotal) +
+        ' · 失败 ' + j.roundsFailed +
+        (j.leoName ? ' · ' + j.leoName : '') + ' · ' + fmtTime(j.createdAt) +
+        (jobWindowText(j) ? ' · ' + jobWindowText(j) : '');
       // 完整配置（含画笔 / 间隔 / 耗时等）
       el.querySelector('.cfg').textContent = jobConfigText(j);
       const actions = el.querySelector('.actions');
@@ -996,9 +1011,53 @@ async function loadJobs() {
 
 function statusText(s) {
   return {
-    queued: '排队中', running: '运行中', done: '已完成',
+    queued: '排队中', running: '运行中', waiting: '等待定时窗口', done: '已完成',
     failed: '失败', stopped: '已停止', paused: '已暂停',
   }[s] || s;
+}
+
+/* ---------------- 运行窗口（限时 / 每天定时）的展示辅助 ---------------- */
+
+/** 分钟数 → "08:00"。 */
+function fmtHM2(min) {
+  const v = ((Math.floor(Number(min) || 0) % 1440) + 1440) % 1440;
+  return String(Math.floor(v / 60)).padStart(2, '0') + ':' + String(v % 60).padStart(2, '0');
+}
+
+/** 毫秒 → "1 小时 20 分"。 */
+function fmtDurMs(ms) {
+  const s = Math.max(0, Math.round(Number(ms) / 1000));
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (d > 0) return d + ' 天 ' + h + ' 小时';
+  if (h > 0) return h + ' 小时 ' + m + ' 分';
+  if (m > 0) return m + ' 分 ' + sec + ' 秒';
+  return sec + ' 秒';
+}
+
+/**
+ * 任务的运行窗口描述（任务页用）。没有窗口（按局数）返回空串。
+ * 限时任务顺带把「还剩多久」算出来 —— 这是用户最关心的一个数字。
+ */
+function jobWindowText(j) {
+  const w = j && j.window;
+  if (!w) return '';
+  if (w.mode === 'duration') {
+    const total = fmtDurMs(w.durationMs);
+    if (j.deadlineAt) {
+      const left = j.deadlineAt - Date.now();
+      return '限时 ' + total + (left > 0 ? '（剩 ' + fmtDurMs(left) + '）' : '（已到点）');
+    }
+    if (j.remainingMs) return '限时 ' + total + '（剩 ' + fmtDurMs(j.remainingMs) + '）';
+    return '限时 ' + total;
+  }
+  if (w.mode === 'daily') {
+    const names = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+    const dayText = (!w.days || w.days.length === 7) ? '每天'
+      : w.days.map((d) => names[d] || '').join('、');
+    return dayText + ' ' + fmtHM2(w.startMin) + '–' + fmtHM2(w.endMin);
+  }
+  return '';
 }
 
 /** 造一个列表里的小按钮。 */
@@ -1024,7 +1083,8 @@ async function jobAction(id, action) {
 
 /** 任务是不是「还没结束」（管理页筛选 / 按钮可用性都用它）。 */
 function isActiveJob(j) {
-  return j.status === 'running' || j.status === 'queued' || j.status === 'paused';
+  return j.status === 'running' || j.status === 'queued' ||
+    j.status === 'paused' || j.status === 'waiting';
 }
 
 function kindText(j) {
@@ -1039,8 +1099,11 @@ function jobConfigText(j) {
   const c = j.config || {};
   const head = [
     '任务类型：' + kindText(j),
-    '轮次：' + (j.roundsDone || 0) + '/' + (j.roundsTotal || 0) + '（失败 ' + (j.roundsFailed || 0) + '）',
+    '局数：' + (j.roundsDone || 0) +
+      (j.unlimited ? ' 局（不限局数）' : '/' + (j.roundsTotal || 0)) +
+      '（失败 ' + (j.roundsFailed || 0) + '）',
   ];
+  if (j.window) head.push('停止条件：' + jobWindowText(j));
   if (j.kind === 'race') {
     head.push(
       '知识点 ID：' + (c.pointId || '自动（第一个）'),
@@ -1586,6 +1649,62 @@ function updateBatchLabel() {
   if (p) p.textContent = '批量开始刷练习（' + batchSel.prac.size + '）';
 }
 
+/* ------------------- 「停止条件」：按局数 / 按时长 / 每天定时 ------------------- */
+/*
+ * 三个模式共用一个机制（服务端 `config.window`）：
+ *   rounds   按局数（旧行为）
+ *   duration 刷够时长就停 —— **到点时不会打断在途那一局**，跑完才停
+ *   daily    每天 [开始, 结束) 之间一直刷，窗口外自动挂起、到点自动接着刷
+ *
+ * 面板前缀 `p` 为 'grind'（刷局）或 'prac'（刷练习），两处 DOM 结构一致。
+ */
+
+/** 同步「停止条件」三选一的显隐 + 提示文案。 */
+function syncRunModeUI(p) {
+  const sel = $(p + '-runmode');
+  const mode = (sel && sel.value) || 'rounds';
+  const toggle = (id, on) => { const el = $(id); if (el) el.classList.toggle('hidden', !on); };
+  toggle(p + '-row-rounds', mode === 'rounds');
+  toggle(p + '-row-duration', mode === 'duration');
+  toggle(p + '-row-daily', mode === 'daily');
+
+  const hint = $(p + '-window-hint');
+  if (!hint) return;
+  hint.classList.toggle('hidden', mode === 'rounds');
+  if (mode === 'duration') {
+    hint.textContent = '刷够这个时长就停。到点时不会硬打断：当前这一局（这一轮）跑完才收尾，' +
+      '不会白跑半局。任务在服务端后台跑，关掉浏览器也继续。';
+  } else if (mode === 'daily') {
+    hint.textContent = '每天在这个时间段内一直刷：到点自动停，第二天到点自动接着刷。' +
+      '开始 > 结束表示跨午夜（如 22:00–02:00）。只要本服务开着就行，任务建好后不用再管；' +
+      '服务重启也会自动接上。';
+  } else {
+    hint.textContent = '';
+  }
+}
+
+/** 收集「停止条件」参数（服务端 makeRunWindow 解析）。 */
+function collectRunWindow(p) {
+  const sel = $(p + '-runmode');
+  const mode = (sel && sel.value) || 'rounds';
+  if (mode === 'duration') {
+    const v = Number(($(p + '-duration') || {}).value);
+    return {
+      runMode: 'duration',
+      durationValue: Number.isFinite(v) && v > 0 ? v : 1,
+      durationUnit: (($(p + '-duration-unit') || {}).value) || 'hour',
+    };
+  }
+  if (mode === 'daily') {
+    return {
+      runMode: 'daily',
+      dailyStart: ($(p + '-daily-start') || {}).value || '08:00',
+      dailyEnd: ($(p + '-daily-end') || {}).value || '20:00',
+    };
+  }
+  return { runMode: 'rounds' };
+}
+
 /** 收集「刷局」面板当前这套参数（不含账号 id）。 */
 function collectPkBody() {
   const strokeEl = document.querySelector('input[name="strokeMode"]:checked');
@@ -1605,6 +1724,8 @@ function collectPkBody() {
   // costTime 留空 = 自动（用「出题成功 → 提交」的真实耗时；服务端有下限，填小会 400）
   const cost = $('grind-cost').value.trim();
   if (cost !== '') body.costTimeMs = Number(cost);
+  // 停止条件（按局数 / 限时 / 每天定时）
+  Object.assign(body, collectRunWindow('grind'));
   return body;
 }
 
@@ -1629,6 +1750,8 @@ function collectExerciseBody() {
   const mwMax = $('prac-mwmax');
   if (mwMin && mwMin.value.trim() !== '') body.matchWaitMinMs = Number(mwMin.value);
   if (mwMax && mwMax.value.trim() !== '') body.matchWaitMaxMs = Number(mwMax.value);
+  // 停止条件（按轮数 / 限时 / 每天定时）
+  Object.assign(body, collectRunWindow('prac'));
   return body;
 }
 
@@ -2412,9 +2535,14 @@ const PERSIST_IDS = [
   'grind-point', 'grind-rounds', 'grind-gapmin', 'grind-gapmax',
   'grind-delaymin', 'grind-delaymax', 'grind-rlbase', 'grind-rlmax',
   'grind-mretry', 'grind-mmax', 'grind-cost',
+  // 停止条件（按局数 / 限时 / 每天定时）
+  'grind-runmode', 'grind-duration', 'grind-duration-unit',
+  'grind-daily-start', 'grind-daily-end',
   // 刷练习
   'prac-kp', 'prac-limit', 'prac-rounds', 'prac-gapmin', 'prac-gapmax',
   'prac-delta', 'prac-rts',
+  'prac-runmode', 'prac-duration', 'prac-duration-unit',
+  'prac-daily-start', 'prac-daily-end',
   // 开学季竞速
   'race-delaymin', 'race-delaymax', 'race-qcount', 'race-grade', 'race-rounds',
   'race-gapmin', 'race-gapmax', 'race-battlemax', 'race-rank-scope',
@@ -2449,6 +2577,14 @@ function bindPersist() {
     } catch (e) { /* ignore */ }
     const save = () => { try { localStorage.setItem(key, el.checked ? '1' : '0'); } catch (e) { /* ignore */ } };
     el.addEventListener('change', save);
+  }
+
+  // 「停止条件」三选一：回填 localStorage 之后才能正确显隐，所以放在最后。
+  for (const p of ['grind', 'prac']) {
+    const sel = $(p + '-runmode');
+    if (!sel) continue;
+    sel.addEventListener('change', () => syncRunModeUI(p));
+    syncRunModeUI(p);
   }
 }
 
