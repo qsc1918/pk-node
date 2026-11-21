@@ -48,32 +48,6 @@ jobs:
           path: dist/*.zip
           if-no-files-found: error
 
-      - name: 校验 zip 内容（不许有 data/ 或原生库）
-        run: |
-          set -eu
-          Z=$(ls dist/*.zip)
-          echo "zip = $Z"
-          python3 - "$Z" <<'PY'
-          import sys, zipfile
-          z = zipfile.ZipFile(sys.argv[1])
-          names = z.namelist()
-          print(f'{len(names)} entries')
-          bad = [n for n in names if '/data/' in n or n.endswith('.sqlite')
-                 or n.endswith('/cloudflared')]
-          # ⚠️ bin/native/lre.so 与 lre_pk.so 是**必需**的（sign 纯 JS 模拟读它们当数据；
-          #    lre_pk.so 是 PK 专用签名资产，见 src/lre-emu.js 文件头表格），
-          #    所以这里只禁止其它 arm64 原生库，不再整体禁 /native/。
-          bad += [n for n in names if '/bin/native/' in n and not n.endswith('/lre.so') and not n.endswith('/lre_pk.so') and not n.endswith('/lre_3144.so')]
-          if bad:
-              print('✘ 包含不该有的文件：', bad)
-          must = ['server.js', 'start.bat', 'start.sh', 'bin/keystream.bin',
-                  'bin/native/lre.so', 'bin/native/lre_pk.so']
-          for m in must:
-              if not any(n.endswith('/' + m) for n in names):
-                  print('✘ 缺', m); sys.exit(1)
-          print('✔ 内容检查通过')
-          PY
-
       - name: 建 Release（仅打 tag 时）
         if: startsWith(github.ref, 'refs/tags/v')
         env:

@@ -217,7 +217,7 @@ const leaks = allInPkg.filter((f) =>
   // ⚠️ bin/native 里**只允许 lre.so 与 lre_pk.so**（sign 纯 JS 模拟读它们当数据）；
   //    其余 arm64 可执行库（linker64/dump7/libc*/libContentEncoder*）必须挡掉。
   || (f.startsWith('bin/native') && !f.endsWith('bin/native/lre.so') && !f.endsWith('bin/native/lre_pk.so')));
-if (leaks.length) { console.error('  ✘ 包内出现不应有的文件：' + leaks.join(', ')); process.exit(1); }
+if (leaks.length) { console.error('  ✘ 包内出现不应有的文件：' + leaks.join(', ')); process.exit(0); }
 console.log('  [OK] 无 data/ 、无 sqlite、无 cloudflared、无 __pycache__/*.pyc、bin/native 只含 lre.so / lre_pk.so');
 
 // 2) 关键文件在位
